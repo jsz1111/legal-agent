@@ -1,0 +1,145 @@
+# ============================================================
+# 法律智能体 (legal-agent) — 基础设施层
+# 包含：Redis / Milvus / Neo4j / MinIO
+# PostgreSQL 共用 tiangong-postgres（legal_db 独立数据库）
+#
+# 端口约定（tiangong+偏移，避免冲突）：
+#   Redis:   6380  (tiangong: 6379)
+#   Milvus:  19531 (tiangong: 19530)
+#   Neo4j:   7475/7688 (tiangong: 7474/7687)
+#   MinIO:   9010/9011 (tiangong: 9000/9001)
+#
+# 启动：docker compose up -d
+# 停止：docker compose down
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # Redis Stack — 短期记忆
+  # ----------------------------------------------------------
+  redis:
+    image: redis/redis-stack:7.4.0-v3
+    container_name: legalflow-redis
+    restart: always
+    environment:
+      REDIS_ARGS: "--appendonly yes"
+    volumes:
+      - ./docker/redis_data:/data
+    ports:
+      - "6380:6379"
+      - "8002:8001"
+    networks:
+      - legal-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # Milvus 依赖：etcd
+  # ----------------------------------------------------------
+  etcd:
+    container_name: legalflow-etcd
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: >
+      etcd
+      --advertise-client-urls=http://etcd:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - ./docker/etcd_data:/etcd
+    networks:
+      - legal-net
+
+  # ----------------------------------------------------------
+  # MinIO — 对象存储
+  # Web UI：http://localhost:9011
+  # ----------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: legalflow-minio
+    restart: always
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - ./docker/minio_data:/minio_data
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    networks:
+      - legal-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ----------------------------------------------------------
+  # Milvus — 向量数据库
+  # 存储：法条语义检索（statute_index）、法律文档 RAG
+  # ----------------------------------------------------------
+  milvus:
+    container_name: legalflow-milvus
+    image: milvusdb/milvus:v2.6.13
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+    volumes:
+      - ./docker/milvus_data:/var/lib/milvus
+    ports:
+      - "19531:19530"
+      - "9092:9091"
+    depends_on:
+      - etcd
+      - minio
+    networks:
+      - legal-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ----------------------------------------------------------
+  # Neo4j — 图数据库
+  # 存储：法律知识图谱
+  # Web UI：http://localhost:7475  用户名/密码：neo4j/legal123
+  # ----------------------------------------------------------
+  neo4j:
+    image: neo4j:5.20
+    container_name: legalflow-neo4j
+    restart: always
+    environment:
+      NEO4J_AUTH: neo4j/legal123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - ./docker/neo4j_data:/data
+      - ./docker/neo4j_logs:/logs
+    ports:
+      - "7475:7474"
+      - "7688:7687"
+    networks:
+      - legal-net
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+networks:
+  legal-net:
+    driver: bridge
