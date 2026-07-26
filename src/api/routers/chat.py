@@ -295,7 +295,7 @@ async def upload_image(
     file: UploadFile = File(...),
     user_id: str = Form(...),
     session_id: str = Form(...),
-    question: str = Form(default="请描述这张图片中与法律证据相关的内容，重点提取：商品信息、价格、订单号、瑕疵描述、商家信息、聊天内容等关键证据"),
+    question: str = Form(default=None),  # 如果为 None，根据上下文自动生成
     auto_inject: bool = Form(default=True),  # 是否自动注入对话流
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -306,7 +306,7 @@ async def upload_image(
     - file: 图片文件
     - user_id: 用户ID
     - session_id: 会话ID（用于关联对话上下文）
-    - question: 分析提示词
+    - question: 分析提示词（如果为 None，根据对话上下文自动生成）
     - auto_inject: 是否自动将分析结果注入对话流（默认true）
 
     返回：
@@ -344,25 +344,64 @@ async def upload_image(
 
         logger.info(f"图片已保存: {save_path}")
 
-        # 分析图片内容
-        analysis = await analyze_image(str(save_path), question)
+        # 获取当前对话上下文（如果存在）
+        redis = get_checkpointer_redis()
+        thread_id = f"{user_id}:{session_id}"
+        state_key = f"guide_state:{thread_id}"
+
+        legal_domain = ""
+        confirmed_issues = []
+        evidence_confirmed = []
+        evidence_unavailable = []
+        recent_assistant_message = ""
+
+        # 尝试从 Redis 恢复 GuideState
+        try:
+            raw = await redis.get(state_key)
+            if raw:
+                existing_state = GuideState.model_validate_json(raw)
+                legal_domain = existing_state.legal_domain or ""
+                confirmed_issues = existing_state.confirmed_issues or []
+                evidence_confirmed = existing_state.evidence_confirmed or []
+                evidence_unavailable = existing_state.evidence_unavailable or []
+
+                # 获取最近一条助手消息（可能包含追问内容）
+                from langchain_core.messages import AIMessage
+                for msg in reversed(existing_state.messages):
+                    if isinstance(msg, AIMessage):
+                        recent_assistant_message = msg.content[:500]  # 最多取500字
+                        break
+
+                logger.info(f"图片分析使用上下文: domain={legal_domain}, issues={confirmed_issues}")
+        except Exception as ctx_err:
+            logger.warning(f"获取对话上下文失败，使用通用分析: {ctx_err}")
+
+        # 分析图片内容（根据上下文生成针对性提示词）
+        analysis = await analyze_image(
+            str(save_path),
+            question=question,  # 如果为 None，会根据上下文自动生成
+            legal_domain=legal_domain,
+            confirmed_issues=confirmed_issues,
+            evidence_confirmed=evidence_confirmed,
+            evidence_unavailable=evidence_unavailable,
+            recent_assistant_message=recent_assistant_message
+        )
 
         response = {
             "enabled": True,
             "image_url": str(save_path),
             "analysis": analysis,
             "injected": False,
+            "context_used": bool(legal_domain or confirmed_issues),  # 标记是否使用了上下文
         }
 
         # 如果启用自动注入，将分析结果作为用户消息注入对话流
-        if auto_inject and analysis:
+        if auto_inject and analysis and not analysis.startswith("❌") and not analysis.startswith("⚠️"):
             try:
                 # 构造结构化的证据消息
                 evidence_message = f"【图片证据补充】\n{analysis}"
 
                 # 调用对话接口，将分析结果注入
-                redis = get_checkpointer_redis()
-                thread_id = f"{user_id}:{session_id}"
                 active_key = f"guide_active:{thread_id}"
 
                 # 检查是否有活跃的指引会话
@@ -386,7 +425,7 @@ async def upload_image(
                     response["injected"] = True
                     response["assistant_reply"] = reply
 
-                logger.info(f"图片分析结果已自动注入对话流: session={session_id}")
+                logger.info(f"图片分析结果已自动注入对话流: session={session_id}, context_aware={response['context_used']}")
 
             except Exception as inject_err:
                 logger.warning(f"自动注入对话流失败: {inject_err}")

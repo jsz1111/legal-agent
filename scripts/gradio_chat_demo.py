@@ -132,7 +132,7 @@ def new_session() -> tuple[list, str]:
 
 
 def upload_and_analyze_image(image_file, user_id: str, session_id: str) -> tuple[str, list]:
-    """上传图片并分析内容（多模态功能），自动注入对话流"""
+    """上传图片并分析内容（多模态功能），根据对话上下文自动生成针对性提示词"""
     if image_file is None:
         return "❌ 请先上传图片", []
 
@@ -143,7 +143,7 @@ def upload_and_analyze_image(image_file, user_id: str, session_id: str) -> tuple
             data = {
                 'user_id': user_id,
                 'session_id': session_id,
-                'question': '请详细描述这张图片中与法律证据相关的内容（如订单信息、商品描述、价格、瑕疵细节、聊天记录内容、商家回复等）',
+                # question 留空，让后端根据上下文自动生成针对性提示词
                 'auto_inject': 'true'  # 启用自动注入
             }
 
@@ -162,9 +162,15 @@ def upload_and_analyze_image(image_file, user_id: str, session_id: str) -> tuple
                 analysis = result.get("analysis", "")
                 injected = result.get("injected", False)
                 assistant_reply = result.get("assistant_reply", "")
+                context_used = result.get("context_used", False)
 
                 # 构建返回消息
-                message = f"✅ 图片分析成功\n\n📋 **提取的证据信息：**\n{analysis}\n\n"
+                message = f"✅ 图片分析成功\n\n"
+
+                if context_used:
+                    message += "🎯 **使用对话上下文生成针对性分析**\n\n"
+
+                message += f"📋 **提取的证据信息：**\n{analysis}\n\n"
 
                 if injected and assistant_reply:
                     message += f"🤖 **助手已自动处理：**\n{assistant_reply[:300]}{'...' if len(assistant_reply) > 300 else ''}\n\n"
