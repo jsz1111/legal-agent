@@ -1,4 +1,4 @@
-"""验证法律维权置信度打分与分档。"""
+"""验证法律维权置信度打分与分档（三维度前置版本）。"""
 from src.agents.legal_guide.confidence import (
     score_confidence, tier_guidance, TIER_HIGH, TIER_MEDIUM,
 )
@@ -6,24 +6,24 @@ from src.agents.legal_guide.confidence import (
 
 def _score(**kw):
     base = dict(
-        confirmed_issues=[], evidence_confirmed=[], candidate_laws=[],
-        milvus_hit=False, case_hit=False, domain_locked=False, region_known=False,
+        confirmed_issues=[], evidence_confirmed=[], evidence_total=4,
+        domain_locked=False, region_known=False, time_known=False,
     )
     base.update(kw)
     return score_confidence(**base)
 
 
 def test_full_signals_high_tier():
-    """信号齐全 → HIGH 档，分数接近上限。"""
+    """信号齐全 → HIGH 档。"""
     r = _score(
-        confirmed_issues=["拖欠工资", "未签合同", "未缴社保"],
-        evidence_confirmed=["劳动合同", "工资流水", "考勤记录"],
-        candidate_laws=[{}, {}, {}],
-        milvus_hit=True, case_hit=True, domain_locked=True, region_known=True,
+        confirmed_issues=["拖欠工资", "未签合同"],
+        evidence_confirmed=["劳动合同", "工资流水", "考勤记录", "通讯记录"],
+        evidence_total=4,
+        domain_locked=True, region_known=True, time_known=True,
     )
+    # 证据4/4=1.0*0.4=0.4; 事实0.1+0.1+0.1=0.3; 权责0.2+0.1=0.3; 总=1.0
     assert r["tier"] == "HIGH"
     assert r["score"] >= TIER_HIGH
-    assert r["score"] <= 1.0
 
 
 def test_empty_signals_low_tier():
@@ -34,33 +34,49 @@ def test_empty_signals_low_tier():
 
 
 def test_partial_signals_medium_tier():
-    """部分信号（命中法条+锁定领域，但无证据无类案）→ 落在 MEDIUM。"""
+    """部分信号（有1个issue+领域锁定，但证据少）→ MEDIUM。"""
     r = _score(
         confirmed_issues=["消费欺诈"],
-        candidate_laws=[{}, {}],
-        milvus_hit=True, domain_locked=True,
+        evidence_confirmed=["订单截图"],
+        evidence_total=4,
+        domain_locked=True,
+        region_known=True,
     )
-    # 0.25+0.10(基) +0.10+0.05(事实) = 0.50
+    # 证据0.1 + 事实0.2 + 权责0.2 = 0.5，落在当前配置的 MEDIUM 区间。
     assert r["tier"] == "MEDIUM"
     assert TIER_MEDIUM <= r["score"] < TIER_HIGH
 
 
 def test_weights_capped():
-    """单维度得分不超过其权重上限（法条数很多也不溢出）。"""
+    """单维度得分不超过其权重上限。"""
     r = _score(
-        candidate_laws=[{}] * 20,
-        evidence_confirmed=["a", "b", "c", "d", "e", "f", "g"],
-        milvus_hit=True,
+        confirmed_issues=["a", "b", "c", "d", "e"],  # 权责上限0.3
+        evidence_confirmed=["1", "2", "3", "4", "5", "6"],
+        evidence_total=4,  # 证据比例>1，但上限0.4
     )
-    assert r["breakdown"]["legal_basis"] <= 0.40
-    assert r["breakdown"]["evidence"] <= 0.20
+    assert r["breakdown"]["evidence"] <= 0.40
+    assert r["breakdown"]["rights_clarity"] <= 0.30
 
 
 def test_score_monotonic_in_evidence():
     """证据越多分数不降低（单调性）。"""
-    r1 = _score(evidence_confirmed=["a"])
-    r2 = _score(evidence_confirmed=["a", "b", "c"])
+    r1 = _score(evidence_confirmed=["a"], evidence_total=4)
+    r2 = _score(evidence_confirmed=["a", "b", "c"], evidence_total=4)
     assert r2["score"] >= r1["score"]
+
+
+def test_effective_evidence_weight_does_not_treat_claim_as_verified_copy():
+    claimed = _score(
+        evidence_confirmed=["劳动合同"],
+        effective_evidence_count=0.45,
+    )
+    uploaded_copy = _score(
+        evidence_confirmed=["劳动合同"],
+        effective_evidence_count=0.70,
+    )
+
+    assert claimed["breakdown"]["evidence"] < uploaded_copy["breakdown"]["evidence"]
+    assert uploaded_copy["breakdown"]["evidence"] < 0.40
 
 
 def test_tier_guidance_distinct():

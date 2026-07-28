@@ -1,0 +1,43 @@
+{
+  "package_name": "china_law_yearbook_statistics_2019_2021",
+  "target_database": "legal_statistics_db",
+  "target_schema": "legal_statistics",
+  "source_root": "D:\\BaiduNetdiskDownload\\免费共享-中国法律年鉴 2020-2021",
+  "yearbook_years": [
+    2019,
+    2020,
+    2021
+  ],
+  "statistical_year_min": 2015,
+  "statistical_year_max": 2020,
+  "counts": {
+    "workbooks": 193,
+    "datasets": 193,
+    "records": 3044,
+    "facts": 11612,
+    "cells": 23573
+  },
+  "extraction_status_counts": {
+    "facts_extracted": 186,
+    "records_only": 7
+  },
+  "topic_counts": {
+    "abolished_documents": 1,
+    "administrative_cases": 6,
+    "administrative_litigation_response": 14,
+    "administrative_reconsideration": 21,
+    "civil_affairs": 16,
+    "civil_cases": 13,
+    "court_statistics": 30,
+    "criminal_cases": 21,
+    "enforcement": 6,
+    "marriage_family": 3,
+    "other": 27,
+    "procuratorate": 25,
+    "public_security": 3,
+    "social_assistance": 2,
+    "traffic_accidents": 3,
+    "treaties": 2
+  },
+  "errors": []
+}

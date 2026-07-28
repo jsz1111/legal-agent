@@ -1,73 +1,71 @@
+"""监督 Agent 的短期与长期法律记忆集成测试。"""
+
 import uuid
 
-from agents.supervisor_agent import chat_endpoint
+from langchain_core.messages import AIMessage, HumanMessage
 
-# @pytest.mark.asyncio
-async def test_supervisor_agent():
-    result = await chat_endpoint("1234","AEEEEA", "你好，我是雷丰阳")
-    print(result)
+from src.agents.supervisor_agent import _exact_name_recall, chat_endpoint
+from src.infra.milvus_store import get_milvus_store
+from src.infra.redis_cache import get_checkpointer_redis
+
+
+def _test_identity(prefix: str) -> tuple[str, str]:
+    suffix = uuid.uuid4().hex[:10]
+    return f"{prefix}_{suffix}", uuid.uuid4().hex[:8]
+
+
+async def _cleanup_test_state(user_id: str) -> None:
+    redis = get_checkpointer_redis()
+    keys = [key async for key in redis.scan_iter(match=f"*{user_id}*")]
+    if keys:
+        await redis.delete(*keys)
+
+    store = get_milvus_store()
+    namespace = ("users", user_id, "memories")
+    items = await store.asearch(namespace, query=None, limit=100)
+    for item in items:
+        await store.aput(namespace, item.key, None)
 
 
 async def test_agent_memory():
-    """验证短期记忆：同一 thread_id 下第二轮能记住第一轮的内容"""
-    # 第一轮：自我介绍
-    reply1 = await chat_endpoint("1123", "ATDAAS", "你好，我叫雷丰阳")
-    print(f"\n第一轮回复：{reply1}")
+    """同一会话的第二轮应记得用户刚提供的称呼。"""
+    user_id, session_id = _test_identity("test_short_memory")
+    try:
+        await chat_endpoint(user_id, session_id, "你好，我叫雷丰阳")
+        reply = await chat_endpoint(user_id, session_id, "我刚才说我叫什么？")
 
-    # 第二轮：考察记忆
-    reply2 = await chat_endpoint("1123", "ATDAAS", "我是谁？")
-    print(f"第二轮回复：{reply2}")
-
-    # 断言：第二轮回复应包含名字
-    assert "雷丰阳" in reply2, f"Agent 应该记住用户名字，实际回复：{reply2}"
-
-    # 第三轮：新会话
-    reply3 = await chat_endpoint("1123", "7783AAA", "我是谁？")
-    print(f"第三轮回复：{reply3}")
+        assert "雷丰阳" in reply
+    finally:
+        await _cleanup_test_state(user_id)
 
 
-def new_session() -> str:
-    """每次测试生成唯一 session_id，防止不同测试/不同执行轮次的 checkpoint 互相污染。"""
-    return uuid.uuid4().hex[:8]
+def test_exact_name_recall_preserves_full_name_from_same_session():
+    messages = [
+        HumanMessage(content="你好，我叫雷丰阳"),
+        AIMessage(content="你好。"),
+        HumanMessage(content="我刚才说我叫什么？"),
+        AIMessage(content="雷先生。"),
+    ]
 
-
-async def test_agent_store():
-    """验证长期记忆：跨会话记忆
-    第一个 session 写入病史 → 第二个全新 session 能检索到
-    """
-    # ── 第一轮：用新会话写入病史 ──────────────────────────────────────────
-    session_1 = new_session()
-    resp1 = await chat_endpoint("2244", session_1, "你好，我叫张三，有新冠病史")
-    print(f"\n[写入] 回复：{resp1}")
-    resp1 = await chat_endpoint("2244", session_1, "我对樱桃过敏")
-    print(f"\n[写入] 回复：{resp1}")
-    resp1 = await chat_endpoint("2244", session_1, "我对樱桃过敏")
-
-    # ── 第二轮：换一个全新会话，查询病史（跨会话长期记忆） ───────────────
-    session_2 = new_session()  # 与 session_1 不同，短期记忆里没有上文
-    resp2 = await chat_endpoint("2244", session_2, "我有什么病史和过敏史？")
-    print(f"[检索] 回复：{resp2}")
-
-    assert "糖尿病" in resp2, f"长期记忆应能跨会话检索到糖尿病史，实际回复：{resp2}"
-
-
-def new_session() -> str:
-    """每次测试生成唯一 session_id，防止不同测试/不同执行轮次的 checkpoint 互相污染。"""
-    return uuid.uuid4().hex[:8]
+    assert _exact_name_recall("我刚才说我叫什么？", messages) == "你刚才说你叫雷丰阳。"
 
 
 async def test_agent_store():
-    """验证长期记忆：跨会话记忆
-    第一个 session 写入病史 → 第二个全新 session 能检索到
-    """
-    # ── 第一轮：用新会话写入病史 ──────────────────────────────────────────
-    session_1 = new_session()
-    resp1 = await chat_endpoint("1123", session_1, "你好，我叫张三，有糖尿病史")
-    print(f"\n[写入] 回复：{resp1}")
+    """法律案情摘要应能跨会话检索，且测试数据在结束后清理。"""
+    user_id, first_session = _test_identity("test_legal_memory")
+    second_session = uuid.uuid4().hex[:8]
+    try:
+        await chat_endpoint(
+            user_id,
+            first_session,
+            "请记住：我在上海有劳动争议，老板已经拖欠我三个月工资。",
+        )
+        reply = await chat_endpoint(
+            user_id,
+            second_session,
+            "我之前说的劳动争议是什么情况？",
+        )
 
-    # ── 第二轮：换一个全新会话，查询病史（跨会话长期记忆） ───────────────
-    session_2 = new_session()  # 与 session_1 不同，短期记忆里没有上文
-    resp2 = await chat_endpoint("1123", session_2, "我有什么病史呢？")
-    print(f"[检索] 回复：{resp2}")
-
-    assert "糖尿病" in resp2, f"长期记忆应能跨会话检索到糖尿病史，实际回复：{resp2}"
+        assert "拖欠" in reply and ("三个月" in reply or "3个月" in reply)
+    finally:
+        await _cleanup_test_state(user_id)

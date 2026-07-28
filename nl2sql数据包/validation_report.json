@@ -1,0 +1,54 @@
+{
+  "status": "passed",
+  "counts": {
+    "datasets": 193,
+    "records": 3044,
+    "facts": 11612,
+    "cells": 23573
+  },
+  "yearbook_counts": {
+    "2019": 63,
+    "2020": 72,
+    "2021": 58
+  },
+  "year_quality_counts": {
+    "explicit_title": 128,
+    "inferred_yearbook_minus_one": 65
+  },
+  "quality_flag_counts": {
+    "auto_extracted": 9383,
+    "auto_extracted;year_inferred": 2226,
+    "auto_extracted;year_inferred;percent_symbol_recovered": 3
+  },
+  "sample_query": [
+    {
+      "statistical_year": 2018,
+      "title": "表14 2018年全国法院审理民事一审案件情况统计表",
+      "row_label": "劳动争议、 人事争议",
+      "received": "452289",
+      "closed": "450589",
+      "source_file": "中国法律年鉴2019（来自马克数据网）/表14 2018年全国法院审理民事一审案件情况统计表.xls",
+      "source_row": 11
+    },
+    {
+      "statistical_year": 2019,
+      "title": "表14 2019年全国法院审理民事一审案件情况统计表",
+      "row_label": "劳动争议、 人事争议",
+      "received": "483767",
+      "closed": "482850",
+      "source_file": "中国法律年鉴2020（来自马克数据网）/表14 2019年全国法院审理民事一审案件情况统计表.xls",
+      "source_row": 12
+    },
+    {
+      "statistical_year": 2020,
+      "title": "表14 2020年全国法院受理民事一审案件情况统计表",
+      "row_label": "劳动争议、 人事争议",
+      "received": "439678",
+      "closed": "446912",
+      "source_file": "中国法律年鉴2021（来自马克数据网）/表14 2020年全国法院受理民事一审案件情况统计表.xls",
+      "source_row": 11
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}

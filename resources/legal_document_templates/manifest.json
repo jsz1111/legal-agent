@@ -1,0 +1,200 @@
+{
+  "schema_version": 2,
+  "collection": {
+    "title": "部分案件起诉状答辩状示范文本",
+    "document_no": "法〔2025〕82号",
+    "issuers": [
+      "最高人民法院",
+      "司法部",
+      "中华全国律师协会"
+    ],
+    "published_at": "2025-06-23",
+    "effective_at": "2025-07-14",
+    "source_page_url": "https://www.court.gov.cn/zixun/xiangqing/468671.html",
+    "source_pdf_url": "https://www.court.gov.cn/upload/file/2025/06/22/17/43/202506221742_01.pdf",
+    "source_pdf_sha256": "07FC626A7B703BEB27B1DAB9B5D7AA47B6DC58B4165048813E02663F9FD11B88"
+  },
+  "templates": [
+    {
+      "template_id": "spc_2025_divorce_complaint",
+      "title": "民事起诉状（离婚纠纷）",
+      "case_type": "离婚纠纷",
+      "domains": ["family_vulnerable_groups"],
+      "keywords": ["离婚", "夫妻感情", "抚养权", "夫妻共同财产"],
+      "requires_keyword": true,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_divorce_complaint_blank.pdf",
+      "blank_pdf_sha256": "C8254E7B642495FC02882FD3FDD0E323EFCFD2BED160F4156D8C975CFA22E1E4",
+      "source_pages": [57, 60],
+      "claim_items": ["解除婚姻关系", "子女抚养及探望", "夫妻共同财产分割", "夫妻共同债务承担", "损害赔偿及诉讼费用"],
+      "fact_items": ["结婚登记情况", "子女情况", "感情变化及破裂事实", "分居情况", "共同财产与债务", "是否存在家庭暴力等情形"],
+      "evidence_items": [
+        "身份证明和婚姻关系材料（身份证、结婚证或婚姻登记信息）",
+        "子女身份及实际抚养材料（出生证明、户口簿、教育医疗支出等，如涉及）",
+        "婚姻关系和感情破裂相关材料（分居居住、沟通、既往诉讼或调解材料等）",
+        "夫妻共同财产材料（房产、车辆、账户及其他财产权属材料，如涉及）",
+        "夫妻共同债务材料（借款合同、转账记录及款项用途材料，如涉及）",
+        "离婚赔偿、补偿或经济帮助相关材料（报警、告诫书、病历、收入或照护材料等，如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_sales_contract_complaint",
+      "title": "民事起诉状（买卖合同纠纷）",
+      "case_type": "买卖合同纠纷",
+      "domains": ["consumer_market", "contracts_property_housing"],
+      "keywords": ["买卖", "网购", "商品", "货款", "退货", "退款", "交付"],
+      "requires_keyword": false,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_sales_contract_complaint_blank.pdf",
+      "blank_pdf_sha256": "B6C72D4F4DA7813AD23734D633BA47584BA130093DD1D6E9F7CF42C182E8671B",
+      "source_pages": [71, 76],
+      "claim_items": ["支付货款或返还价款", "交付、退换货或解除合同", "违约金、利息及损害赔偿", "实现债权费用及诉讼费用", "诉讼请求总额"],
+      "fact_items": ["合同订立情况", "买卖标的、价款及支付方式", "交付和验收情况", "质量异议", "违约经过", "催告及协商情况"],
+      "evidence_items": [
+        "身份证明或主体资格材料（身份证、营业执照等）",
+        "买卖合同、订单、确认单或能够证明约定内容的聊天记录",
+        "价款支付材料（转账记录、收据、发票等）",
+        "交付和验收材料（物流记录、签收单、验收单等）",
+        "质量异议材料（商品照片视频、检测材料、退换货通知及送达记录等，如涉及）",
+        "催告协商、违约损失和实现债权费用材料（如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_house_sales_complaint",
+      "title": "民事起诉状（房屋买卖合同纠纷）",
+      "case_type": "房屋买卖合同纠纷",
+      "domains": ["contracts_property_housing"],
+      "keywords": ["买房", "购房", "房屋买卖", "开发商", "过户", "房产证"],
+      "requires_keyword": true,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_house_sales_complaint_blank.pdf",
+      "blank_pdf_sha256": "52BCE9A87F8DAB89A0E4F78A17E17C71AB496F277A0B512FE08FBA1E5F6EBE8E",
+      "source_pages": [93, 98],
+      "claim_items": ["继续履行或解除合同", "交付房屋或办理过户", "返还购房款", "违约金及损害赔偿", "诉讼费用和请求总额"],
+      "fact_items": ["合同订立情况", "房屋基本情况", "价款支付情况", "交付及办证约定", "履行与违约情况", "催告及协商情况"],
+      "evidence_items": [
+        "身份证明或主体资格材料（身份证、营业执照等）",
+        "房屋买卖、认购或定金合同及网签备案材料",
+        "购房款、定金、税费和中介费支付凭证",
+        "房屋交付材料（交付通知、验收单、交房签收单等）",
+        "不动产登记材料（产权证、预告登记或办证进度材料等）",
+        "房屋质量、维修通知、鉴定或损失材料（如涉及）",
+        "解除、催告、协商及按揭贷款相关材料（如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_private_lending_complaint",
+      "title": "民事起诉状（民间借贷纠纷）",
+      "case_type": "民间借贷纠纷",
+      "domains": ["contracts_property_housing", "other"],
+      "keywords": ["借款", "借钱", "欠钱", "借条", "欠条", "民间借贷"],
+      "requires_keyword": true,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_private_lending_complaint_blank.pdf",
+      "blank_pdf_sha256": "72428897821DE6747A39EB47C11315686C2CAD43D423E44FEAE2295DA5F8E606",
+      "source_pages": [134, 139],
+      "claim_items": ["返还借款本金", "支付利息及逾期利息", "担保责任", "实现债权费用及诉讼费用", "诉讼请求总额"],
+      "fact_items": ["借款合意形成", "款项交付", "借款期限与利率", "还款情况", "催收情况", "担保约定"],
+      "evidence_items": [
+        "身份证明或主体资格材料（身份证、营业执照等）",
+        "借款合同、借条、欠条或能够证明借款合意的聊天记录",
+        "款项实际交付材料（银行转账、收条、取现记录等）",
+        "利息约定及本金、利息还款记录",
+        "催收通知、聊天记录、录音及送达记录",
+        "保证、抵押、质押合同及登记材料（如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_house_lease_complaint",
+      "title": "民事起诉状（房屋租赁合同纠纷）",
+      "case_type": "房屋租赁合同纠纷",
+      "domains": ["contracts_property_housing"],
+      "keywords": ["租房", "租赁", "房租", "押金", "房东", "承租"],
+      "requires_keyword": true,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_house_lease_complaint_blank.pdf",
+      "blank_pdf_sha256": "9F1458997E4F74408F5CB066A75DB29556239BC23005A7F7EA2F631FB43343BC",
+      "source_pages": [171, 176],
+      "claim_items": ["支付租金及违约金", "交付或返还房屋", "解除合同", "返还押金", "占有使用费、损失及诉讼费用"],
+      "fact_items": ["租赁合同订立", "房屋及租期", "租金和押金约定", "房屋交付", "租金支付", "解除、退租及房屋返还情况"],
+      "evidence_items": [
+        "身份证明或主体资格材料（身份证、营业执照等）",
+        "房屋租赁合同及补充协议",
+        "房屋权属、授权出租和房屋交付材料",
+        "租金、押金、物业水电等费用支付凭证",
+        "入住、退租、房屋返还和房屋状况材料（交接单、照片视频等）",
+        "解除通知、租金催告、维修或协商记录（如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_labor_dispute_complaint",
+      "title": "民事起诉状（劳动争议纠纷）",
+      "case_type": "劳动争议纠纷",
+      "domains": ["labor_social_security"],
+      "keywords": ["劳动争议", "工资", "加班费", "经济补偿", "违法解除", "工伤"],
+      "requires_keyword": false,
+      "requires_litigation_stage": true,
+      "blank_pdf": "official_blank/spc_2025_labor_dispute_complaint_blank.pdf",
+      "blank_pdf_sha256": "B95B5A2BBCE316D3D94301FF2C89F86D3146FB9DD8558D2B8D4B76A760A0A5D1",
+      "source_pages": [248, 251],
+      "claim_items": ["工资支付", "未签书面劳动合同双倍工资", "加班费和未休年休假工资", "社会保险损失", "经济补偿或违法解除赔偿金", "诉讼费用及请求总额"],
+      "fact_items": ["劳动合同签订", "入职、岗位、地点与工资", "加班、年休假与社会保险", "解除或终止劳动关系", "工伤情况", "劳动仲裁请求、裁决及送达情况"],
+      "evidence_items": [
+        "身份证明及用人单位主体资格材料",
+        "劳动合同、录用通知、入职登记、工作证或工牌等劳动关系材料",
+        "工资标准和支付材料（工资单、银行流水、社会保险记录等）",
+        "考勤、加班、排班、请休假和年休假材料（如涉及）",
+        "解除或终止通知、离职材料及相关沟通记录（如涉及）",
+        "劳动仲裁申请书、仲裁裁决书及送达证明（进入诉讼阶段时）",
+        "工伤认定、劳动能力鉴定和医疗材料（如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_traffic_accident_complaint",
+      "title": "民事起诉状（机动车交通事故责任纠纷）",
+      "case_type": "机动车交通事故责任纠纷",
+      "domains": ["traffic_personal_injury"],
+      "keywords": ["交通事故", "车祸", "机动车", "交警", "事故认定书"],
+      "requires_keyword": false,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_traffic_accident_complaint_blank.pdf",
+      "blank_pdf_sha256": "21968206EAC1411B921474C9103C6C185B43E226371BCBB171EC3A65F85EB54E",
+      "source_pages": [351, 355],
+      "claim_items": ["医疗费、护理费和营养费", "误工费和交通费", "残疾或死亡赔偿项目", "精神损害抚慰金", "车辆及其他财产损失", "鉴定费、诉讼费及请求总额"],
+      "fact_items": ["交通事故发生经过", "事故责任认定", "车辆及保险情况", "治疗、伤残或死亡情况", "费用和损失", "鉴定与证据情况"],
+      "evidence_items": [
+        "身份证明或主体资格材料（身份证、营业执照等）",
+        "道路交通事故认定书及事故现场材料",
+        "车辆登记和保险材料（行驶证、保单、保险公司信息等）",
+        "医疗费凭证、费用清单和病历资料",
+        "护理、营养、住院、误工和交通费证明材料（按主张项目准备）",
+        "伤残鉴定、死亡证明或残疾辅助器具材料（如涉及）",
+        "车辆维修、停运及其他财产损失材料（如涉及）",
+        "鉴定费、保全费及其他合理支出凭证（如涉及）"
+      ]
+    },
+    {
+      "template_id": "spc_2025_copyright_complaint",
+      "title": "民事起诉状（侵害著作权及邻接权纠纷）",
+      "case_type": "侵害著作权及邻接权纠纷",
+      "domains": ["intellectual_property"],
+      "keywords": ["著作权", "版权", "作品", "复制", "传播", "侵权"],
+      "requires_keyword": true,
+      "requires_litigation_stage": false,
+      "blank_pdf": "official_blank/spc_2025_copyright_complaint_blank.pdf",
+      "blank_pdf_sha256": "A46231E547CEBBF64A0AD52ECA84302246DE52C6A9AFC3BE57F4F0DF9A06B86D",
+      "source_pages": [377, 382],
+      "claim_items": ["停止侵害", "消除影响或赔礼道歉", "赔偿经济损失", "赔偿合理开支", "诉讼费用及请求总额"],
+      "fact_items": ["权利作品和权属依据", "作品发表或登记情况", "被诉侵权行为", "实质性相似及接触可能", "损失、获利或法定赔偿依据", "取证和维权支出"],
+      "evidence_items": [
+        "身份证明或主体资格材料（身份证、营业执照等）",
+        "作品登记证书、底稿、原件、权利合同或认证机构证明等权属材料",
+        "被告实施被诉侵权行为的证据",
+        "被告接触涉案作品及侵权内容与作品实质性相似的证据",
+        "侵权行为持续期间的证据",
+        "实际损失、被告违法所得或许可使用费等赔偿计算材料",
+        "律师费、取证费、差旅费等合理开支凭证（如涉及）"
+      ]
+    }
+  ]
+}

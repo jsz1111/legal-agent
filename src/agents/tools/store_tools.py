@@ -23,7 +23,7 @@ async def save_memory(
         content: 要记住的内容，用一句话描述
     """
 
-    print(f"🔧执行：保存长期记忆：{content} ")
+    # Skip print to avoid GBK encoding errors in Windows terminal
     user_id = get_user_id(runtime)
     if not user_id:
         return "无法获取用户ID。"
@@ -52,7 +52,8 @@ async def search_memory(
     """
 
     user_id = get_user_id(runtime)
-    print(f"🔧执行：搜索长期记忆：{query}; 用户id：{user_id}")
+    # Skip print to avoid GBK encoding errors in Windows terminal
+    # print(f"[TOOL] search_memory: query={query}, user_id={user_id}")
     if not user_id:
         return "无法获取用户ID。"
 

@@ -1,7 +1,7 @@
 """验证高危检测在多轮对话中每一轮都会触发（而非仅首轮）。
 
 场景：用户先聊普通租房纠纷，第二轮才追加"对方上门殴打我"这类高危案情。
-修复前 check_urgency 仅在 round==0 执行、且 dispatcher 在 round>0 时绕过该节点，
+修复前 check_urgency 仅在 round==0 执行、且旧分发节点在后续轮绕过该节点，
 导致中途追加的高危内容不会熔断。本测试验证修复后每轮都会重跑高危检测。
 """
 import asyncio
@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 import src.agents.legal_guide.graph as g
 from src.agents.legal_guide.state import GuideState, GuidePhase
 from src.agents.legal_guide.graph import (
-    node_check_urgency, route_dispatcher, route_after_urgency,
+    node_check_urgency, node_prepare_turn, route_after_urgency,
     URGENCY_CRITICAL_RESPONSE, GuideDeps,
 )
 from langgraph.graph import END
@@ -45,16 +45,13 @@ def test_check_urgency_runs_on_later_rounds():
     assert result["messages"][0].content == URGENCY_CRITICAL_RESPONSE
 
 
-def test_dispatcher_always_routes_through_urgency():
-    """dispatcher 在任何轮次都要把流程导向 check_urgency（首轮经 load_context）。"""
-    s0 = GuideState(round=0)
-    assert route_dispatcher(s0) == "load_context"
-
-    s1 = GuideState(round=1)
-    assert route_dispatcher(s1) == "check_urgency"
-
-    s2 = GuideState(round=3, pending_ask_details=["有无合同？"])
-    assert route_dispatcher(s2) == "check_urgency"
+def test_prepare_turn_increments_user_round_once():
+    """每条用户消息只由 prepare_turn 推进一次轮次。"""
+    deps = MagicMock(spec=GuideDeps)
+    state = GuideState(round=2, total_rounds=2)
+    result = asyncio.run(node_prepare_turn(state, deps))
+    assert result["round"] == 3
+    assert result["total_rounds"] == 3
 
 
 def test_route_after_urgency_branches():
@@ -83,7 +80,7 @@ def test_normal_input_not_flagged():
 
 if __name__ == "__main__":
     test_check_urgency_runs_on_later_rounds()
-    test_dispatcher_always_routes_through_urgency()
+    test_prepare_turn_increments_user_round_once()
     test_route_after_urgency_branches()
     test_normal_input_not_flagged()
     print("ALL PASS")

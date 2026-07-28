@@ -33,7 +33,7 @@ async def fetch_pg_data():
     async with AsyncSessionLocal() as session:
         laws      = (await session.execute(select(Law))).scalars().all()
         articles  = (await session.execute(select(Article))).scalars().all()
-        cases     = (await session.execute(select(LegalCase))).scalars().all()
+        cases     = (await session.execute(select(LegalCase).limit(200))).scalars().all()
         channels  = (await session.execute(select(Channel))).scalars().all()
         law_cases = (await session.execute(select(LawCase))).scalars().all()
     logger.info(
@@ -123,14 +123,16 @@ def init_graph():
         # Channel
         ch_params = [
             {"pg_id": ch.id, "name": ch.name, "domain": ch.domain or "",
-             "channel_type": ch.channel_type or "", "region_code": ch.region_code or ""}
+             "channel_type": ch.channel_type or "", "region_code": ch.region_code or "",
+             "phone": ch.phone or "", "url": ch.url or ""}
             for ch in channels
         ]
         batch_run(s, """
             UNWIND $params AS p
             MERGE (n:Channel {pg_id: p.pg_id})
             SET n.name=p.name, n.domain=p.domain,
-                n.channel_type=p.channel_type, n.region_code=p.region_code
+                n.channel_type=p.channel_type, n.region_code=p.region_code,
+                n.phone=p.phone, n.url=p.url
         """, ch_params)
         logger.info(f"  Channel 节点: {len(ch_params)}")
 

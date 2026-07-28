@@ -1,7 +1,7 @@
 """init_legal_schema
 
 Revision ID: 98789af4c4dc
-Revises: 857e2741406f
+Revises: 61e6a9e8f8f1
 Create Date: 2026-07-23 22:49:47.765575
 
 """
@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = '98789af4c4dc'
-down_revision: Union[str, Sequence[str], None] = '857e2741406f'
+down_revision: Union[str, Sequence[str], None] = '61e6a9e8f8f1'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -122,9 +122,9 @@ def upgrade() -> None:
     op.drop_table('patients')
     op.add_column('consultations', sa.Column('user_id', sa.BigInteger(), nullable=False, comment='用户 ID'))
     op.add_column('consultations', sa.Column('channel_id', sa.BigInteger(), nullable=True, comment='推荐维权渠道 ID'))
-    op.add_column('consultations', sa.Column('issue_description', sa.Text(), nullable=True, comment='用户诉求描述（对标 chief_complaint）'))
-    op.add_column('consultations', sa.Column('legal_advice', sa.Text(), nullable=True, comment='法律建议结论（对标 diagnosis）'))
-    op.add_column('consultations', sa.Column('action_plan', sa.Text(), nullable=True, comment='行动方案 JSON（对标 prescription）'))
+    op.add_column('consultations', sa.Column('issue_description', sa.Text(), nullable=True, comment='用户诉求描述'))
+    op.add_column('consultations', sa.Column('legal_advice', sa.Text(), nullable=True, comment='法律建议结论'))
+    op.add_column('consultations', sa.Column('action_plan', sa.Text(), nullable=True, comment='行动方案 JSON'))
     op.alter_column('consultations', 'urgency_level',
                existing_type=sa.VARCHAR(length=20),
                comment='紧急程度：normal / urgent / emergency',

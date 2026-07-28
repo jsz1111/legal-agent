@@ -1,6 +1,7 @@
 import json
 import asyncio
 import time
+from functools import lru_cache
 from typing import Any, Iterable
 from langgraph.store.base import (
     BaseStore, Item, SearchItem,
@@ -53,7 +54,7 @@ class MilvusStore(BaseStore):
 
     用法：
         store = MilvusStore(
-            alias="tiangong_milvus",
+            alias="legalflow_milvus",
             embeddings=your_embedding_model,
             dims=1536,
         )
@@ -236,3 +237,16 @@ class MilvusStore(BaseStore):
                 score=hit.score,
             ))
         return items
+
+
+@lru_cache(maxsize=1)
+def get_milvus_store() -> MilvusStore:
+    """返回应用共享的长期记忆 Store，避免每次结论重复创建连接对象。"""
+    from src.infra.embedding import get_embedding_model
+    from src.infra.milvus_client import get_milvus_client_alias
+
+    return MilvusStore(
+        alias=get_milvus_client_alias(),
+        embeddings=get_embedding_model(),
+        dims=1024,
+    )

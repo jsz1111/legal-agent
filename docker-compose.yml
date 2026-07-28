@@ -1,19 +1,43 @@
 # ============================================================
 # 法律智能体 (legal-agent) — 基础设施层
-# 包含：Redis / Milvus / Neo4j / MinIO
-# PostgreSQL 共用 tiangong-postgres（legal_db 独立数据库）
+# 包含：PostgreSQL / Redis / Milvus / Neo4j / MinIO
 #
-# 端口约定（tiangong+偏移，避免冲突）：
-#   Redis:   6380  (tiangong: 6379)
-#   Milvus:  19531 (tiangong: 19530)
-#   Neo4j:   7475/7688 (tiangong: 7474/7687)
-#   MinIO:   9010/9011 (tiangong: 9000/9001)
+# 端口约定（避免与宿主机已有服务冲突）：
+#   PostgreSQL: 5433
+#   Redis:   6380
+#   Milvus:  19531
+#   Neo4j:   7475/7688
+#   MinIO:   9010/9011
 #
 # 启动：docker compose up -d
 # 停止：docker compose down
 # ============================================================
 
 services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL — 关系数据库
+  # 存储：法律元数据（laws/articles/legal_cases/channels）
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:17.9
+    container_name: legalflow-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: legal
+      POSTGRES_PASSWORD: legal123
+      POSTGRES_DB: legal_db
+    volumes:
+      - ./docker/postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - legal-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legal -d legal_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ----------------------------------------------------------
   # Redis Stack — 短期记忆

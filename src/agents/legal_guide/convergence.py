@@ -1,6 +1,8 @@
 """check_convergence：判断法律指引是否可以收敛输出结论。"""
 from __future__ import annotations
 
+from src.agents.legal_guide.evidence_rules import resolve_state_evidence_checklist
+
 
 def check_convergence(
     laws: list[dict],
@@ -37,4 +39,43 @@ def check_convergence(
     if not laws and not milvus_hit and current_round >= 1:
         return True, True
 
+    return False, False
+
+
+def should_conclude(state, max_rounds: int = 12) -> tuple[bool, bool]:
+    """新版收敛判断：基于 total_rounds + confidence_tier + evidence_ratio。
+
+    Args:
+        state: GuideState
+        max_rounds: 最大总轮次（澄清+追问细节+追问证据）
+
+    Returns:
+        (should_stop, force_conclude)
+        should_stop: 是否停止追问，进入 conclude
+        force_conclude: 是否因轮次上限强制收敛
+    """
+    # 1. 轮次上限（强制收敛）
+    if state.total_rounds >= max_rounds:
+        return True, True
+
+    # 2. 用户主动要求结论（预留字段，当前未实现）
+    if hasattr(state, 'wants_conclude') and state.wants_conclude:
+        return True, False
+
+    # 3. 置信度判断
+    tier = state.confidence_tier
+    fact_confidence = state.confidence_score
+
+    # HIGH 档：法律事实清晰 + 有一定证据 → 可以收敛
+    if tier == "HIGH" and len(state.evidence_confirmed) >= 1:
+        return True, False
+
+    # MEDIUM 档：法律事实基本清楚，证据覆盖 40% 以上 → 可以收敛
+    if tier == "MEDIUM":
+        evidence_tpl = resolve_state_evidence_checklist(state).items
+        evidence_ratio = len(state.evidence_confirmed) / max(len(evidence_tpl), 3)
+        if evidence_ratio >= 0.4:
+            return True, False
+
+    # LOW 档：继续追问（除非达到轮次上限）
     return False, False

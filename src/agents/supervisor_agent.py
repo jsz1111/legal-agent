@@ -1,3 +1,5 @@
+import asyncio
+import re
 from dataclasses import dataclass
 
 from langchain.agents.middleware import SummarizationMiddleware
@@ -14,17 +16,16 @@ load_dotenv()
 
 
 def _get_embedding_model():
-    """返回向量化模型。根据你的实际情况替换。"""
-    # 使用 DashScope（阿里云）: 环境变量需要配置 DASHSCOPE_API_KEY
-    from langchain_community.embeddings import DashScopeEmbeddings
-    return DashScopeEmbeddings(model="text-embedding-v3")
+    """返回向量化模型，从 src.infra.embedding 统一获取，保持与灌库一致。"""
+    from src.infra.embedding import get_embedding_model
+    return get_embedding_model()
 
 
 SUPERVISOR_SYSTEM_PROMPT = """你是法律多智能体平台的智能总助手，面向不懂法的普通市民和企业用户提供法律服务。
 
 ## 你的职责
 
-识别用户意图，调用对应的专项助手处理，整合结果后给出清晰、友好的回复。
+识别用户意图，调用对应的专项助手处理，将结果原封不动传递给用户。
 你自己不直接回答任何法律问题，必须通过专项助手完成。
 
 ## 可调用的专项助手
@@ -35,8 +36,8 @@ SUPERVISOR_SYSTEM_PROMPT = """你是法律多智能体平台的智能总助手�
   注意：后续多轮追问由系统自动路由，无需再次调用此工具
 
 - call_legal_qa_agent：法律知识问答
-  适用：用户询问法律概念、法条含义、制度性知识、维权流程等通用法律知识时
-  示例："劳动仲裁流程是什么"、"诉讼时效是多久"、"什么是合同解除"、"消费者权益保护法的适用范围"
+  适用：用户询问法律概念、法条含义、制度性知识、维权流程，以及中国法律年鉴中的案件数量、趋势、比例等法律统计问题
+  示例："劳动仲裁流程是什么"、"诉讼时效是多久"、"2020年劳动争议一审收案多少"
 
 - call_professional_agent：专业法律服务（功能建设中）
   适用：法律从业者需要裁决预测、案件分析、文书摘要等专业服务时
@@ -46,6 +47,7 @@ SUPERVISOR_SYSTEM_PROMPT = """你是法律多智能体平台的智能总助手�
 
 - call_operation_agent：运营数据查询（仅限内部运营人员）
   适用：查询平台咨询量、领域分布、用户数据等运营统计时
+  注意：中国法律年鉴的法院、检察、公安等法律统计不属于平台运营数据，必须调用 call_legal_qa_agent
 
 ## 记忆工具
 
@@ -57,7 +59,8 @@ SUPERVISOR_SYSTEM_PROMPT = """你是法律多智能体平台的智能总助手�
 1. 路由优先级：用户描述具体纠纷/事件 → call_guide_agent；询问法律知识/概念 → call_legal_qa_agent；意图不明确时默认调用 call_guide_agent。
 2. 传递消息规则：调用专项助手时，message 参数必须原样传递用户的原始输入，禁止改写或补充。如果 search_memory 检索到相关历史信息，以"[长期记忆] xxx"格式附加在用户原文之后。
 3. 紧急情形优先：识别到"人身安全威胁"、"正在遭受暴力"、"被拘留"等紧急关键词时，立即提示用户拨打 110（警察）或 12348（法律援助），不要等待流程。
-4. 语气温和通俗：用普通人能理解的语言表达，避免堆砌法律术语。"""
+4. 语气温和通俗：用普通人能理解的语言表达，避免堆砌法律术语。
+5. 透传规则（最高优先级）：调用 call_guide_agent 或 call_legal_qa_agent 后，必须将工具返回的完整内容**原封不动**直接输出给用户，禁止摘要、改写、压缩或在前后添加任何自己的评论。专项助手的回复即为最终回复，直接输出即可。"""
 
 
 
@@ -88,13 +91,13 @@ async def create_supervisor_agent():
 
     # 4. 创建 Agent
     agent = create_agent(
-        model="deepseek-chat",
+        model="deepseek-v4-flash",
         tools=tools,
         system_prompt=SUPERVISOR_SYSTEM_PROMPT,
         context_schema=UserContext,
         middleware=[
             SummarizationMiddleware( # 会话总结压缩
-                model="deepseek-chat",
+                model="deepseek-v4-flash",
                 trigger=[
                     ("tokens", 4000),  # token数达到4k时触发
                     ("messages", 6),  # 或消息数达到 4条时触发
@@ -111,13 +114,39 @@ async def create_supervisor_agent():
 
 # 模块级单例：避免每次请求都重新创建 agent 和 checkpointer
 _supervisor_agent = None
+_supervisor_loop = None
+
+
+_NAME_RECALL_QUESTIONS = ("我叫什么", "我叫啥", "我的名字", "我的姓名")
+_EXPLICIT_NAME_RE = re.compile(r"(?:我叫|我的名字是|我的姓名是)([\u4e00-\u9fff·]{2,20})")
+
+
+def _exact_name_recall(query: str, messages: list) -> str | None:
+    """Return the user's exact self-introduced name instead of an LLM-shortened salutation."""
+    if not any(marker in query for marker in _NAME_RECALL_QUESTIONS):
+        return None
+    for message in reversed(messages[:-1]):
+        role = getattr(message, "type", "")
+        content = getattr(message, "content", "")
+        if isinstance(message, dict):
+            role = message.get("role", "")
+            content = message.get("content", "")
+        if role not in ("human", "user"):
+            continue
+        if str(content).strip() == query.strip():
+            continue
+        if match := _EXPLICIT_NAME_RE.search(str(content)):
+            return f"你刚才说你叫{match.group(1)}。"
+    return None
 
 # 返回 agent
 async def get_supervisor_agent():
     """返回全局单例 Agent，首次调用时初始化。"""
-    global _supervisor_agent
-    if _supervisor_agent is None:
+    global _supervisor_agent, _supervisor_loop
+    current_loop = asyncio.get_running_loop()
+    if _supervisor_agent is None or _supervisor_loop is not current_loop:
         _supervisor_agent = await create_supervisor_agent()
+        _supervisor_loop = current_loop
     return _supervisor_agent
 
 
@@ -134,4 +163,5 @@ async def chat_endpoint(user_id: str, session_id: str, message: str):
         config=config,
         context=UserContext(user_id=user_id, session_id=session_id),
     )
-    return result["messages"][-1].content
+    exact_recall = _exact_name_recall(message, result["messages"])
+    return exact_recall or result["messages"][-1].content
