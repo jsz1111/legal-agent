@@ -21,6 +21,10 @@ from src.agents.legal_guide.followup_catalog import (
     fact_rule_resolved,
     get_domain_followups,
 )
+from src.agents.legal_guide.followup_policy import (
+    rank_followup_candidates,
+    score_dynamic_proposal,
+)
 from src.core.config import get_settings
 
 
@@ -46,12 +50,14 @@ FOLLOWUP_PLANNER_PROMPT = """你是法律咨询工作流中的动态追问规划
 本轮检索到的真实法条候选（只能按编号引用，不得自行编造法条）：
 {law_sources}
 
-官方材料中提炼出的决策维度（它们只是候选维度，不是必须依次填写的问卷；问题必须结合本案动态改写）：
+应用层已经选出的最高价值决策维度（不得改选其他维度；你的职责是结合本案自然改写问题）：
 {decision_hints}
 
-请比较候选问题的信息增益和用户负担，只选择一项。规则：
+请判断该决策维度能否被自然、准确地询问，并生成一个问题。规则：
 1. 已在结构化案情或材料中出现的信息不得重复询问；用户刚说的话必须在 acknowledgement 中自然承接。
-2. question 只能有一个问号、只问一个中心问题；可以给一个简短回答提示，但不能把多个独立字段拼成表单。
+2. question 只服务于一个法律决策目标，而不是机械限制为一个字段。可以在一个自然句中组合
+   2-3 个紧密相关、用户通常能一起回答的要素（例如交易对象、商品和金额），但只能有一个问号，
+   不能把责任、时效、证据、诉求等不同决策目标拼成表单。
 3. 行为事实、用户主张和法律结论必须分开；不得把任何尚未核验的事实直接写成违法、违约、侵权、犯罪或责任成立。
 4. 若继续追问不会明显改变方案，should_ask=false。不要为了填满字段而追问。
 5. basis_kind="law" 时 law_index 必须对应上方真实法条编号；否则用 basis_kind="official_elements"，表示问题来自官方办事/示范文本要素。
@@ -63,7 +69,7 @@ FOLLOWUP_PLANNER_PROMPT = """你是法律咨询工作流中的动态追问规划
 11. contextual_reason 用一句自然语言解释为什么此刻问这个问题，必须承接本案具体事实，不得写法律结论或法条。acknowledgement、question、contextual_reason 连起来应像同一段真实对话，而不是三段表单文案。
 12. ask_type=evidence 时，question 必须询问某项材料是否存在、是否保留或能否找到；不能把它改成询问付款方式、行为方式等新的事实问题。
 13. contextual_reason 不得擅自认定“属于违法/不符合标准/构成侵权或犯罪”，也不要假设对方一定会否认、拒绝或抗辩。
-14. 已追问轮数达到体验软上限后，只能保留会明显改变责任、请求、时效、管辖、程序、关键证据或安全措施的问题；否则 should_ask=false，系统会直接生成方案。
+14. 候选排序、信息增益、用户负担和是否超过追问阈值由应用程序决定；不得自行给这些项目打分。
 
 只输出 JSON：
 {{
@@ -79,9 +85,7 @@ FOLLOWUP_PLANNER_PROMPT = """你是法律咨询工作流中的动态追问规划
   "acknowledgement": "自然承接本轮新增信息",
   "acknowledged_fact_keys": ["实际承接的案情事实key"],
   "basis_kind": "law或official_elements",
-  "law_index": 0,
-  "information_gain": 0.0,
-  "user_burden": 0.0
+  "law_index": 0
 }}"""
 
 
@@ -103,8 +107,6 @@ class FollowupPlanProposal(BaseModel):
     acknowledged_fact_keys: list[str] = Field(default_factory=list)
     basis_kind: str = "official_elements"
     law_index: int = -1
-    information_gain: float = 0.0
-    user_burden: float = 0.0
 
 
 def _json_content(value: str) -> dict[str, Any]:
@@ -209,7 +211,8 @@ def _case_dimension_context(state: Any) -> tuple[set[str], dict[str, list[str]]]
     return dimensions, statements
 
 
-def _candidate_coverage(slot: str, state: Any) -> dict[str, list[str]]:
+def candidate_coverage(slot: str, state: Any) -> dict[str, list[str]]:
+    """Return known and missing semantic dimensions for a catalog slot."""
     dimensions, statements = _case_dimension_context(state)
     requirements = _SLOT_ALIASES.get(slot, ())
     known_dimensions: list[str] = []
@@ -237,7 +240,8 @@ def _candidate_coverage(slot: str, state: Any) -> dict[str, list[str]]:
     }
 
 
-def _candidate_rows(state: Any) -> tuple[list[dict[str, Any]], Any]:
+def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
+    """Build unresolved catalog candidates from structured case state."""
     domain_rules = get_domain_followups(getattr(state, "legal_domain", ""))
     asked = set(getattr(state, "asked_followup_ids", []) or [])
     asked.update(getattr(state, "asked_decision_keys", []) or [])
@@ -245,13 +249,14 @@ def _candidate_rows(state: Any) -> tuple[list[dict[str, Any]], Any]:
     for rule in domain_rules.facts:
         if rule.slot == "current_safety" and not getattr(state, "safety_relevant", False):
             continue
-        coverage = _candidate_coverage(rule.slot, state)
+        coverage = candidate_coverage(rule.slot, state)
         resolved_by_dimensions = bool(_SLOT_ALIASES.get(rule.slot)) and not coverage["missing"]
         if rule.id not in asked and not fact_rule_resolved(rule, state) and not resolved_by_dimensions:
             rows.append({
                 "id": rule.id, "kind": "facts", "decision_dimension": rule.slot,
                 "seed_question": rule.question, "legal_effect": rule.why,
                 "low_burden_hint": rule.answer_hint, "coverage": coverage,
+                "priority": rule.priority,
             })
     known_evidence = list(getattr(state, "evidence_confirmed", []) or []) + list(
         getattr(state, "evidence_unavailable", []) or []
@@ -262,6 +267,7 @@ def _candidate_rows(state: Any) -> tuple[list[dict[str, Any]], Any]:
                 "id": rule.id, "kind": "evidence", "decision_dimension": rule.evidence_key,
                 "seed_question": rule.question, "legal_effect": rule.purpose,
                 "alternatives": rule.alternatives,
+                "priority": rule.priority,
                 "coverage": {
                     "known": known_evidence[-3:],
                     "missing": [rule.item],
@@ -382,7 +388,7 @@ def _question_is_duplicate(question: str, asked: list[str]) -> bool:
 
 
 def _single_question(question: str) -> str:
-    """Repair a useful plan that accidentally appends a second question."""
+    """Keep one decision objective while allowing related fields in one sentence."""
     compact = " ".join(str(question or "").split())
     marks = [index for index, char in enumerate(compact) if char in "？?"]
     if len(marks) <= 1:
@@ -390,9 +396,29 @@ def _single_question(question: str) -> str:
     return compact[: marks[0] + 1].strip()
 
 
-def _stop_plan(mode: str) -> dict[str, Any]:
+def _stop_plan(
+    mode: str,
+    *,
+    decision_trace: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Fail closed instead of falling back to the first catalog question."""
-    return {"should_ask": False, "planner_mode": mode}
+    result: dict[str, Any] = {"should_ask": False, "planner_mode": mode}
+    if decision_trace:
+        result["decision_trace"] = decision_trace
+    return result
+
+
+def _policy_trace(
+    *,
+    mode: str,
+    scores: list[Any],
+    selected_id: str = "",
+) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "selected_candidate_id": selected_id,
+        "candidates": [item.model_dump() for item in scores[:8]],
+    }
 
 
 def _grounded_acknowledgement(state: Any, requested_keys: list[str]) -> tuple[str, list[str]]:
@@ -420,9 +446,26 @@ def _grounded_acknowledgement(state: Any, requested_keys: list[str]) -> tuple[st
 
 async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
     """Choose and phrase the single highest-value next question."""
-    candidates, source = _candidate_rows(state)
+    candidates, source = build_followup_candidates(state)
     if not candidates and not getattr(state, "allow_extra_followups", False):
         return _stop_plan("no_candidates")
+    policy_scores = rank_followup_candidates(candidates, state)
+    selected_score = next((item for item in policy_scores if item.eligible), None)
+    selected_candidate = next(
+        (
+            item for item in candidates
+            if selected_score and item["id"] == selected_score.candidate_id
+        ),
+        None,
+    )
+    if candidates and selected_candidate is None:
+        return _stop_plan(
+            "policy_no_eligible_candidate",
+            decision_trace=_policy_trace(
+                mode="policy_no_eligible_candidate",
+                scores=policy_scores,
+            ),
+        )
     law_rows = _law_rows(state)
     asked = list(getattr(state, "asked_details", []) or [])
     settings = get_settings()
@@ -453,6 +496,13 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
             "official_source": source.model_dump(),
             "information_gain": 1.0,
             "user_burden": 0.05,
+            "policy_score": 1.0,
+            "decision_effects": ["safety"],
+            "decision_trace": _policy_trace(
+                mode="mandatory_safety_gate",
+                scores=policy_scores,
+                selected_id=safety_gate["id"],
+            ),
             "planner_mode": "mandatory_safety_gate",
         }
     prompt = FOLLOWUP_PLANNER_PROMPT.format(
@@ -466,7 +516,11 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
         evidence_unavailable="；".join(getattr(state, "evidence_unavailable", []) or []) or "暂无",
         asked_questions="\n".join(f"- {item}" for item in asked) or "- 暂无",
         law_sources=json.dumps(law_rows, ensure_ascii=False, indent=2),
-        decision_hints=json.dumps(candidates, ensure_ascii=False, indent=2),
+        decision_hints=json.dumps(
+            [selected_candidate] if selected_candidate else [],
+            ensure_ascii=False,
+            indent=2,
+        ),
     )
     try:
         response = await llm.ainvoke([SystemMessage(content=prompt)])
@@ -474,17 +528,55 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
         plan = proposal.model_dump()
     except (AttributeError, TypeError, ValueError, ValidationError, json.JSONDecodeError) as exc:
         logger.warning("动态追问规划失败，按现有信息收敛: {}", exc)
-        return _stop_plan("planner_error")
+        return _stop_plan(
+            "planner_error",
+            decision_trace=_policy_trace(
+                mode="planner_error",
+                scores=policy_scores,
+                selected_id=selected_score.candidate_id if selected_score else "",
+            ),
+        )
 
     if not bool(plan.get("should_ask")):
-        return {"should_ask": False, "planner_mode": plan.get("planner_mode", "dynamic")}
+        return _stop_plan(
+            "model_declined_selected_candidate",
+            decision_trace=_policy_trace(
+                mode="model_declined_selected_candidate",
+                scores=policy_scores,
+                selected_id=selected_score.candidate_id if selected_score else "",
+            ),
+        )
 
-    candidate_ids = {item["id"] for item in candidates}
-    candidate_id = str(plan.get("candidate_id") or "").strip()
-    selected_candidate = next(
-        (item for item in candidates if item["id"] == candidate_id),
-        None,
-    )
+    proposed_candidate_id = str(plan.get("candidate_id") or "").strip()
+    if selected_candidate:
+        if proposed_candidate_id and proposed_candidate_id != selected_candidate["id"]:
+            return _stop_plan(
+                "model_changed_policy_candidate",
+                decision_trace=_policy_trace(
+                    mode="model_changed_policy_candidate",
+                    scores=policy_scores,
+                    selected_id=selected_candidate["id"],
+                ),
+            )
+        candidate_id = selected_candidate["id"]
+        policy_score = selected_score
+    else:
+        candidate_id = ""
+        policy_score = score_dynamic_proposal(
+            decision_effects=list(plan.get("decision_effects") or []),
+            ask_type=str(plan.get("ask_type") or "facts"),
+            state=state,
+        )
+        if not policy_score.eligible:
+            return _stop_plan(
+                "policy_rejected_dynamic",
+                decision_trace={
+                    "mode": "policy_rejected_dynamic",
+                    "selected_candidate_id": "",
+                    "candidates": [policy_score.model_dump()],
+                },
+            )
+
     raw_question = " ".join(str(plan.get("question") or "").split())
     question = _single_question(raw_question)
     if question != raw_question:
@@ -499,28 +591,25 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
     ):
         logger.info("证据追问偏离材料存在性，回退到权威题库问题 | raw={}", question)
         question = str(selected_candidate.get("seed_question") or question).strip()
-    information_gain = float(plan.get("information_gain") or 0.0)
-    user_burden = float(plan.get("user_burden") or 0.0)
     decision_key = re.sub(
         r"[^a-zA-Z0-9_.:-]+", "_", str(plan.get("decision_key") or "")
     ).strip("_")
     asked_decision_keys = set(getattr(state, "asked_decision_keys", []) or [])
-    gain_floor = (
-        0.55
-        if getattr(state, "ask_rounds", 0) >= settings.GUIDE_SOFT_ASK_ROUNDS
-        else 0.3
-    )
     if (
         ask_type not in {"facts", "evidence"} or not question
         or _question_is_duplicate(question, asked)
-        or (candidate_id and candidate_id not in candidate_ids)
         or (decision_key and decision_key in asked_decision_keys)
-        or information_gain < gain_floor
-        or user_burden > 0.9
         or _FREE_TEXT_LEGAL_CLAIM.search(question)
     ):
         logger.warning("动态追问计划未通过结构校验，按现有信息收敛 | plan={}", plan)
-        return _stop_plan("policy_rejected")
+        return _stop_plan(
+            "policy_rejected",
+            decision_trace=_policy_trace(
+                mode="policy_rejected",
+                scores=policy_scores,
+                selected_id=candidate_id,
+            ),
+        )
     if "？" not in question and "?" not in question:
         question += "？"
 
@@ -546,9 +635,16 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
         "basis_kind": basis_kind, "law_index": law_index,
         "law_source": law_rows[law_index] if law_index >= 0 else {},
         "official_source": source.model_dump(),
-        "information_gain": float(plan.get("information_gain") or 0.5),
-        "user_burden": float(plan.get("user_burden") or 0.5),
-        "planner_mode": plan.get("planner_mode", "dynamic"),
+        "information_gain": policy_score.information_gain,
+        "user_burden": policy_score.user_burden,
+        "policy_score": policy_score.net_score,
+        "decision_effects": policy_score.decision_effects,
+        "decision_trace": _policy_trace(
+            mode="deterministic_policy",
+            scores=policy_scores if policy_scores else [policy_score],
+            selected_id=candidate_id,
+        ),
+        "planner_mode": "deterministic_policy",
     }
 
 

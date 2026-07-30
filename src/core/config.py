@@ -18,14 +18,17 @@ class Settings(BaseSettings):
     GUIDE_CONFIDENCE_MID: float = 0.50    # MID 档：中等置信度
     # 澄清/追问轮次上限
     GUIDE_MAX_CLARIFY_ROUNDS: int = 2     # 最多澄清 2 轮
-    GUIDE_MAX_ASK_ROUNDS: int = 6         # 事实+证据追问总上限
+    GUIDE_MAX_ASK_ROUNDS: int = 6         # 默认事实+证据追问硬上限
+    GUIDE_MAX_OPT_IN_ASK_ROUNDS: int = 8  # 用户明确继续后允许的绝对追问上限
     GUIDE_SOFT_ASK_ROUNDS: int = 3        # 用户体验软上限，通常到此即按现有信息给方案
     GUIDE_MAX_FACT_ROUNDS: int = 3        # 最多追问关键事实 3 轮
     GUIDE_MAX_EVIDENCE_ROUNDS: int = 3    # 最多追问证据 3 轮
-    GUIDE_MAX_LOW_INFO_ANSWERS: int = 2   # 连续“不知道/没有”后停止盘问
+    GUIDE_NO_PROGRESS_CHOICE_ROUNDS: int = 2  # 连续无进展后切换为低负担选择
+    GUIDE_MAX_LOW_INFO_ANSWERS: int = 3   # 连续三次真正无进展后停止盘问
     GUIDE_MAX_COUNTER_QUESTIONS: int = 3  # 连续只反问 3 次后按现有信息收敛
-    GUIDE_MAX_TOTAL_ROUNDS: int = 12      # 用户消息达到 12 轮时强制收敛
+    GUIDE_MAX_TOTAL_ROUNDS: int = 20      # 仅作异常循环保险，不作为普通收敛依据
     GUIDE_SESSION_TTL: int = 86400         # 法律指引状态与文书保留 24 小时，支持离开页面后继续
+    GUIDE_CASE_BOUNDARY_CONFIDENCE: float = 0.72  # 低于该置信度时不继承旧案，先向用户确认
     # 检索超时配置（秒）
     GUIDE_RETRIEVE_TIMEOUT_STATUTE: float = 8.0   # 法条检索超时
     GUIDE_RETRIEVE_TIMEOUT_CASE: float = 5.0      # 案例检索超时

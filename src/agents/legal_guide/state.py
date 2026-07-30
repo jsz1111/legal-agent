@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Annotated
+import uuid
 from pydantic import BaseModel, Field
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
@@ -25,6 +26,13 @@ class GuideState(BaseModel):
     round: int = 0  # 用户消息轮次，只由 prepare_turn 每轮递增一次
     session_id: str = ""
     total_rounds: int = 0  # 兼容旧状态的总轮次计数，用于强制收敛
+    case_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    case_generation: int = 1
+    awaiting_case_boundary: bool = False
+    pending_case_message: str = ""
+    case_boundary_audit: list[dict] = Field(default_factory=list)
+    turn_control_intent: str = ""
+    turn_contains_case_details: bool = False
 
     # 法律问题追踪（对标症状四元组）
     # confirmed_issues / unmatched_issues 是两个互不合并的池：
@@ -43,6 +51,8 @@ class GuideState(BaseModel):
     asked_followup_ids: list[str] = Field(default_factory=list)  # 结构化题库 ID，跨文案稳定防重复
     pending_followup_ids: list[str] = Field(default_factory=list) # 当前待答题库 ID（通常仅1项）
     followup_plan: dict = Field(default_factory=dict)             # assess_retrieve 动态生成，ask_followup 负责展示
+    followup_decision_trace: list[dict] = Field(default_factory=list)
+    decision_sufficiency: dict = Field(default_factory=dict)
     asked_decision_keys: list[str] = Field(default_factory=list)  # 已追问的法律决策点，跨问法去重
     fact_records: dict[str, dict] = Field(default_factory=dict)   # 用户陈述的清晰度/冲突状态，不代表已查证
     evidence_assessments: dict[str, dict] = Field(default_factory=dict) # 存在性、相关性、真实性和可采性分层
@@ -50,7 +60,7 @@ class GuideState(BaseModel):
     evidence_unverified: list[str] = Field(default_factory=list)  # 图片/转述中提到但本次未直接核验的材料
     deferred_questions: list[str] = Field(default_factory=list)  # 追问期间用户反问、尚未答复的问题
     consecutive_counter_questions: int = 0                       # 连续未回答待确认项的反问次数
-    consecutive_low_info_answers: int = 0                        # 连续“不知道/没有材料”，用于体验收敛
+    consecutive_low_info_answers: int = 0                        # 连续真正未推进案情或决策的回答
 
     # 检索结果（issue_search节点写入，conclude节点读取）
     candidate_laws: list[dict] = Field(default_factory=list)      # graph查询到的适用法律元信息
@@ -78,6 +88,8 @@ class GuideState(BaseModel):
     urgency_level: str = "normal"      # critical / time / normal
     safety_relevant: bool = False        # 当前纠纷是否涉及用户或他人的人身安全
     current_safety_status: str = "not_applicable"  # danger / safe / unknown / not_applicable
+    safety_pause_active: bool = False     # 现实危险处理中暂停普通流程；确认安全后恢复同一案件
+    safety_pause_case_message: str = ""   # 暂停前的原始危险陈述，恢复后归入同一案件
     time_warning: str = ""             # 时效提醒文案（由 check_urgency 生成）
     clarify_rounds: int = 0            # 澄清轮数（上限 2 轮）
     ask_rounds: int = 0                # 事实+证据追问总轮数

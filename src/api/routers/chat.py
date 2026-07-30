@@ -21,6 +21,14 @@ from src.infra.redis_cache import get_checkpointer_redis
 from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.legal_guide.graph import run_guide, build_guide_deps
 from src.agents.legal_guide.state import GuideState, GuidePhase
+from src.agents.legal_guide.case_lifecycle import (
+    CaseRelation,
+    boundary_audit_entry,
+    boundary_confirmation_reply,
+    decide_case_boundary,
+    resolve_pending_boundary,
+    start_isolated_case,
+)
 
 settings = get_settings()
 
@@ -34,6 +42,8 @@ class ChatRequest(BaseModel):
 
 
 class DebugInfo(BaseModel):
+    case_id: str = ""
+    case_boundary_status: str = ""
     domain: str = ""
     confidence_tier: str = ""
     statute_hits: str = ""
@@ -63,7 +73,116 @@ async def _has_guide_session(redis, active_key: str, state_key: str) -> bool:
 
 def _should_keep_guide_state(state: GuideState) -> bool:
     """已识别具体法律问题的终态仍需支持生成或重生成参考文书。"""
-    return bool(state.confirmed_issues)
+    return bool(state.confirmed_issues or state.safety_pause_active)
+
+
+def _guide_debug(state: GuideState) -> DebugInfo:
+    """Expose the current case identity and retrieval state for UI/debugging."""
+
+    return DebugInfo(
+        case_id=state.case_id,
+        case_boundary_status=(
+            "awaiting_confirmation" if state.awaiting_case_boundary else "resolved"
+        ),
+        domain=state.legal_domain or "",
+        confidence_tier=state.confidence_tier or "GATHERING",
+        statute_hits=state.law_context_str or "",
+        case_hits=state.case_context_str or "",
+        graph_laws=state.candidate_laws or [],
+        graph_channels=state.relevant_channels or [],
+        fallback_guide=state.fallback_guide,
+    )
+
+
+async def _prepare_case_turn(
+    *,
+    message: str,
+    existing_state: GuideState,
+    thread_id: str,
+    user_id: str | None,
+    llm,
+    redis,
+    state_key: str,
+) -> tuple[str, GuideState, str | None]:
+    """Resolve case ownership before any message can mutate the guide state."""
+
+    if existing_state.safety_pause_active:
+        # 现实危险是可恢复中断。危险状态没有被明确解除前，下一条消息必须先回到
+        # 同一状态机重新做安全判断，不能因为首轮尚未提取法律问题而丢失案件。
+        decision = await decide_case_boundary(existing_state, message, llm)
+        existing_state.phase = GuidePhase.ISSUE_SEARCH
+        existing_state.force_conclude = False
+        existing_state.wants_conclude = False
+        existing_state.turn_control_intent = decision.control_intent.value
+        existing_state.turn_contains_case_details = decision.carries_case_detail
+        return message, existing_state, None
+
+    if existing_state.awaiting_case_boundary:
+        decision = await resolve_pending_boundary(existing_state, message, llm)
+        case_message = existing_state.pending_case_message
+    else:
+        decision = await decide_case_boundary(existing_state, message, llm)
+        case_message = message
+
+    transition = boundary_audit_entry(existing_state, case_message, decision)
+    if decision.relation == CaseRelation.UNCERTAIN:
+        existing_state.awaiting_case_boundary = True
+        if not existing_state.pending_case_message:
+            existing_state.pending_case_message = message
+        existing_state.case_boundary_audit = [
+            *existing_state.case_boundary_audit,
+            transition,
+        ][-30:]
+        await redis.set(
+            state_key,
+            existing_state.model_dump_json(),
+            ex=settings.GUIDE_SESSION_TTL,
+        )
+        return message, existing_state, boundary_confirmation_reply(existing_state)
+
+    pending_confirmation = existing_state.awaiting_case_boundary
+    effective_message = case_message
+    if pending_confirmation and decision.carries_case_detail:
+        effective_message = f"{case_message}\n用户确认时补充：{message}"
+
+    if decision.relation == CaseRelation.NEW:
+        archive_key = (
+            f"guide_case_archive:{thread_id}:{existing_state.case_id}"
+        )
+        await redis.set(
+            archive_key,
+            existing_state.model_dump_json(),
+            ex=settings.GUIDE_SESSION_TTL,
+        )
+        next_state = start_isolated_case(
+            existing_state,
+            thread_id=thread_id,
+            user_id=user_id,
+            transition=transition,
+        )
+        next_state.turn_control_intent = decision.control_intent.value
+        next_state.turn_contains_case_details = decision.carries_case_detail
+        return effective_message, next_state, None
+
+    existing_state.turn_control_intent = decision.control_intent.value
+    existing_state.turn_contains_case_details = decision.carries_case_detail
+    existing_state.awaiting_case_boundary = False
+    existing_state.pending_case_message = ""
+    existing_state.case_boundary_audit = [
+        *existing_state.case_boundary_audit,
+        transition,
+    ][-30:]
+    if existing_state.phase == GuidePhase.END:
+        existing_state.phase = GuidePhase.ISSUE_SEARCH
+        existing_state.force_conclude = False
+        existing_state.wants_conclude = False
+        existing_state.consecutive_low_info_answers = 0
+        existing_state.consecutive_counter_questions = 0
+        existing_state.awaiting_supplement_choice = False
+        existing_state.supplement_choice_offered = False
+        existing_state.supplement_choice = ""
+        existing_state.allow_extra_followups = False
+    return effective_message, existing_state, None
 
 
 async def _pop_statistics_artifact(redis, user_id: str, session_id: str) -> dict | None:
@@ -231,27 +350,22 @@ async def _run_guide_turn(
             await redis.set(state_key, existing_state.model_dump_json(), ex=ttl)
             await redis.set(active_key, "1", ex=ttl)
 
-            debug = DebugInfo(
-                domain=existing_state.legal_domain or "",
-                confidence_tier=existing_state.confidence_tier or "",
-                statute_hits=existing_state.law_context_str or "",
-                case_hits=existing_state.case_context_str or "",
-                graph_laws=existing_state.candidate_laws or [],
-                graph_channels=existing_state.relevant_channels or [],
-                fallback_guide=existing_state.fallback_guide,
-            )
+            debug = _guide_debug(existing_state)
             return generated.text, debug, document_artifact
-        # END 状态只因“等待文书确认”而保留。用户若继续补充案情，则重新进入
-        # 法律问题提取，而不是重复返回上一轮结论。
-        logger.info("结束状态收到非文书消息，重新打开法律指引 | thread={}", thread_id)
-        existing_state.phase = GuidePhase.ISSUE_SEARCH
-        existing_state.force_conclude = False
-        existing_state.wants_conclude = False
-        existing_state.consecutive_counter_questions = 0
-        existing_state.awaiting_supplement_choice = False
-        existing_state.supplement_choice_offered = False
-        existing_state.supplement_choice = ""
-        existing_state.allow_extra_followups = False
+
+    if existing_state:
+        message, existing_state, boundary_reply = await _prepare_case_turn(
+            message=message,
+            existing_state=existing_state,
+            thread_id=thread_id,
+            user_id=user_id,
+            llm=deps.llm,
+            redis=redis,
+            state_key=state_key,
+        )
+        if boundary_reply is not None:
+            await redis.set(active_key, "1", ex=settings.GUIDE_SESSION_TTL)
+            return boundary_reply, _guide_debug(existing_state), None
 
     reply, new_state = await run_guide(
         user_message=message,
@@ -261,15 +375,7 @@ async def _run_guide_turn(
         user_id=user_id,
     )
 
-    debug = DebugInfo(
-        domain=new_state.legal_domain or "",
-        confidence_tier=new_state.confidence_tier or "GATHERING",  # 未打分时显示 GATHERING
-        statute_hits=new_state.law_context_str or "",
-        case_hits=new_state.case_context_str or "",
-        graph_laws=new_state.candidate_laws or [],
-        graph_channels=new_state.relevant_channels or [],
-        fallback_guide=new_state.fallback_guide,  # 透传案例检索兜底指引
-    )
+    debug = _guide_debug(new_state)
 
     # 指引结束后依据结构化案情保留状态，不依赖回复中的固定邀请文案。
     if new_state.phase == GuidePhase.END:
