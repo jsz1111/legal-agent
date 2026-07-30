@@ -62,7 +62,11 @@ async def _fake_clarify(state: GuideState, deps: GuideDeps) -> dict:
 
 async def _fake_assess(state: GuideState, deps: GuideDeps) -> dict:
     is_complete = len(state.evidence_confirmed) >= 2 and len(state.collected_facts) >= 2
-    force = state.total_rounds >= settings.GUIDE_MAX_TOTAL_ROUNDS
+    force = (
+        state.force_conclude
+        or state.total_rounds >= settings.GUIDE_MAX_TOTAL_ROUNDS
+        or state.ask_rounds >= settings.GUIDE_MAX_ASK_ROUNDS
+    )
     return {
         "confidence_score": 0.85 if is_complete else 0.25,
         "confidence_tier": "HIGH" if is_complete else "LOW",
@@ -71,32 +75,36 @@ async def _fake_assess(state: GuideState, deps: GuideDeps) -> dict:
         "relevant_channels": [{"name": "劳动保障监察", "phone": "12333"}],
         "last_confirmed_count": len(state.confirmed_issues),
         "force_conclude": force,
+        "followup_plan": {
+            "should_ask": not is_complete and not force,
+            "ask_type": "facts",
+            "decision_key": "wage_duration_and_amount",
+            "candidate_id": "",
+            "question": "公司拖欠工资大约多久、金额多少？",
+            "reason": "确认请求范围",
+            "information_gain": 0.8,
+            "user_burden": 0.2,
+        },
     }
 
 
 async def _fake_ask(state: GuideState, deps: GuideDeps) -> dict:
-    ask_type = guide_graph._next_ask_type(state)
-    if ask_type == "facts":
-        item = guide_graph._remaining_fact_questions(state)[0]
+    plan = state.followup_plan
+    if plan.get("should_ask"):
+        item = plan["question"]
         return {
             "phase": GuidePhase.DETAIL_GATHER,
             "ask_rounds": state.ask_rounds + 1,
             "facts_rounds": state.facts_rounds + 1,
             "asked_details": state.asked_details + [item],
             "pending_ask_details": [item],
-            "pending_ask_type": "facts",
-            "messages": [AIMessage(content=f"相关法律主要看具体事实。您还记得{item}吗？")],
+            "pending_ask_type": plan.get("ask_type", "facts"),
+            "messages": [AIMessage(content=(
+                f"相关法律主要看具体事实。您还记得{item}吗？\n"
+                "如果不方便补充，直接回复“现在生成方案”。"
+            ))],
         }
-    item = guide_graph._remaining_evidence_questions(state)[0]
-    return {
-        "phase": GuidePhase.DETAIL_GATHER,
-        "ask_rounds": state.ask_rounds + 1,
-        "evidence_rounds": state.evidence_rounds + 1,
-        "asked_details": state.asked_details + [item],
-        "pending_ask_details": [item],
-        "pending_ask_type": "evidence",
-        "messages": [AIMessage(content=f"现有法条支持追讨欠薪。您手边有{item}吗？")],
-    }
+    return {}
 
 
 async def _fake_parse(state: GuideState, deps: GuideDeps) -> dict:
@@ -105,9 +113,11 @@ async def _fake_parse(state: GuideState, deps: GuideDeps) -> dict:
     unavailable = state.evidence_unavailable
     facts = state.collected_facts
     evidence = state.evidence_confirmed
+    low_info = state.consecutive_low_info_answers
     if "没有" in last:
         unavailable = _merge(unavailable, pending)
         facts = _merge(facts, [f"用户无法提供：{pending[0]}"] if pending else [])
+        low_info += 1
     if "图片证据" in last:
         evidence = _merge(evidence, ["工资转账截图"])
     return {
@@ -116,6 +126,8 @@ async def _fake_parse(state: GuideState, deps: GuideDeps) -> dict:
         "evidence_unavailable": unavailable,
         "evidence_confirmed": evidence,
         "collected_facts": facts,
+        "consecutive_low_info_answers": low_info,
+        "force_conclude": low_info >= settings.GUIDE_MAX_LOW_INFO_ANSWERS,
         "phase": GuidePhase.ISSUE_SEARCH,
     }
 
@@ -192,7 +204,7 @@ def test_elderly_unclear_and_evidence_poor_user_converges_by_ninth_turn():
     assert all(item["reply"] for item in trace)
 
 
-def test_knowledgeable_adult_gets_grounded_plan_in_first_turn():
+def test_knowledgeable_adult_gets_grounded_plan_without_an_extra_menu():
     message = "公司拖欠3个月工资24000元，上海，劳动合同、流水、考勤材料都在"
     with _scripted_graph():
         trace, state = _run_messages([message])
@@ -202,6 +214,27 @@ def test_knowledgeable_adult_gets_grounded_plan_in_first_turn():
     assert state.confidence_tier == "HIGH"
     assert "RETRIEVED_LAW" in trace[-1]["reply"]
     assert "维权胜算评估" in trace[-1]["reply"]
+    assert "继续补充" not in trace[0]["reply"]
+
+
+def test_long_dialogue_can_continue_beyond_soft_limit_and_stop_at_will():
+    messages = [
+        "公司拖欠工资",
+        "2024年入职",
+        "每月8000元",
+        "一共欠24000元",
+        "【图片证据补充】这是工资转账截图，属于图片证据",
+        "现在生成方案",
+    ]
+    with _scripted_graph():
+        trace, state = _run_messages(messages)
+
+    assert state.phase == GuidePhase.END
+    assert state.ask_rounds > settings.GUIDE_SOFT_ASK_ROUNDS
+    assert state.ask_rounds <= settings.GUIDE_MAX_ASK_ROUNDS
+    assert "维权胜算评估" in trace[-1]["reply"]
+    assert all("继续补充" not in item["reply"] for item in trace)
+    assert all(item["reply"] for item in trace)
 
 
 def test_multimodal_evidence_is_accumulated_before_next_retrieval():

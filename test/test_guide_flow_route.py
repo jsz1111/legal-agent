@@ -9,8 +9,6 @@ from langgraph.graph import END
 from src.agents.legal_guide.graph import (
     GuideDeps,
     _needs_clarify,
-    _next_ask_type,
-    _remaining_fact_questions,
     build_guide_graph,
     node_assess_retrieve,
     node_parse_details,
@@ -19,12 +17,39 @@ from src.agents.legal_guide.graph import (
     route_after_parse,
     run_guide,
 )
-from src.agents.legal_guide.followup_catalog import evidence_followups, fact_followups
 from src.agents.legal_guide.state import GuidePhase, GuideState
 from src.core.config import get_settings
+from src.api.routers.chat import _has_guide_session, _should_keep_guide_state
 
 
 settings = get_settings()
+
+
+class _SessionRedis:
+    def __init__(self, keys: set[str]):
+        self.keys = keys
+
+    async def exists(self, key: str):
+        return int(key in self.keys)
+
+
+def test_guide_session_recovers_when_only_structured_state_survives():
+    redis = _SessionRedis({"guide_state:u:s"})
+    assert asyncio.run(
+        _has_guide_session(redis, "guide_active:u:s", "guide_state:u:s")
+    ) is True
+
+
+def test_end_state_persistence_uses_structured_case_readiness():
+    ready = GuideState(
+        phase=GuidePhase.END,
+        confirmed_issues=["拖欠工资"],
+        legal_domain="labor_social_security",
+    )
+    urgent_without_case = GuideState(phase=GuidePhase.END)
+
+    assert _should_keep_guide_state(ready) is True
+    assert _should_keep_guide_state(urgent_without_case) is False
 
 
 def test_needs_clarify_2_round_cap():
@@ -60,56 +85,12 @@ def test_route_after_parse_branches():
     assert route_after_parse(answered) == "assess_retrieve"
 
 
-def test_followup_type_uses_explicit_fact_and_evidence_limits():
-    domain = "labor_social_security"
-    low = GuideState(legal_domain=domain, confidence_tier="LOW")
-    assert _next_ask_type(low) == "facts"
-
-    medium = GuideState(legal_domain=domain, confidence_tier="MEDIUM")
-    assert _next_ask_type(medium) == "evidence"
-
-    facts_exhausted = GuideState(
-        legal_domain=domain,
-        confidence_tier="LOW",
-        asked_followup_ids=[rule.id for rule in fact_followups(domain)],
-    )
-    assert _next_ask_type(facts_exhausted) == "evidence"
-
-    all_exhausted = GuideState(
-        legal_domain=domain,
-        confidence_tier="LOW",
-        asked_followup_ids=(
-            [rule.id for rule in fact_followups(domain)]
-            + [rule.id for rule in evidence_followups(domain)]
-        ),
-    )
-    assert _next_ask_type(all_exhausted) == ""
-
-    total_limit = GuideState(
-        legal_domain=domain,
-        confidence_tier="LOW",
-        ask_rounds=settings.GUIDE_MAX_ASK_ROUNDS,
-    )
-    assert _next_ask_type(total_limit) == ""
-
-
-def test_fact_followup_does_not_repeat_merchant_response_from_user_message():
-    state = GuideState(
-        legal_domain="consumer_market",
-        messages=[HumanMessage(content="店里说给我退钱，但我不知道该怎么办")],
-    )
-
-    remaining = _remaining_fact_questions(state)
-
-    assert "您在哪里买了什么商品或服务，大约花了多少钱？" in remaining
-    assert not any("商家沟通后" in question for question in remaining)
-
-
 def test_route_after_assess_retrieve_converges_or_asks_once():
     low = GuideState(
         legal_domain="labor_social_security",
         confidence_tier="LOW",
         total_rounds=1,
+        followup_plan={"should_ask": True},
     )
     assert route_after_assess_retrieve(low) == "ask_followup"
 
@@ -118,8 +99,14 @@ def test_route_after_assess_retrieve_converges_or_asks_once():
         confidence_tier="HIGH",
         confidence_score=0.8,
         evidence_confirmed=["劳动合同"],
+        followup_plan={"should_ask": False},
     )
     assert route_after_assess_retrieve(high) == "conclude"
+
+    high_after_choice = high.model_copy(update={
+        "supplement_choice_offered": True,
+    })
+    assert route_after_assess_retrieve(high_after_choice) == "conclude"
 
     forced = GuideState(
         legal_domain="labor_social_security",
@@ -134,6 +121,23 @@ def test_route_after_assess_retrieve_converges_or_asks_once():
         total_rounds=settings.GUIDE_MAX_TOTAL_ROUNDS,
     )
     assert route_after_assess_retrieve(round_limit) == "conclude"
+
+
+def test_unresolved_safety_plan_routes_to_one_followup_not_conclusion():
+    state = GuideState(
+        legal_domain="criminal_public_security",
+        confirmed_issues=["故意伤害"],
+        safety_relevant=True,
+        current_safety_status="unknown",
+        confidence_tier="LOW",
+        followup_plan={
+            "should_ask": True,
+            "candidate_id": "criminal_event_safety",
+            "decision_key": "current_safety",
+        },
+    )
+
+    assert route_after_assess_retrieve(state) == "ask_followup"
 
 
 def test_parse_details_clears_explicit_ask_type_and_saves_time():
@@ -230,6 +234,7 @@ def test_end_to_end_route_returns_question_then_final_plan():
             "confidence_tier": "LOW",
             "law_context_str": "《劳动法》相关条文",
             "last_confirmed_count": 1,
+            "followup_plan": {"should_ask": True},
         })),
         patch("src.agents.legal_guide.graph.node_ask_followup", new=AsyncMock(return_value={
             "phase": GuidePhase.DETAIL_GATHER,
@@ -264,6 +269,7 @@ def test_end_to_end_route_returns_question_then_final_plan():
             "confidence_score": 0.8,
             "confidence_tier": "HIGH",
             "last_confirmed_count": 1,
+            "followup_plan": {"should_ask": False},
         })),
         patch("src.agents.legal_guide.graph.node_conclude", new=AsyncMock(return_value={
             "phase": GuidePhase.CONCLUDE,
@@ -287,7 +293,6 @@ if __name__ == "__main__":
     test_needs_clarify_2_round_cap()
     test_route_after_extract_branches()
     test_route_after_parse_branches()
-    test_followup_type_uses_explicit_fact_and_evidence_limits()
     test_route_after_assess_retrieve_converges_or_asks_once()
     test_parse_details_clears_explicit_ask_type_and_saves_time()
     test_assess_retrieve_sets_force_conclude_at_total_limit()

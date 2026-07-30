@@ -86,7 +86,7 @@ def test_conclusion_prompt_and_reply_keep_official_evidence_source():
     )
 
     updates = asyncio.run(guide_graph.node_conclude(state, deps))
-    prompt = llm.ainvoke.await_args.args[0][0].content
+    prompt = llm.ainvoke.await_args_list[0].args[0][0].content
     reply = updates["messages"][0].content
 
     assert "医疗费凭证、费用清单和病历资料" in prompt

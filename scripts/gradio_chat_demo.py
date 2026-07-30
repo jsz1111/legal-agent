@@ -8,25 +8,36 @@
 - 高分自省降档：HIGH档检索后LLM判断法条适用性/时效/管辖
 
 使用方式：
-1. 先启动后端：uvicorn src.main:app --port 8080 --reload
+1. 先启动后端：uvicorn src.main:app --port 8085 --reload
 2. 再启动本脚本：python scripts/gradio_chat_demo.py
 """
 
 import uuid
+import html
 import mimetypes
 import requests
 import gradio as gr
 import os
 import pandas as pd
 import plotly.graph_objects as go
+import tempfile
+from pathlib import Path
+from gradio.processing_utils import save_file_to_cache
+from urllib.parse import quote, urlparse
 
-API_BASE = os.getenv("LEGAL_AGENT_API_BASE", "http://127.0.0.1:8080")
+API_BASE = os.getenv("LEGAL_AGENT_API_BASE", "http://127.0.0.1:8085")
 BASE_URL = API_BASE
 CHAT_URL = f"{API_BASE}/api/v1/chat"
 HEALTH_URL = f"{API_BASE}/health/deps"
 
 
 _CHART_COLORS = ["#176B87", "#C8553D", "#3A7D44", "#6B5B95", "#B7791F"]
+_OFFICIAL_TEMPLATE_CACHE: dict[str, dict] = {}
+_ARTIFACT_FILE_CACHE: dict[str, str] = {}
+_ARTIFACT_CACHE_DIR = Path(tempfile.gettempdir()) / "legal-agent-gradio-downloads"
+_GRADIO_CACHE_DIR = Path(
+    os.getenv("GRADIO_TEMP_DIR") or (Path(tempfile.gettempdir()) / "gradio")
+)
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────
@@ -182,37 +193,209 @@ def _statistics_updates(statistics: dict | None):
     )
 
 
-def _document_update(document: dict | None):
+def _absolute_api_artifact_url(value: str | None) -> str:
+    """只允许下载当前法律智能体后端提供的文书文件。"""
+    if not value:
+        raise ValueError("下载地址为空")
+
+    base = urlparse(API_BASE)
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        if (
+            parsed.scheme != base.scheme
+            or parsed.hostname != base.hostname
+            or parsed.port != base.port
+        ):
+            raise ValueError("下载地址不属于当前法律智能体后端")
+        url = value
+        path = parsed.path
+    else:
+        path = value if value.startswith("/") else f"/{value}"
+        url = f"{API_BASE.rstrip('/')}{path}"
+
+    if not path.startswith("/api/v1/chat/"):
+        raise ValueError("下载地址不在允许的文书接口范围内")
+    return url
+
+
+def _materialize_api_artifact(
+    value: str | None,
+    *,
+    filename: str,
+    expected_suffix: str,
+) -> str:
+    """把跨端口附件缓存到 Gradio 本地，再由前端同源下载。
+
+    内置浏览器会拦截从 Gradio 端口直接跳转到 API 端口的附件地址。这里由
+    Gradio 服务端请求已校验的 API 路径，并把文件路径交给 DownloadButton，
+    浏览器最终访问的是 Gradio 自己的文件接口。
+    """
+    url = _absolute_api_artifact_url(value)
+    cached = _ARTIFACT_FILE_CACHE.get(url)
+    if cached and Path(cached).is_file():
+        return cached
+
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    content = response.content
+    if not content:
+        raise ValueError("下载接口返回了空文件")
+    if len(content) > 20 * 1024 * 1024:
+        raise ValueError("下载文件超过 20MB 安全上限")
+
+    suffix = expected_suffix.lower()
+    if suffix == ".pdf" and not content.startswith(b"%PDF"):
+        raise ValueError("官方模板不是有效 PDF")
+    if suffix == ".docx" and not content.startswith(b"PK"):
+        raise ValueError("生成文书不是有效 DOCX")
+
+    _ARTIFACT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_stem = "".join(
+        char if char.isalnum() or char in "-_" else "_"
+        for char in Path(filename).stem
+    ).strip("_") or "legal_document"
+    local_path = _ARTIFACT_CACHE_DIR / f"{safe_stem}_{uuid.uuid4().hex[:10]}{suffix}"
+    local_path.write_bytes(content)
+    _ARTIFACT_FILE_CACHE[url] = str(local_path)
+    return str(local_path)
+
+
+def _same_origin_download_url(local_path: str | None) -> str:
+    """Return a browser-safe same-origin Gradio file URL."""
+    if not local_path or not Path(local_path).is_file():
+        raise ValueError("本地缓存文件不存在")
+    cached_path = save_file_to_cache(local_path, str(_GRADIO_CACHE_DIR))
+    return "/gradio_api/file=" + quote(Path(cached_path).as_posix(), safe=":/")
+
+
+def _same_origin_download_button(
+    local_path: str | None,
+    label: str,
+    *,
+    primary: bool,
+) -> str:
+    """生成指向 Gradio 自身文件接口的可点击下载按钮。"""
+    file_url = _same_origin_download_url(local_path)
+    background = "#176B87" if primary else "#4F6475"
+    return (
+        f'<a href="{html.escape(file_url, quote=True)}" download '
+        f'aria-label="{html.escape(label, quote=True)}" '
+        'style="display:inline-flex;align-items:center;justify-content:center;'
+        'width:100%;box-sizing:border-box;padding:12px 18px;border-radius:8px;'
+        f'background:{background};color:#fff;text-decoration:none;cursor:pointer;'
+        'font-weight:700;font-size:15px;line-height:1.2;">'
+        f'⬇️ {html.escape(label)}</a>'
+    )
+
+
+def _document_chat_download_links(document: dict | None) -> str:
+    """把附件链接同时放进对话，避免独立组件未刷新时用户找不到文件。"""
     if not document:
-        return gr.update(value="", visible=False)
-
-    def absolute_url(value: str | None) -> str:
-        if not value:
-            return ""
-        if value.startswith("http://") or value.startswith("https://"):
-            return value
-        return f"{API_BASE.rstrip('/')}/{value.lstrip('/')}"
-
-    lines = [f"**{document.get('doc_type') or '参考文书'}**", ""]
-    generated_url = absolute_url(document.get("generated_docx_url"))
+        return ""
+    links = []
+    generated_url = document.get("generated_docx_url")
     if generated_url:
-        lines.append(f"[下载智能填写参考稿 DOCX]({generated_url})")
-
-    official_url = absolute_url(document.get("official_blank_url"))
+        try:
+            generated_file = _materialize_api_artifact(
+                generated_url,
+                filename=document.get("filename") or "智能填写参考稿.docx",
+                expected_suffix=".docx",
+            )
+            links.append(
+                f"- [下载智能填写参考稿 DOCX]({_same_origin_download_url(generated_file)})"
+            )
+        except Exception as exc:
+            links.append(f"- DOCX 下载准备失败：{exc}")
+    official_url = document.get("official_blank_url")
     source = document.get("source") or {}
     if official_url:
-        lines.extend(["", f"[下载官方空白模板 PDF]({official_url})"])
-    if source:
-        issuers = "、".join(source.get("issuers") or [])
-        source_page = source.get("source_page_url") or ""
-        source_text = (
-            f"模板来源：{issuers or '未注明发布机关'}，"
-            f"{source.get('document_no') or '未注明文号'}，"
-            f"自 {source.get('effective_at') or '未注明日期'} 起推广使用。"
+        try:
+            official_file = _materialize_api_artifact(
+                official_url,
+                filename=f"{source.get('title') or '官方空白模板'}.pdf",
+                expected_suffix=".pdf",
+            )
+            links.append(
+                f"- [下载相关官方空白模板 PDF]({_same_origin_download_url(official_file)})"
+            )
+        except Exception as exc:
+            links.append(f"- 官方模板下载准备失败：{exc}")
+    if not links:
+        return ""
+    return "\n\n### 文件下载\n" + "\n".join(links)
+
+
+def _format_template_source(source: dict | None) -> str:
+    if not source:
+        return ""
+    issuers = "、".join(source.get("issuers") or [])
+    lines = [
+        f"**{source.get('title') or '官方空白模板'}**",
+        "",
+        f"- 发布机关：{issuers or '未注明'}",
+        f"- 文号：{source.get('document_no') or '未注明'}",
+        f"- 推广日期：{source.get('effective_at') or '未注明'}",
+    ]
+    source_page = source.get("source_page_url") or ""
+    if source_page:
+        lines.append(f"- [查看发布机关原文]({source_page})")
+    return "\n".join(lines)
+
+
+def _document_updates(document: dict | None):
+    if not document:
+        return (
+            gr.update(value="", visible=True),
+            gr.update(value="", visible=True),
+            gr.update(value="", visible=True),
         )
-        lines.extend(["", source_text])
-        if source_page:
-            lines.append(f"[查看发布机关原文]({source_page})")
+
+    lines = [f"**{document.get('doc_type') or '参考文书'}**", ""]
+    generated_button = ""
+    official_button = ""
+    generated_url = document.get("generated_docx_url")
+    if generated_url:
+        try:
+            generated_file = _materialize_api_artifact(
+                generated_url,
+                filename=document.get("filename") or "智能填写参考稿.docx",
+                expected_suffix=".docx",
+            )
+            generated_button = _same_origin_download_button(
+                generated_file,
+                "下载智能填写参考稿 DOCX",
+                primary=True,
+            )
+            lines.append("✅ 可编辑 DOCX 已生成，可在下方直接下载。")
+        except Exception as exc:
+            lines.append(f"⚠️ DOCX 下载准备失败：{exc}")
+
+    official_url = document.get("official_blank_url")
+    source = document.get("source") or {}
+    official_match = document.get("official_template_match") or "none"
+    official_note = document.get("official_template_note") or ""
+    if official_url:
+        try:
+            official_file = _materialize_api_artifact(
+                official_url,
+                filename=f"{source.get('title') or '官方空白模板'}.pdf",
+                expected_suffix=".pdf",
+            )
+            official_button = _same_origin_download_button(
+                official_file,
+                "下载相关官方空白模板 PDF",
+                primary=False,
+            )
+            if official_match == "exact":
+                lines.extend(["", "✅ 已精确匹配当前阶段的官方空白模板，可在下方直接下载。"])
+            else:
+                lines.extend(["", "✅ 已附上同领域最相关的官方空白模板，可与 DOCX 一起下载。"])
+        except Exception as exc:
+            lines.extend(["", f"⚠️ 官方模板下载准备失败：{exc}"])
+    if official_note:
+        lines.extend(["", f"> ⚠️ {official_note}"])
+    if source:
+        lines.extend(["", _format_template_source(source)])
     else:
         lines.extend(
             ["", "本次未匹配到全国统一官方空白模板，DOCX 使用系统通用参考格式。"]
@@ -226,7 +409,115 @@ def _document_update(document: dict | None):
     lines.extend(
         ["", "> 智能填写稿为系统生成的可编辑参考稿，非发布机关出具。"]
     )
-    return gr.update(value="\n".join(lines), visible=True)
+    return (
+        gr.update(value="\n".join(lines), visible=True),
+        gr.update(value=generated_button, visible=bool(generated_button)),
+        gr.update(value=official_button, visible=bool(official_button)),
+    )
+
+
+def _fetch_official_template_catalog() -> list[dict]:
+    response = requests.get(
+        f"{API_BASE}/api/v1/chat/document-templates",
+        timeout=10,
+    )
+    response.raise_for_status()
+    templates = response.json().get("templates") or []
+    _OFFICIAL_TEMPLATE_CACHE.clear()
+    _OFFICIAL_TEMPLATE_CACHE.update(
+        {
+            str(item["template_id"]): item
+            for item in templates
+            if item.get("template_id")
+        }
+    )
+    return list(_OFFICIAL_TEMPLATE_CACHE.values())
+
+
+def load_official_template_catalog():
+    try:
+        templates = _fetch_official_template_catalog()
+    except Exception as exc:
+        return (
+            gr.update(choices=[], value=None),
+            gr.update(value=f"⚠️ 官方模板目录加载失败：{exc}", visible=True),
+            gr.update(value=None, visible=False),
+        )
+    choices = [
+        (
+            f"{item.get('title') or item['template_id']}｜{item.get('document_no') or '官方示范文本'}",
+            item["template_id"],
+        )
+        for item in templates
+    ]
+    selected = templates[0]["template_id"] if templates else None
+    source = _format_template_source(templates[0]) if templates else "暂无可用官方模板。"
+    download_update = gr.update(value=None, visible=False)
+    if templates:
+        try:
+            local_file = _materialize_api_artifact(
+                templates[0].get("official_blank_url"),
+                filename=f"{templates[0].get('title') or '官方空白模板'}.pdf",
+                expected_suffix=".pdf",
+            )
+            button_html = _same_origin_download_button(
+                local_file,
+                "下载所选官方空白模板 PDF",
+                primary=False,
+            )
+            download_update = gr.update(value=button_html, visible=True)
+        except Exception as exc:
+            source = f"{source}\n\n⚠️ 官方模板下载准备失败：{exc}"
+    return (
+        gr.update(choices=choices, value=selected),
+        gr.update(value=source, visible=True),
+        download_update,
+    )
+
+
+def show_official_template_source(template_id: str | None):
+    if not template_id:
+        return (
+            gr.update(value="请选择一种官方空白模板。", visible=True),
+            gr.update(value=None, visible=False),
+        )
+    item = _OFFICIAL_TEMPLATE_CACHE.get(template_id)
+    if item is None:
+        try:
+            _fetch_official_template_catalog()
+        except Exception as exc:
+            return (
+                gr.update(value=f"⚠️ 官方模板目录加载失败：{exc}", visible=True),
+                gr.update(value=None, visible=False),
+            )
+        item = _OFFICIAL_TEMPLATE_CACHE.get(template_id)
+    source = _format_template_source(item) or "未找到该模板的来源信息。"
+    if not item:
+        return (
+            gr.update(value=source, visible=True),
+            gr.update(value=None, visible=False),
+        )
+    try:
+        local_file = _materialize_api_artifact(
+            item.get("official_blank_url")
+            or f"/api/v1/chat/document-templates/{quote(template_id, safe='')}/official",
+            filename=f"{item.get('title') or '官方空白模板'}.pdf",
+            expected_suffix=".pdf",
+        )
+        button_html = _same_origin_download_button(
+            local_file,
+            "下载所选官方空白模板 PDF",
+            primary=False,
+        )
+    except Exception as exc:
+        return (
+            gr.update(value=f"{source}\n\n⚠️ 官方模板下载准备失败：{exc}", visible=True),
+            gr.update(value=None, visible=False),
+        )
+    return (
+        gr.update(value=source, visible=True),
+        gr.update(value=button_html, visible=True),
+    )
 
 
 def send_message(
@@ -248,7 +539,7 @@ def send_message(
             *_empty_debug,
             [],
             *_statistics_updates(None),
-            _document_update(None),
+            *_document_updates(None),
         )
 
     # 自动生成 session_id（首轮）
@@ -313,6 +604,7 @@ def send_message(
         reply = data.get("reply", "（无回复）")
         statistics = data.get("statistics")
         document = data.get("document")
+        reply += _document_chat_download_links(document)
 
         dbg = data.get("debug") or {}
         if dbg:
@@ -378,7 +670,7 @@ def send_message(
         fallback_html,
         [],
         *_statistics_updates(statistics),
-        _document_update(document),
+        *_document_updates(document),
     )
 
 
@@ -604,83 +896,104 @@ def upload_and_analyze_image(
 
 SCENARIOS = {
     "🔥 紧急情形（高危熔断）": "我现在正在遭受家庭暴力，对方威胁我不让报警",
-    "❓ 模糊描述（触发澄清）": "房东不退钱",
-    "📋 清晰案情（触发追问）": "退房后房东以房屋有损坏为由不退押金，但损坏不是我造成的，我有交房时的照片",
+    "❓ 简单描述": "房东不退钱",
+    "🏠 租房押金": "退房后房东以房屋有损坏为由不退押金，但损坏不是我造成的，我有交房时的照片",
     "💼 劳动纠纷 — 拖欠工资": "公司已经3个月没发工资了，我有劳动合同、工资流水和考勤记录",
     "🛒 消费维权 — 网购假货": "我在某平台买了一件商品，收到后发现是假货，有订单截图和聊天记录，商家拒绝退款",
     "📚 法律知识问答": "劳动仲裁和劳动诉讼有什么区别？分别需要多长时间？",
     "📈 法律统计趋势": "2018到2020年劳动争议一审收案变化趋势？",
     "📊 法律统计对比": "2020年全国法院民事一审收案和结案分别有多少？",
-    "🎓 测试LOW档（信息少）": "我被人打了",
-    "✅ 测试HIGH档（信息全）": "我在北京工作，公司拖欠我3个月工资共2万元，我有劳动合同、银行流水、打卡记录和微信催款截图，事情发生在半年前",
+    "🧭 信息较少": "我被人打了",
+    "✅ 信息较完整": "我在北京工作，公司拖欠我3个月工资共2万元，我有劳动合同、银行流水、打卡记录和微信催款截图，事情发生在半年前",
 }
 
 
 # ── Gradio 界面 ───────────────────────────────────────────────────────────
 
+DEMO_CSS = """
+.gradio-container, .contain { max-width: 1480px !important; width: min(96vw, 1480px) !important;
+  margin: 0 auto !important; background: #f5f7fa; }
+#main-grid { display: grid !important; grid-template-columns: minmax(250px, 310px) minmax(0, 1fr) !important;
+  gap: 18px !important; align-items: start !important; }
+#main-grid > * { min-width: 0 !important; width: 100% !important; }
+#workspace { min-width: 0 !important; }
+.legal-hero { padding: 24px 28px; margin: 4px 0 18px; border-radius: 18px;
+  background: linear-gradient(135deg, #123b55 0%, #176b87 62%, #2b8a78 100%);
+  color: white; box-shadow: 0 14px 36px rgba(18,59,85,.18); }
+.legal-hero h1 { margin: 0; font-size: 30px; letter-spacing: .04em; }
+.legal-hero p { margin: 8px 0 0; color: rgba(255,255,255,.86); font-size: 15px; }
+.legal-safety { margin-top: 14px; font-size: 13px; color: rgba(255,255,255,.76); }
+.gr-panel, .gr-box, .gr-form { border-radius: 14px !important; }
+button.primary { background: #176b87 !important; border-color: #176b87 !important; }
+.chatbot { border: 1px solid #dce4ea !important; border-radius: 16px !important; background: white !important; }
+footer { opacity: .45; }
+@media (max-width: 860px) {
+  #main-grid { grid-template-columns: 1fr !important; }
+  .legal-hero { padding: 20px; }
+  .legal-hero h1 { font-size: 26px; }
+}
+"""
+
+
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="法律多智能体平台 — 测试台") as demo:
+    with gr.Blocks(title="法护通") as demo:
 
-        gr.Markdown("""
-# 法律多智能体平台 测试台 🏛️
-
-**改造版本（2024-07）**：澄清/追问分离 + 打分前置 + 档位分级输出
-
-测试要点：
-- **澄清上限**：模糊描述 → 最多澄清2轮 → 仍模糊降级LOW档
-- **追问上限**：清晰案情 → 事实与证据追问合计最多6轮；用户消息总轮次硬上限12轮
-- **打分分档**：HIGH≥0.65，MEDIUM≥0.50，LOW<0.50；所有档位均检索，证据不足时采用审慎语气
-- **紧急熔断**：每轮检测高危 → CRITICAL立即终止推送110/12348
+        gr.HTML("""
+<section class="legal-hero">
+  <h1>法护通</h1>
+  <p>法律咨询与维权辅助</p>
+  <div class="legal-safety">内容仅供参考；如有人身危险，请优先拨打 110。</div>
+</section>
         """)
 
         # 新增：暂存上传的文件列表
         uploaded_files_state = gr.State([])
 
-        with gr.Row():
+        with gr.Row(elem_id="main-grid"):
             # ── 左侧控制面板 ──────────────────────────────────────────
-            with gr.Column(scale=1, min_width=240):
+            with gr.Column(scale=1, min_width=240, elem_id="sidebar"):
 
-                gr.Markdown("### ⚙️ 配置")
-                user_id_box = gr.Textbox(
-                    label="用户ID", value="test_user_01", placeholder="用于记忆关联"
-                )
-                session_id_box = gr.Textbox(
-                    label="会话ID（首轮自动生成）", value="", placeholder="多轮对话标识"
-                )
-                new_btn = gr.Button("🔄 新建会话", variant="secondary")
+                with gr.Accordion("会话设置", open=False):
+                    user_id_box = gr.Textbox(
+                        label="用户ID", value="test_user_01", placeholder="用于记忆关联"
+                    )
+                    session_id_box = gr.Textbox(
+                        label="会话ID", value="", placeholder="首轮自动生成"
+                    )
+                    new_btn = gr.Button("新建会话", variant="secondary")
 
-                gr.Markdown("### 🎯 快速测试场景\n点击填入输入框，可修改后发送")
+                gr.Markdown("### 常见场景")
                 # 场景按钮：点击后填入输入框
                 scenario_btns = []
                 for label in SCENARIOS:
                     b = gr.Button(label, size="sm")
                     scenario_btns.append(b)
 
-                gr.Markdown("### 🔍 后端健康状态")
-                health_box = gr.Textbox(
-                    label="", lines=8, interactive=False, value="点击「检查」刷新"
-                )
-                check_btn = gr.Button("🔍 检查后端", size="sm")
+                with gr.Accordion("系统状态", open=False):
+                    health_box = gr.Textbox(
+                        label="", lines=3, interactive=False, value="正在检查"
+                    )
+                    check_btn = gr.Button("刷新状态", size="sm")
 
-                gr.Markdown("### 📸 图片证据上传（可选）")
-                image_upload = gr.Image(
-                    label="上传图片证据",
-                    type="filepath",
-                    height=200
-                )
-                upload_btn = gr.Button("🔍 分析图片", size="sm", variant="secondary")
-                image_result = gr.Textbox(
-                    label="图片分析结果",
-                    lines=6,
-                    interactive=False,
-                    placeholder="上传图片后点击「分析图片」查看结果"
-                )
+                with gr.Accordion("图片证据", open=False):
+                    image_upload = gr.Image(
+                        label="上传图片证据",
+                        type="filepath",
+                        height=180
+                    )
+                    upload_btn = gr.Button("分析图片", size="sm", variant="secondary")
+                    image_result = gr.Textbox(
+                        label="图片分析结果",
+                        lines=5,
+                        interactive=False,
+                    )
 
             # ── 右侧对话区 ────────────────────────────────────────────
-            with gr.Column(scale=3):
+            with gr.Column(scale=3, elem_id="workspace"):
                 chatbot = gr.Chatbot(
-                    label="💬 对话记录",
-                    height=500,
+                    label="咨询对话",
+                    height=480,
+                    elem_classes=["chatbot"],
                 )
                 # 文件暂存提示
                 files_status = gr.Markdown("", visible=True)
@@ -696,14 +1009,14 @@ def build_demo() -> gr.Blocks:
                     )
                     msg_box = gr.Textbox(
                         label="",
-                        placeholder="💬 描述您的法律问题（支持回车发送）……",
+                        placeholder="请描述您遇到的事情……",
                         scale=5,
                         container=False,
                         lines=2
                     )
-                    send_btn = gr.Button("📤 发送", variant="primary", scale=1)
+                    send_btn = gr.Button("发送", variant="primary", scale=1)
 
-                with gr.Accordion("法律统计分析", open=True):
+                with gr.Accordion("法律统计分析", open=False):
                     statistics_plot = gr.Plot(
                         label="自动推荐图表",
                         visible=False,
@@ -718,8 +1031,36 @@ def build_demo() -> gr.Blocks:
                         visible=False,
                     )
 
-                with gr.Accordion("参考文书下载", open=True):
+                with gr.Accordion("参考文书与官方模板", open=False):
                     document_download = gr.Markdown(
+                        value="",
+                        visible=True,
+                    )
+                    with gr.Row():
+                        generated_docx_file = gr.HTML(
+                            value="",
+                            visible=True,
+                        )
+                        matched_official_blank_file = gr.HTML(
+                            value="",
+                            visible=True,
+                        )
+
+                    gr.Markdown(
+                        "#### 官方空白模板库\n"
+                        "无需先生成文书，可直接选择并下载最高人民法院发布的空白示范文本。"
+                    )
+                    official_template_select = gr.Dropdown(
+                        label="选择官方模板",
+                        choices=[],
+                        value=None,
+                        interactive=True,
+                    )
+                    official_template_source = gr.Markdown(
+                        value="正在加载官方模板目录……",
+                        visible=True,
+                    )
+                    selected_official_template_file = gr.HTML(
                         value="",
                         visible=False,
                     )
@@ -769,6 +1110,8 @@ def build_demo() -> gr.Blocks:
                 statistics_table,
                 statistics_source,
                 document_download,
+                generated_docx_file,
+                matched_official_blank_file,
             ],
         )
         send_btn.click(**send_kwargs)
@@ -824,7 +1167,9 @@ def build_demo() -> gr.Blocks:
                 gr.update(value=None, visible=False),
                 gr.update(value=None, visible=False),
                 gr.update(value="", visible=False),
-                gr.update(value="", visible=False),
+                gr.update(value="", visible=True),
+                gr.update(value="", visible=True),
+                gr.update(value="", visible=True),
             ),
             outputs=[
                 chatbot,
@@ -835,10 +1180,25 @@ def build_demo() -> gr.Blocks:
                 statistics_table,
                 statistics_source,
                 document_download,
+                generated_docx_file,
+                matched_official_blank_file,
             ]
         )
         check_btn.click(fn=check_health, outputs=health_box)
         demo.load(fn=check_health, outputs=health_box)
+        demo.load(
+            fn=load_official_template_catalog,
+            outputs=[
+                official_template_select,
+                official_template_source,
+                selected_official_template_file,
+            ],
+        )
+        official_template_select.change(
+            fn=show_official_template_source,
+            inputs=official_template_select,
+            outputs=[official_template_source, selected_official_template_file],
+        )
 
         # 图片上传分析（自动注入对话流）
         upload_btn.click(
@@ -858,7 +1218,8 @@ if __name__ == "__main__":
     demo = build_demo()
     demo.launch(
         server_name="0.0.0.0",
-        server_port=int(os.getenv("LEGAL_AGENT_GRADIO_PORT", "7862")),
+        server_port=int(os.getenv("LEGAL_AGENT_GRADIO_PORT", "7864")),
         share=False,
         inbrowser=False,
+        css=DEMO_CSS,
     )

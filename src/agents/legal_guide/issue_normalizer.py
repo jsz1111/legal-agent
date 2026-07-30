@@ -19,12 +19,13 @@ from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
 from src.agents.legal_guide.prompts import ISSUE_EXTRACT_PROMPT, DOMAIN_MAPPING
+from src.agents.legal_guide.case_model import CaseFactUpdate
 
 # with_structured_output 失败时的降级提示词（DeepSeek thinking mode 不支持 tool_choice）
 _ISSUE_EXTRACT_FALLBACK_PROMPT = ISSUE_EXTRACT_PROMPT + """
 
 请严格输出 JSON，格式如下（只输出 JSON，不要有其他文字）：
-{{"issues": ["法律问题1", "法律问题2"], "domain": "领域代码", "facts": ["客观事实"], "region": "地区", "time_info": "时间信息"}}"""
+{{"issues": ["法律问题1", "法律问题2"], "domain": "领域代码", "facts": ["客观事实"], "case_updates": [{{"key": "event.main", "category": "event", "statement": "客观事实", "subject": "", "relation": "", "value": "", "certainty": "asserted", "operation": "add", "source_text": "用户原文片段"}}], "region": "地区", "time_info": "时间信息"}}"""
 
 
 class IssuesOutput(BaseModel):
@@ -32,6 +33,7 @@ class IssuesOutput(BaseModel):
     issues: list[str] = Field(description="标准化的法律问题列表，无则空列表")
     domain: str = Field(description="推断的法律领域代码，如 labor_social_security")
     facts: list[str] = Field(default_factory=list, description="用户明确说出的客观案情事实")
+    case_updates: list[CaseFactUpdate] = Field(default_factory=list, description="带用户原文锚点的原子案情更新")
     region: str = Field(default="", description="用户明确提到的地区")
     time_info: str = Field(default="", description="用户明确提到的时间信息")
 
@@ -67,6 +69,7 @@ async def extract_legal_issues(user_input: str, llm: BaseChatModel) -> IssuesOut
             issues=[i for i in data.get("issues", []) if i],
             domain=data.get("domain", "other") or "other",
             facts=[item for item in data.get("facts", []) if item],
+            case_updates=[CaseFactUpdate.model_validate(item) for item in data.get("case_updates", []) if isinstance(item, dict)],
             region=(data.get("region") or "").strip(),
             time_info=(data.get("time_info") or "").strip(),
         )
@@ -261,6 +264,7 @@ async def normalize_legal_issues(
         return {
             "standard": [], "colloquial": [], "term_map": {}, "domain": domain,
             "collected_facts": extracted.facts,
+            "case_updates": [item.model_dump() for item in extracted.case_updates],
             "region": extracted.region,
             "time_info": extracted.time_info,
         }
@@ -284,6 +288,7 @@ async def normalize_legal_issues(
         "term_map":   term_map,
         "domain":     domain,
         "collected_facts": extracted.facts,
+        "case_updates": [item.model_dump() for item in extracted.case_updates],
         "region": extracted.region,
         "time_info": extracted.time_info,
     }

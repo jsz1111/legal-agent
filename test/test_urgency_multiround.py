@@ -45,6 +45,69 @@ def test_check_urgency_runs_on_later_rounds():
     assert result["messages"][0].content == URGENCY_CRITICAL_RESPONSE
 
 
+def test_past_domestic_violence_with_explicit_current_safety_continues_guidance():
+    deps = _make_deps({"urgency": "CRITICAL", "time_clue": ""})
+    state = GuideState(
+        messages=[HumanMessage(content="丈夫打过我，但今天暂时安全，我有报警记录")],
+    )
+
+    result = asyncio.run(node_check_urgency(state, deps))
+
+    assert result["urgency_level"] == "normal"
+    assert result["safety_relevant"] is True
+    assert result["current_safety_status"] == "safe"
+
+
+def test_current_danger_overrides_safety_phrase():
+    deps = _make_deps({"urgency": "CRITICAL", "time_clue": ""})
+    state = GuideState(
+        messages=[HumanMessage(content="刚才暂时安全，但他现在拿刀就在门外")],
+    )
+
+    result = asyncio.run(node_check_urgency(state, deps))
+
+    assert result["urgency_level"] == "critical"
+    assert result["phase"] == GuidePhase.END
+
+
+def test_later_evidence_detail_inherits_recent_explicit_safety():
+    deps = _make_deps({
+        "urgency": "CRITICAL",
+        "current_danger": False,
+        "time_clue": "",
+    })
+    state = GuideState(
+        round=2,
+        messages=[
+            HumanMessage(content="我昨天受伤了，但现在已经安全"),
+            AIMessage(content="请说明是否认识对方"),
+            HumanMessage(content="医院记录有，对方我不认识"),
+        ],
+    )
+
+    result = asyncio.run(node_check_urgency(state, deps))
+
+    assert result["urgency_level"] == "normal"
+    assert result["safety_relevant"] is True
+    assert result["current_safety_status"] == "safe"
+
+
+def test_past_violence_without_current_status_is_marked_unknown_not_critical():
+    deps = _make_deps({
+        "urgency": "NORMAL",
+        "safety_relevant": True,
+        "safety_status": "unknown",
+        "time_clue": "",
+    })
+    state = GuideState(messages=[HumanMessage(content="我被人打了")])
+
+    result = asyncio.run(node_check_urgency(state, deps))
+
+    assert result["urgency_level"] == "normal"
+    assert result["safety_relevant"] is True
+    assert result["current_safety_status"] == "unknown"
+
+
 def test_prepare_turn_increments_user_round_once():
     """每条用户消息只由 prepare_turn 推进一次轮次。"""
     deps = MagicMock(spec=GuideDeps)

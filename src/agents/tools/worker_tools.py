@@ -17,6 +17,24 @@ from src.core.config import get_settings
 settings = get_settings()
 
 
+_INLINE_MEMORY_MARKER = "[长期记忆]"
+
+
+def _separate_inline_memory_context(message: str) -> tuple[str, list[str]]:
+    """Separate Supervisor metadata from the user's original utterance.
+
+    Older Supervisor prompts could append a retrieved memory to ``message``.  The
+    guide should receive that memory as context, not treat it as something the
+    user stated again in the current session.
+    """
+    raw_message = str(message or "")
+    if _INLINE_MEMORY_MARKER not in raw_message:
+        return raw_message, []
+    user_message, _, memory_text = raw_message.partition(_INLINE_MEMORY_MARKER)
+    memory_text = memory_text.strip()
+    return user_message.rstrip(), [memory_text] if memory_text else []
+
+
 @dataclass
 class UserContext:
     user_id: str
@@ -61,11 +79,13 @@ async def call_guide_agent(message: str, runtime: ToolRuntime[UserContext]) -> s
     """
     session_id = runtime.context.session_id
     user_id = runtime.context.user_id
-    print(f"[TOOL] call_guide_agent: session={session_id}, msg={message[:50]}")
-    long_term_memories = await _search_relevant_memories(message, runtime)
+    user_message, inline_memories = _separate_inline_memory_context(message)
+    print(f"[TOOL] call_guide_agent: session={session_id}, msg={user_message[:50]}")
+    searched_memories = await _search_relevant_memories(user_message, runtime)
+    long_term_memories = list(dict.fromkeys(inline_memories + searched_memories))
 
     return await call_guide_agent_impl(
-        message=message,
+        message=user_message,
         user_id=user_id,
         session_id=session_id,
         long_term_memories=long_term_memories,

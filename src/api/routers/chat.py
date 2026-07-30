@@ -56,6 +56,16 @@ def _make_keys(user_id: str, session_id: str) -> tuple[str, str]:
     return f"guide_active:{thread_id}", f"guide_state:{thread_id}"
 
 
+async def _has_guide_session(redis, active_key: str, state_key: str) -> bool:
+    """活跃标记可重建；结构化状态才是法律指引会话的事实来源。"""
+    return bool(await redis.exists(active_key) or await redis.exists(state_key))
+
+
+def _should_keep_guide_state(state: GuideState) -> bool:
+    """已识别具体法律问题的终态仍需支持生成或重生成参考文书。"""
+    return bool(state.confirmed_issues)
+
+
 async def _pop_statistics_artifact(redis, user_id: str, session_id: str) -> dict | None:
     """读取本轮法律统计图表产物，读取后删除，避免后续普通问答误用旧图表。"""
     key = f"legal_statistics_last:{user_id}:{session_id}"
@@ -122,8 +132,9 @@ async def _run_guide_turn(
     执行一轮法律指引对话（路由层直接调用，绕过 Supervisor）。
     从 Redis 恢复状态 → 执行 GuideGraph → 保存新状态 → 返回回复+调试信息。
     """
-    from src.agents.legal_guide.formatters import is_doc_request
+    from src.agents.legal_guide.formatters import is_doc_request, requested_doc_type
     from src.agents.legal_guide.doc_generator import generate_legal_document
+    from src.agents.legal_guide.prompts import DOC_TYPE_MAP
     from langchain_core.messages import HumanMessage, AIMessage
 
     active_key = f"guide_active:{thread_id}"
@@ -143,21 +154,27 @@ async def _run_guide_turn(
             logger.info("检测到文书生成请求，直接调用独立文书生成服务")
             # 添加用户消息到历史
             existing_state.messages.append(HumanMessage(content=message))
+            doc_type = requested_doc_type(
+                message,
+                DOC_TYPE_MAP.get(existing_state.legal_domain, "投诉信"),
+            )
+            existing_state.requested_doc_type = doc_type
             # 直接调用文书生成函数
             generated = await generate_legal_document(
                 legal_domain=existing_state.legal_domain,
                 confirmed_issues=existing_state.confirmed_issues,
-                collected_facts=existing_state.collected_facts,
+                collected_facts=existing_state.draftable_facts,
                 region=existing_state.region,
                 evidence_confirmed=existing_state.evidence_confirmed,
                 law_context_str=existing_state.law_context_str,
                 llm=deps.llm,
+                requested_doc_type=doc_type,
             )
             existing_state.doc_draft = generated.text
             existing_state.messages.append(AIMessage(content=generated.text))
 
             document_id = uuid.uuid4().hex
-            ttl = settings.REDIS_SESSION_TTL
+            ttl = settings.GUIDE_SESSION_TTL
             file_key = f"legal_document_file:{document_id}"
             meta_key = f"legal_document_meta:{document_id}"
             await redis.set(file_key, generated.docx_bytes, ex=ttl)
@@ -174,7 +191,23 @@ async def _run_guide_turn(
                 ex=ttl,
             )
 
-            official = generated.official_template
+            official = (
+                generated.official_template
+                or generated.related_official_template
+            )
+            official_match = (
+                "exact"
+                if generated.official_template
+                else "related"
+                if official
+                else "none"
+            )
+            official_note = None
+            if official_match == "related":
+                official_note = (
+                    "该官方空白模板与当前纠纷领域相关，但适用于法院诉讼阶段；"
+                    "本次智能填写 DOCX 仍按当前维权阶段生成，二者不是同一文书。"
+                )
             document_artifact = {
                 "document_id": document_id,
                 "doc_type": generated.doc_type,
@@ -186,12 +219,17 @@ async def _run_guide_turn(
                     else None
                 ),
                 "source": official.public_metadata() if official else None,
+                "official_template_match": official_match,
+                "official_template_note": official_note,
                 "missing_fields": generated.missing_fields,
                 "expires_in_seconds": ttl,
             }
 
-            # 文书生成完成，删除 Redis 状态
-            await redis.delete(active_key, state_key)
+            # 文书生成后仍保留结束状态：用户可能需要重新生成、改文书类型，
+            # 或在前端刷新后再次取得附件。状态只保存文本和案情，不保存 DOCX
+            # 二进制；文件本身仍使用独立短期 key 和相同 TTL。
+            await redis.set(state_key, existing_state.model_dump_json(), ex=ttl)
+            await redis.set(active_key, "1", ex=ttl)
 
             debug = DebugInfo(
                 domain=existing_state.legal_domain or "",
@@ -210,6 +248,10 @@ async def _run_guide_turn(
         existing_state.force_conclude = False
         existing_state.wants_conclude = False
         existing_state.consecutive_counter_questions = 0
+        existing_state.awaiting_supplement_choice = False
+        existing_state.supplement_choice_offered = False
+        existing_state.supplement_choice = ""
+        existing_state.allow_extra_followups = False
 
     reply, new_state = await run_guide(
         user_message=message,
@@ -229,11 +271,11 @@ async def _run_guide_turn(
         fallback_guide=new_state.fallback_guide,  # 透传案例检索兜底指引
     )
 
-    # 指引结束：检查是否有文书生成邀请，若有则保留 Redis 一轮等待用户确认
+    # 指引结束后依据结构化案情保留状态，不依赖回复中的固定邀请文案。
     if new_state.phase == GuidePhase.END:
-        if not new_state.doc_draft and "生成文书" in reply:
-            # conclude 提供了文书邀请，保留状态让下一轮进入独立文书生成入口
-            ttl = settings.REDIS_SESSION_TTL
+        if _should_keep_guide_state(new_state):
+            # 支持用户离开页面或服务重启后继续生成/重生成参考文书。
+            ttl = settings.GUIDE_SESSION_TTL
             await redis.set(state_key, new_state.model_dump_json(), ex=ttl)
             await redis.set(active_key, "1", ex=ttl)
         else:
@@ -241,7 +283,7 @@ async def _run_guide_turn(
         return reply, debug, None
 
     # 指引继续：更新 Redis 状态，重置 TTL
-    ttl = settings.REDIS_SESSION_TTL
+    ttl = settings.GUIDE_SESSION_TTL
     await redis.set(state_key,  new_state.model_dump_json(), ex=ttl)
     await redis.set(active_key, "1",                         ex=ttl)
     return reply, debug, None
@@ -261,9 +303,10 @@ async def chat(
         redis = get_checkpointer_redis()
         thread_id = f"{req.user_id}:{req.session_id}"
         active_key = f"guide_active:{thread_id}"
+        state_key = f"guide_state:{thread_id}"
 
         # ── 指引进行中：直接走 GuideGraph ──
-        if await redis.exists(active_key):
+        if await _has_guide_session(redis, active_key, state_key):
             reply, debug, document = await _run_guide_turn(
                 req.message, thread_id, redis, db
             )
@@ -382,9 +425,10 @@ async def chat_stream(
             redis = get_checkpointer_redis()
             thread_id = f"{req.user_id}:{req.session_id}"
             active_key = f"guide_active:{thread_id}"
+            state_key = f"guide_state:{thread_id}"
 
             # ── 指引进行中：GuideGraph 非流式执行，结果整体推送 ──
-            if await redis.exists(active_key):
+            if await _has_guide_session(redis, active_key, state_key):
                 reply, debug, document = await _run_guide_turn(
                     req.message, thread_id, redis, db
                 )
@@ -691,9 +735,10 @@ async def upload_image(
 
                 # 调用对话接口，将分析结果注入
                 active_key = f"guide_active:{thread_id}"
+                state_key = f"guide_state:{thread_id}"
 
                 # 检查是否有活跃的指引会话
-                if await redis.exists(active_key):
+                if await _has_guide_session(redis, active_key, state_key):
                     # 直接调用 guide_agent
                     reply, debug, _document = await _run_guide_turn(
                         evidence_message, thread_id, redis, db

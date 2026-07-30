@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     GUIDE_MAX_LOW_INFO_ANSWERS: int = 2   # 连续“不知道/没有”后停止盘问
     GUIDE_MAX_COUNTER_QUESTIONS: int = 3  # 连续只反问 3 次后按现有信息收敛
     GUIDE_MAX_TOTAL_ROUNDS: int = 12      # 用户消息达到 12 轮时强制收敛
+    GUIDE_SESSION_TTL: int = 86400         # 法律指引状态与文书保留 24 小时，支持离开页面后继续
     # 检索超时配置（秒）
     GUIDE_RETRIEVE_TIMEOUT_STATUTE: float = 8.0   # 法条检索超时
     GUIDE_RETRIEVE_TIMEOUT_CASE: float = 5.0      # 案例检索超时

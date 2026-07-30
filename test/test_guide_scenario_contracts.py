@@ -52,6 +52,12 @@ def test_prepare_turn_merges_context_without_losing_identity_or_memory():
     assert updates["round"] == 1
 
 
+def test_state_preserves_non_pilot_region_for_documents_but_channels_can_fallback():
+    assert guide_graph._state_region_name("杭州") == "杭州"
+    assert guide_graph._extract_case_region("公司在杭州，我也在这里工作") == "杭州"
+    assert guide_graph._state_region_name("在饭馆吃东西") == ""
+
+
 def test_non_numeric_user_id_does_not_open_postgres_query():
     db = MagicMock()
     db.execute = AsyncMock()
@@ -96,20 +102,36 @@ def test_followup_reply_has_at_most_two_questions_without_llm_expansion():
         legal_domain="labor_social_security",
         confirmed_issues=["拖欠劳动报酬"],
         confidence_tier="LOW",
+        followup_plan={
+            "should_ask": True,
+            "ask_type": "facts",
+            "decision_key": "employment_status",
+            "candidate_id": "",
+            "question": "您目前还在这家公司工作吗？",
+            "reason": "判断当前可走的程序和时效",
+            "answer_hint": "在职或已离职都可以直接说",
+            "basis_kind": "official_elements",
+            "official_source": {
+                "authority_level": "official_basis_derived",
+                "issuer": "全国人大常委会",
+                "title": "劳动争议调解仲裁法",
+                "url": "https://flk.npc.gov.cn/",
+                "usage_note": "",
+            },
+            "information_gain": 0.8,
+            "user_burden": 0.2,
+        },
     )
     deps = MagicMock(spec=GuideDeps)
-    deps.llm = MagicMock()
-    deps.llm.ainvoke = AsyncMock()
 
     updates = asyncio.run(guide_graph.node_ask_facts(state, deps))
     reply = updates["messages"][0].content
 
-    assert reply.count("？") + reply.count("?") <= 2
-    assert len(updates["pending_ask_details"]) <= 2
-    deps.llm.ainvoke.assert_not_awaited()
+    assert reply.count("？") + reply.count("?") == 1
+    assert updates["pending_ask_details"] == ["您目前还在这家公司工作吗？"]
 
 
-def test_evidence_followup_skips_resolved_aliases_and_conditional_materials():
+def legacy_contract_evidence_followup_skips_resolved_aliases_and_conditional_materials():
     state = GuideState(
         legal_domain="labor_social_security",
         confirmed_issues=["拖欠劳动报酬"],
@@ -127,7 +149,7 @@ def test_evidence_followup_skips_resolved_aliases_and_conditional_materials():
     assert remaining == []
 
 
-def test_dine_in_food_followup_does_not_ask_for_identity_or_logistics():
+def legacy_contract_dine_in_food_followup_does_not_ask_for_identity_or_logistics():
     state = GuideState(
         legal_domain="consumer_market",
         confirmed_issues=["食品不符合食品安全标准"],
@@ -142,7 +164,7 @@ def test_dine_in_food_followup_does_not_ask_for_identity_or_logistics():
     assert not any("物流" in item or "签收" in item for item in remaining)
 
 
-def test_fact_followup_does_not_repeat_known_time_contract_or_bank_record():
+def legacy_contract_fact_followup_does_not_repeat_known_time_contract_or_bank_record():
     state = GuideState(
         legal_domain="labor_social_security",
         time_info="已拖欠工资两个月",
@@ -187,6 +209,76 @@ def test_statute_citation_filter_renumbers_remaining_items():
     assert "第三十四条" not in sanitized
     assert "1. 《中华人民共和国食品安全法》第一百四十八条" in sanitized
     assert "2. 《中华人民共和国食品安全法》第一百四十八条" not in sanitized
+
+
+def legacy_patch_consumer_sanitizer_corrects_small_claim_and_burden_overclaims():
+    state = GuideState(legal_domain="consumer_market")
+    reply = (
+        "300元的案子，法院可能认为金额太小不立案。"
+        "商家需要证明它没有跑路或提供了对等价值服务。"
+        "集体诉讼可以分摊诉讼成本，通常7个工作日内有答复。\n"
+        "**耗时**：一般15-45天有初步结果。\n"
+        "路径二：联合报案，如果涉嫌诈骗就去派出所。"
+    )
+
+    sanitized = guide_graph._sanitize_consumer_procedure_claims(reply, state)
+
+    assert "金额太小不立案" not in sanitized
+    assert "小额本身不是法院不予立案的理由" in sanitized
+    assert "商家需要证明它没有跑路" not in sanitized
+    assert "您需先证明消费关系" in sanitized
+    assert "需先核对是否符合法定共同诉讼条件" in sanitized
+    assert "以12315平台及承办部门反馈为准" in sanitized
+    assert "15-45天" not in sanitized
+    assert "联合报案" not in sanitized
+    assert "诈骗" not in sanitized
+    assert "派出所" not in sanitized
+
+
+def legacy_patch_consumer_sanitizer_removes_unsupported_deadlines_costs_and_certainty():
+    state = GuideState(legal_domain="consumer_market")
+    reply = (
+        "通常7-15个工作日内给出是否受理的答复。"
+        "流程较长（通常1-3个月）。"
+        "[需预交50元左右的诉讼费，胜诉后由败诉方承担]。\n"
+        "第一步（今日必做）：投诉。\n"
+        "花50元诉讼费去当地法院起诉（小额诉讼），胜诉概率很高。\n"
+        "建议放弃诉讼，转为向12315举报其欺诈行为，以警示他人。"
+    )
+
+    sanitized = guide_graph._sanitize_consumer_procedure_claims(reply, state)
+
+    for unsafe in (
+        "7-15个工作日", "1-3个月", "预交50元", "今日必做",
+        "花50元", "胜诉概率很高", "建议放弃诉讼", "欺诈行为",
+    ):
+        assert unsafe not in sanitized
+    assert "是否适用小额诉讼程序由法院依法确定" in sanitized
+    assert "最终负担以法院通知和裁判为准" in sanitized
+
+
+def legacy_patch_prepaid_plan_understanding_uses_accumulated_context():
+    state = GuideState(
+        legal_domain="consumer_market",
+        messages=[
+            HumanMessage(content="在理发店充值后一周店就关门了，卡里还有300元"),
+            HumanMessage(content="我要求退款，对方把我拉黑了"),
+            HumanMessage(content="听说还有很多人也有损失"),
+        ],
+        collected_facts=["充值金额700元", "卡内余额300元"],
+    )
+    reply = (
+        "**【理解您的情况】**\n预付卡的钱没了，确实让人生气。\n\n"
+        "**【法律依据】**\n已检索。"
+    )
+
+    contextual = guide_graph._ensure_contextual_understanding(reply, state)
+
+    assert "最初充值700元" in contextual
+    assert "尚余300元" in contextual
+    assert "要求退款后被拉黑" in contextual
+    assert "待核实线索" in contextual
+    assert "确实让人生气" not in contextual
 
 
 def test_pg_keyword_expansion_and_article_number_normalization():
@@ -240,7 +332,7 @@ def test_forced_conclusion_uses_concise_answer_guidance():
     assert "2200字" in guidance
 
 
-def test_user_facing_tone_replaces_harsh_evidence_wording():
+def legacy_patch_user_facing_tone_replaces_harsh_evidence_wording():
     reply = "没有合同是非常致命的，微信证明力严重不足，还要看证据够不够硬。"
 
     sanitized = guide_graph._sanitize_user_facing_tone(reply)
@@ -251,7 +343,7 @@ def test_user_facing_tone_replaces_harsh_evidence_wording():
     assert "增加举证难度" in sanitized
 
 
-def test_labor_sanitizer_keeps_additional_compensation_conditional():
+def legacy_patch_labor_sanitizer_keeps_additional_compensation_conditional():
     state = GuideState(
         legal_domain="labor_social_security",
         confirmed_issues=["拖欠劳动报酬"],
@@ -269,7 +361,7 @@ def test_labor_sanitizer_keeps_additional_compensation_conditional():
     assert "需结合用工状态" in sanitized
 
 
-def test_labor_sanitizer_handles_indirect_and_application_request_variants():
+def legacy_patch_labor_sanitizer_handles_indirect_and_application_request_variants():
     state = GuideState(legal_domain="labor_social_security")
     reply = (
         "**【法律依据】**\n"
@@ -287,7 +379,7 @@ def test_labor_sanitizer_handles_indirect_and_application_request_variants():
     assert "先向劳动监察部门核实是否已具备法定前提" in sanitized
 
 
-def test_labor_sanitizer_corrects_wage_arbitration_limitation_start():
+def legacy_patch_labor_sanitizer_corrects_wage_arbitration_limitation_start():
     state = GuideState(
         legal_domain="labor_social_security",
         confirmed_issues=["拖欠劳动报酬"],
@@ -298,6 +390,228 @@ def test_labor_sanitizer_corrects_wage_arbitration_limitation_start():
 
     assert "从您知道或应当知道权利被侵害之日起" not in sanitized
     assert "劳动关系终止的应自终止之日起一年内提出" in sanitized
+
+
+def legacy_patch_labor_sanitizer_corrects_false_arbitration_fee_claim():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "**方案二：申请劳动仲裁（更全面）**\n"
+        "- **[收费]：**劳动争议仲裁通常预收受理费，最终由败诉方承担。"
+        "具体费用以受理通知为准。"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(reply, state)
+
+    assert "[免费]" in sanitized
+    assert "预收受理费" not in sanitized
+    assert "败诉方承担" not in sanitized
+    assert "劳动争议仲裁不收费" in sanitized
+
+
+def legacy_patch_labor_sanitizer_removes_demo_risk_wording_and_stale_compensation_math():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "注意：这条是说，您可以要求公司除了补发工资，再额外赔偿您拖欠金额的50%-100%。"
+        "但这通常需要先经过劳动监察部门或仲裁机构的程序才能主张。\n"
+        "**方案二：申请劳动仲裁（“撕破脸”但最彻底）**\n"
+        "一旦申请仲裁，通常意味着和公司关系破裂，不适合想继续工作的您。\n"
+        "如果公司因此有违法行为（比如未缴社保），还可以主张经济补偿。\n"
+        "您2022年3月入职，至今2年多，大约可拿到2-3个月的工资作为补偿。\n"
+        "这是最划算的选择，可从企查查、天眼查上查到公司地址。\n"
+        "12345（可以投诉政府部门办事不力）"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(reply, state)
+
+    assert "提出劳动仲裁就当然支持" in sanitized
+    assert "撕破脸" not in sanitized
+    assert "关系破裂" not in sanitized
+    assert "未缴社保就当然获得经济补偿" in sanitized
+    assert "至今2年多" not in sanitized
+    assert "不能仅按入职年份估算" in sanitized
+    assert "最划算" not in sanitized
+    assert "国家企业信用信息公示系统" in sanitized
+    assert "政务服务咨询和事项转办" in sanitized
+
+
+def legacy_patch_labor_sanitizer_handles_long_reply_variants_from_real_conversation():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "劳动监察只负责追讨工资，不能处理经济补偿金，通常15-30个工作日。\n"
+        "申请仲裁可以一次性解决所有问题。如果不想干了，可以主动提出离职并要求经济补偿。\n"
+        "按工作年限算，2022年3月入职，工作2年多，能拿到约2-2.5个月工资的经济补偿。\n"
+        "向杭州市劳动人事争议仲裁委员会申请仲裁。\n"
+        "一旦申请仲裁，通常意味着和公司关系破裂。\n"
+        "你的证据很好，追回工资的可能性很大。你现在手上的证据已经能说明这一点。"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(reply, state)
+
+    assert "只负责追讨工资" not in sanitized
+    assert "15-30个工作日" not in sanitized
+    assert "一次性解决所有问题" not in sanitized
+    assert "主动提出离职并要求经济补偿" not in sanitized
+    assert "工作2年多" not in sanitized
+    assert "有管辖权的劳动人事争议仲裁委员会" in sanitized
+    assert "关系破裂" not in sanitized
+    assert "可能性很大" not in sanitized
+    assert "你的" not in sanitized
+
+
+def legacy_patch_labor_sanitizer_handles_markdown_split_and_incorrect_in_service_claims():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "**缺点**：劳动监察**只负责追讨工资，不能处理经济补偿金**，一般15-60天会有结果。\n"
+        "**优点**：可以**一次性解决所有问题**，同时，可以申请加付50%-100%的赔偿金。\n"
+        "如果您不离职，仲裁这条路就走不通。一旦申请仲裁，基本意味着和公司撕破脸。\n"
+        "材料已经构成了完整的证据链，胜算的基础非常扎实。\n"
+        "前往公司注册地所在的区劳动人事争议仲裁委员会申请立案。\n"
+        "直接告诉对方：“不解决就走仲裁，到时您还得赔我经济补偿金。”"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(reply, state)
+
+    assert "**" not in sanitized
+    assert "只负责追讨工资" not in sanitized
+    assert "15-60天" not in sanitized
+    assert "一次性解决所有问题" not in sanitized
+    assert "申请加付50%-100%" not in sanitized
+    assert "走不通" not in sanitized
+    assert "撕破脸" not in sanitized
+    assert "完整的证据链" not in sanitized
+    assert "公司注册地所在的区" not in sanitized
+    assert "还得赔我经济补偿金" not in sanitized
+
+
+def legacy_patch_labor_sanitizer_handles_real_long_wage_plan_variants():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "预计时长：通常1-2个月能有初步结果（责令支付的通知）。\n"
+        "不直接跟老板“撕破脸”打官司。由政府部门出面施压，很多公司会优先解决。\n"
+        "公司账上没钱或老板跑路，监察部门也只能发“空头支票”责令支付。\n"
+        "预计时长：从申请到裁决通常需要2-4个月，甚至更长。\n"
+        "有国家强制力，可以一并主张解除劳动合同的经济补偿金等其他诉求。\n"
+        "一旦正式提起仲裁，基本意味着跟公司关系彻底破裂，通常不再适合继续工作。\n"
+        "光有聊天记录就是有力证据。用银行流水证明没有进账就行。"
+        "举证责任主要在您这边，但您现有的证据已经足够了。\n"
+        "追回工资是大概率事件。\n"
+        "直接去公司注册地所属的杭州市区级劳动人事争议仲裁委员会递交申请。\n"
+        "如果因此被迫离职，可以要求公司支付经济补偿金（每工作满一年赔一个月工资）。\n"
+        "如果公司提出异议，支付令就会失效，程序转到普通诉讼。"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(reply, state)
+
+    for unsafe in (
+        "1-2个月", "2-4个月", "撕破脸", "政府部门出面施压", "老板跑路",
+        "空头支票", "有国家强制力", "可以一并主张解除劳动合同",
+        "关系彻底破裂", "聊天记录就是有力证据", "没有进账就行",
+        "证据已经足够", "是大概率事件", "公司注册地所属",
+        "被迫离职，可以要求", "程序转到普通诉讼",
+    ):
+        assert unsafe not in sanitized
+    assert "45日" in sanitized
+    assert "申请仲裁不以离职为前提" in sanitized
+    assert "劳动合同履行地或用人单位所在地" in sanitized
+    assert "第三十八条" in sanitized
+    assert "最终仍需核验原件和完整内容" in sanitized
+
+
+def legacy_patch_labor_sanitizer_handles_second_real_long_plan_variants():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "预计时长：15-45个工作日。公司铁了心不给，适用于公司有支付能力但“赖账”的情况。\n"
+        "证据非常有利，这套证据组合非常扎实，成功率很高。您的情况并不复杂，放平心态。\n"
+        "可在“天眼查”或“国家企业信用信息公示系统”查询。\n"
+        "如果因为公司拖欠工资导致您被迫离职，还可以要求经济补偿金。"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(
+        guide_graph._sanitize_evidence_overconfidence(reply),
+        state,
+    )
+
+    for unsafe in (
+        "15-45个工作日", "铁了心", "赖账", "非常扎实", "成功率很高",
+        "并不复杂", "放平心态", "天眼查", "被迫离职，还可以要求",
+    ):
+        assert unsafe not in sanitized
+    assert "第三十八条" in sanitized
+    assert "国家企业信用信息公示系统" in sanitized
+
+
+def legacy_patch_labor_sanitizer_handles_final_real_plan_procedure_variants():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+    )
+    reply = (
+        "时长：通常较快，一般在15-30个工作日内有初步结果。\n"
+        "从申请到开庭再到出结果，通常需要2-3个月。\n"
+        "能一揽子解决拖欠工资、加班费、经济补偿等所有劳动争议。"
+        "只能处理“拖欠工资”本身，不能处理其他争议（如未缴社保）。\n"
+        "且通常要先经过劳动监察调解不成后才建议走这条路。\n"
+        "您的情况完全符合《中华人民共和国劳动合同法》第三十条和第八十五条的规定，拖欠的还要加付赔偿金。\n"
+        "这份证据对您非常有利，直接证明了公司承认欠薪。您已经完成了最基本的举证责任。\n"
+        "按兵不动，立刻行动：在公司承诺的“下个月”期限到来前一周，如果还没动静，就拨打12333。\n"
+        "去公司注册地的杭州市劳动监察大队。如果公司准时发工资：万事大吉。\n"
+        "支付令通常需要时间较长，且程序复杂，不推荐作为首选。\n"
+        "法院会支持劳动者拿回自己的血汗钱。"
+    )
+
+    sanitized = guide_graph._sanitize_labor_procedure_claims(
+        guide_graph._sanitize_evidence_overconfidence(reply),
+        state,
+    )
+
+    for unsafe in (
+        "15-30个工作日", "2-3个月", "一揽子解决", "只能处理",
+        "先经过劳动监察", "完全符合", "拖欠的还要加付", "非常有利",
+        "直接证明", "完成了最基本的举证责任", "按兵不动", "期限到来前一周",
+        "公司注册地的杭州市", "万事大吉", "不推荐作为首选", "血汗钱",
+    ):
+        assert unsafe not in sanitized
+    assert "不以先经劳动监察调解为前提" in sanitized
+    assert "您现在即可拨打12333" in sanitized
+    assert "第八十五条的加付赔偿还需满足" in sanitized
+
+
+def test_required_sections_fill_empty_recommendation_block():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confidence_tier="MEDIUM",
+        relevant_channels=[{"name": "本地劳动争议受理机构", "phone": "12333"}],
+    )
+    reply = (
+        "【法律依据】\n《劳动合同法》第三十条。\n"
+        "【维权路径比较】\n- 劳动监察\n- 劳动仲裁\n"
+        "【推荐方案】\n"
+        "【维权胜算评估】\n- 综合判断：中等\n"
+        "【行动清单】\n1. 保存证据"
+    )
+
+    normalized = guide_graph._ensure_required_plan_sections(reply, state)
+
+    assert "本地劳动争议受理机构" in normalized
+    assert "具体受理范围和材料以该机构答复为准" in normalized
 
 
 def test_compact_accessible_reply_removes_optional_sections_not_required_sections():
@@ -319,6 +633,49 @@ def test_compact_accessible_reply_removes_optional_sections_not_required_section
         assert section in compacted
 
 
+def test_compact_reply_enforces_budget_and_preserves_document_offer():
+    reply = (
+        "**【理解您的情况】**\n" + "案情。" * 100
+        + "\n**【法律依据】**\n" + "法条原文。" * 300
+        + "\n**【类似案例参考】**\n" + "类案内容。" * 300
+        + "\n**【维权路径比较】**\n" + "路径说明。" * 300
+        + "\n**【维权情况分析】**\n" + "重复分析。" * 300
+        + "\n**【行动清单】**\n" + "行动步骤。" * 300
+        + "\n**【维权胜算评估】**\n一般。"
+        + "\n\n---\n📄 **需要参考文书？** 请回复「生成文书」。"
+    )
+
+    compacted = guide_graph._compact_final_reply(reply, accessible=False)
+    concluded = guide_graph._compact_final_reply(reply, accessible=False, compact=True)
+
+    assert len(compacted) <= 3000
+    assert len(concluded) <= 2600
+    assert "维权情况分析" not in compacted
+    assert "需要参考文书" in compacted
+    for section in ("理解您的情况", "法律依据", "维权路径比较", "维权胜算评估", "行动清单"):
+        assert section in compacted
+
+
+def test_forced_conclusion_restores_action_checklist_if_cleanup_removed_it():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confirmed_issues=["拖欠劳动报酬"],
+        force_conclude=True,
+        relevant_channels=[{"name": "劳动保障服务渠道", "phone": "12333"}],
+    )
+    reply = (
+        "**【法律依据】**\n法条。\n"
+        "**【维权路径比较】**\n投诉或仲裁。\n"
+        "**【维权胜算评估】**\n较低。"
+    )
+
+    restored = guide_graph._ensure_action_checklist(reply, state)
+
+    assert "【行动清单】" in restored
+    assert "12333" in restored
+    assert "12348" in restored
+
+
 def test_output_section_normalizer_uses_stable_path_heading():
     reply = "**【初步方向建议】**\n先投诉，再仲裁。"
 
@@ -326,6 +683,14 @@ def test_output_section_normalizer_uses_stable_path_heading():
 
     assert "【维权路径比较】" in normalized
     assert "【初步方向建议】" not in normalized
+
+
+def test_output_section_normalizer_accepts_plain_retrieved_law_heading():
+    reply = "### 检索到的相关法律依据\n《中华人民共和国劳动合同法》第三十条。"
+
+    normalized = guide_graph._normalize_required_sections(reply)
+
+    assert "【法律依据】" in normalized
 
 
 def test_statute_citation_whitelist_keeps_numbered_list_reference():
@@ -352,6 +717,21 @@ def test_forced_conclusion_removes_request_for_another_information_round():
     assert "需要参考文书" in sanitized
 
 
+def test_conclusion_sanitizer_removes_batch_questionnaire_without_force_flag():
+    reply = (
+        "**【理解您的情况】**\n已记录。\n"
+        "**【关键缺失信息清单】**\n"
+        "1. 什么时候发生？\n2. 在哪里发生？\n3. 是否报警？\n"
+        "**【行动清单】**\n1. 保存现有材料。"
+    )
+
+    sanitized = guide_graph._sanitize_forced_followups(reply)
+
+    assert "关键缺失信息清单" not in sanitized
+    assert "什么时候发生" not in sanitized
+    assert "行动清单" in sanitized
+
+
 def test_requested_conclusion_removes_single_numbered_followup_without_losing_action_list():
     reply = (
         "**【行动清单】**\n"
@@ -367,6 +747,35 @@ def test_requested_conclusion_removes_single_numbered_followup_without_losing_ac
     assert "拨打12348" in sanitized
 
 
+def test_forced_cleanup_does_not_delete_required_sections_after_supplement_sentence():
+    reply = (
+        "**【维权路径比较】**\n先投诉。\n"
+        "**【维权胜算评估】**\n需补充证据后才能准确评估。\n"
+        "**【行动清单】**\n1. 保存材料。\n2. 拨打12348。"
+    )
+
+    sanitized = guide_graph._sanitize_forced_followups(reply)
+
+    assert "【维权路径比较】" in sanitized
+    assert "【维权胜算评估】" in sanitized
+    assert "【行动清单】" in sanitized
+
+
+def test_required_plan_sections_are_restored_before_document_offer():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        confidence_tier="MEDIUM",
+    )
+    reply = "**【法律依据】**\n法条。\n\n---\n📄 **需要参考文书？**"
+
+    restored = guide_graph._ensure_required_plan_sections(reply, state)
+
+    assert "【维权路径比较】" in restored
+    assert "【维权胜算评估】" in restored
+    assert "【行动清单】" in restored
+    assert restored.index("【行动清单】") < restored.index("需要参考文书")
+
+
 def test_structured_case_is_added_when_model_omits_case_section():
     reply = "**【法律依据】**\n法条内容\n\n**【行动清单】**\n先保存证据。"
     cases = [{"title": "刘某追索劳动报酬案", "gist": "法院支持支付拖欠工资。", "text": ""}]
@@ -376,6 +785,38 @@ def test_structured_case_is_added_when_model_omits_case_section():
     assert "【类似案例参考】" in completed
     assert "刘某追索劳动报酬案" in completed
     assert "法院支持支付拖欠工资" in completed
+
+
+def test_generated_case_claims_are_replaced_only_by_structured_retrieval_results():
+    reply = (
+        "**【法律依据】**\n法条内容\n\n"
+        "**【类似案例参考】**\n"
+        "甘肃（2013）某案证明法院大概率支持。\n\n"
+        "**【维权路径比较】**\n先投诉。"
+    )
+    cases = [
+        {
+            "title": "白某诉李某服务合同纠纷案",
+            "gist": "经营者停业后，法院结合剩余履行期限认定应返还的预付款。",
+            "text": "",
+        },
+        {
+            "title": "郑某等诈骗案",
+            "gist": "经查明存在欺诈目的并依法追究刑事责任。",
+            "text": "",
+        },
+    ]
+    state = GuideState(
+        legal_domain="consumer_market",
+        messages=[HumanMessage(content="理发店会员卡充值后关门")],
+    )
+
+    completed = guide_graph._ensure_case_reference(reply, cases, state=state)
+
+    assert "甘肃（2013）" not in completed
+    assert "法院大概率" not in completed
+    assert "白某诉李某服务合同纠纷案" in completed
+    assert "郑某等诈骗案" in completed
 
 
 def test_case_context_is_used_when_structured_case_list_is_missing():
@@ -500,6 +941,18 @@ def test_parse_details_accumulates_fact_blackboard_across_turns():
         "user_question": "",
         "new_issues": [],
         "collected_facts": ["2022年3月入职", "月薪8000元"],
+        "case_updates": [
+            {
+                "key": "employment.start_date", "category": "time",
+                "statement": "2022年3月入职", "source_text": "2022年3月入职",
+                "certainty": "asserted", "operation": "add",
+            },
+            {
+                "key": "employment.monthly_wage", "category": "amount",
+                "statement": "月薪8000元", "source_text": "月薪8000元",
+                "certainty": "asserted", "operation": "add",
+            },
+        ],
         "evidence": [],
         "evidence_unavailable": [],
         "region": "",
@@ -520,6 +973,18 @@ def test_parse_details_accumulates_fact_blackboard_across_turns():
         "user_question": "",
         "new_issues": [],
         "collected_facts": ["拖欠3个月工资", "拖欠金额24000元"],
+        "case_updates": [
+            {
+                "key": "wage.unpaid_duration", "category": "time",
+                "statement": "拖欠3个月工资", "source_text": "拖欠了3个月",
+                "certainty": "asserted", "operation": "add",
+            },
+            {
+                "key": "wage.unpaid_amount", "category": "amount",
+                "statement": "拖欠金额24000元", "source_text": "一共24000元",
+                "certainty": "asserted", "operation": "add",
+            },
+        ],
         "evidence": [],
         "evidence_unavailable": [],
         "region": "",
@@ -552,6 +1017,12 @@ def test_parse_details_does_not_count_evidence_mentioned_only_inside_image():
         "user_question": "",
         "new_issues": ["可能涉及系统性食品安全隐患"],
         "collected_facts": ["截图中消费者表示另有玻璃渣实物和现场照片"],
+        "case_updates": [{
+            "key": "evidence.unverified_claim", "category": "uncertainty",
+            "statement": "待核验线索（图片文字转述，本次未直接展示）：消费者称另有玻璃渣实物和现场照片",
+            "source_text": "语音转写称消费者另有实物和现场照片",
+            "certainty": "uncertain", "operation": "add",
+        }],
         "evidence": [
             "聊天记录截图（语音转文字记录）",
             "玻璃渣实物（消费者声称持有）",
@@ -575,7 +1046,7 @@ def test_parse_details_does_not_count_evidence_mentioned_only_inside_image():
     assert "玻璃渣实物" in updates["collected_facts"][0]
 
 
-def test_evidence_overconfidence_is_deterministically_softened():
+def legacy_patch_evidence_overconfidence_is_deterministically_softened():
     reply = (
         "现场照片是直接铁证，已经足够证明异物来自商家，胜诉希望很大。"
         "获得一千元赔偿的可能性非常大。"
@@ -606,7 +1077,7 @@ def test_unverified_image_leads_cannot_be_presented_as_evidence_in_hand():
     assert sanitized.count("本次未直接展示") == 2
 
 
-def test_food_minimum_additional_compensation_remains_conditional():
+def legacy_patch_food_minimum_additional_compensation_remains_conditional():
     state = GuideState(
         confirmed_issues=["食品安全问题"],
         collected_facts=["饭菜中疑似有玻璃渣"],
@@ -680,7 +1151,7 @@ def test_conclusion_prompt_uses_retrieval_and_complete_state_blackboard():
     )
 
     updates = asyncio.run(guide_graph.node_conclude(state, deps))
-    prompt = llm.ainvoke.await_args.args[0][0].content
+    prompt = llm.ainvoke.await_args_list[0].args[0][0].content
 
     assert "GROUNDING_LAW" in prompt
     assert "GROUNDING_CASE" in prompt
@@ -696,9 +1167,11 @@ def test_conclusion_prompt_uses_retrieval_and_complete_state_blackboard():
 class _FakeRedis:
     def __init__(self):
         self.data: dict[str, str] = {}
+        self.expirations: dict[str, int | None] = {}
 
     async def set(self, key, value, ex=None):
         self.data[key] = value
+        self.expirations[key] = ex
         return True
 
 
@@ -748,6 +1221,42 @@ def test_worker_persists_complete_short_term_blackboard():
     assert restored.evidence_confirmed == ["劳动合同"]
     assert restored.pending_ask_type == "facts"
     assert redis.data["guide_active:12:s1"] == "1"
+    assert redis.expirations["guide_state:12:s1"] == guide_worker.settings.GUIDE_SESSION_TTL
+
+
+def test_worker_persists_end_state_without_matching_invitation_copy():
+    redis = _FakeRedis()
+    state = GuideState(
+        session_id="12:s1",
+        phase=GuidePhase.END,
+        confirmed_issues=["拖欠工资"],
+        legal_domain="labor_social_security",
+        collected_facts=["拖欠3个月工资"],
+    )
+    with patch.object(
+        guide_worker,
+        "AsyncSessionLocal",
+        new=MagicMock(return_value=_SessionContext()),
+    ), patch.object(
+        guide_worker,
+        "build_guide_deps",
+        return_value=MagicMock(),
+    ), patch.object(
+        guide_worker,
+        "run_guide",
+        new=AsyncMock(return_value=("最终维权方案", state)),
+    ), patch.object(
+        guide_worker,
+        "get_checkpointer_redis",
+        return_value=redis,
+    ):
+        reply = asyncio.run(guide_worker.call_guide_agent_impl("现在生成方案", "12", "s1"))
+
+    restored = GuideState.model_validate_json(redis.data["guide_state:12:s1"])
+    assert reply == "最终维权方案"
+    assert restored.phase == GuidePhase.END
+    assert redis.data["guide_active:12:s1"] == "1"
+    assert redis.expirations["guide_state:12:s1"] == guide_worker.settings.GUIDE_SESSION_TTL
 
 
 def test_worker_tool_retrieves_long_term_memory_deterministically():

@@ -24,6 +24,7 @@ class Scenario:
     max_turns: int
     expect_critical: bool = False
     expect_first_turn_end: bool = False
+    expect_choice_before_end: bool = False
     expect_multimodal_evidence: bool = False
     expect_forced_conclusion: bool = False
     expected_end_round: int | None = None
@@ -32,13 +33,14 @@ class Scenario:
 SCENARIOS: dict[str, Scenario] = {
     "informed_adult": Scenario(
         title="知识储备足、信息完整的成年人",
-        persona="能一次说清时间、金额、地区与证据，希望直接得到方案",
+        persona="能一次说清时间、金额、地区与证据，并自主选择是否继续完善",
         messages=[
             "公司从2025年4月开始拖欠我3个月工资共24000元，我在上海工作，"
-            "有劳动合同、工资条、银行转账记录和考勤记录，请告诉我怎么维权。"
+            "有劳动合同、工资条、银行转账记录和考勤记录，请告诉我怎么维权。",
+            "现在生成方案。",
         ],
-        max_turns=1,
-        expect_first_turn_end=True,
+        max_turns=2,
+        expect_choice_before_end=True,
     ),
     "elderly_unclear": Scenario(
         title="表达不清、证据不足的老人",
@@ -125,6 +127,57 @@ SCENARIOS: dict[str, Scenario] = {
         max_turns=4,
         expect_forced_conclusion=True,
         expected_end_round=4,
+    ),
+    "housing_deposit": Scenario(
+        title="房屋租赁押金返还",
+        persona="事实和材料较完整，要求快速形成租房维权方案",
+        messages=[
+            "我在北京租房，已经退房一个月，房东不退3000元押金。"
+            "我有租赁合同、押金转账记录、退房交接聊天和房东收到钥匙的记录。",
+            "现在生成方案。",
+        ],
+        max_turns=2,
+    ),
+    "consumer_refund": Scenario(
+        title="网购商品退款纠纷",
+        persona="提供订单、检测和沟通材料的普通消费者",
+        messages=[
+            "我在网店花4200元买的手机收到后频繁重启，商家拒绝退货。"
+            "我有订单、付款记录、售后检测单和与客服的完整聊天记录，收货才5天。",
+            "现在生成方案。",
+        ],
+        max_turns=2,
+    ),
+    "prepaid_service": Scenario(
+        title="预付式服务停业退费",
+        persona="分轮补充金额、退款沟通和材料，验证上下文承接与法条召回",
+        messages=[
+            "我在理发店充值后一周店就关门了，卡内余额还有300元。",
+            "一共充值700元，我要求退还这300元，对方把我拉黑了。",
+            "我有付款记录、会员卡、余额截图和要求退款的完整聊天记录。",
+            "我还拍了店铺关门的照片。现在生成方案。",
+        ],
+        max_turns=4,
+    ),
+    "traffic_injury": Scenario(
+        title="交通事故人身损害",
+        persona="责任已初步明确并持有医疗材料的事故伤者",
+        messages=[
+            "我在广州被小汽车撞伤，交警认定对方全责。住院花了18000元，"
+            "我有事故认定书、病历、医疗费票据和误工证明，对方保险公司只愿赔一部分。",
+            "现在生成方案。",
+        ],
+        max_turns=2,
+    ),
+    "cyber_fraud": Scenario(
+        title="网络兼职诈骗",
+        persona="保留电子交易痕迹并希望尽快报案止损的受害者",
+        messages=[
+            "我在网络兼职群里被骗转账2万元，昨天刚发生。"
+            "我保留了转账记录、群聊、对方账号和平台主页截图，还没有报案。",
+            "现在生成方案。",
+        ],
+        max_turns=2,
     ),
 }
 
@@ -232,6 +285,23 @@ def _evaluate_final_reply(result: ScenarioResult, scenario: Scenario, state: Gui
         if leaked:
             _add_error(result, f"强制收敛后仍要求继续补充：{leaked}")
 
+    if result.key == "prepaid_service":
+        if state.legal_domain != "consumer_market":
+            _add_error(result, f"预付式服务纠纷错误切换领域：{state.legal_domain}")
+        issue_text = "；".join(state.confirmed_issues)
+        if any(term in issue_text for term in ("诈骗", "刑事犯罪", "非法集资")):
+            _add_error(result, f"普通预付消费事实被自动升级为刑事争点：{issue_text}")
+        if "拉黑" not in reply:
+            _add_error(result, "最终方案没有承接用户明确补充的被拉黑事实")
+        evidence_text = "；".join(state.evidence_confirmed)
+        if not all(term in evidence_text for term in ("付款", "会员卡", "照片")):
+            _add_error(result, f"用户主动补充的材料没有完整入库：{evidence_text or '空'}")
+        if not (
+            "中华人民共和国消费者权益保护法实施条例" in state.law_context_str
+            and "第二十二条" in state.law_context_str
+        ):
+            _add_error(result, "未召回预付款退还直接相关的《实施条例》第二十二条")
+
 
 async def run_scenario(key: str, scenario: Scenario) -> ScenarioResult:
     result = ScenarioResult(key=key, title=scenario.title)
@@ -293,6 +363,13 @@ async def run_scenario(key: str, scenario: Scenario) -> ScenarioResult:
     assert state is not None
     if scenario.expect_first_turn_end and state.round != 1:
         _add_error(result, f"信息完整用户未在首轮收敛，实际 {state.round} 轮")
+    if scenario.expect_choice_before_end:
+        offered = any(
+            "继续补充" in turn["reply"] and "现在生成方案" in turn["reply"]
+            for turn in result.turns[:-1]
+        )
+        if not offered:
+            _add_error(result, "信息达到可出方案条件后，未先让用户选择继续补充或立即生成")
     if state.round > scenario.max_turns:
         _add_error(result, f"对话超过场景上限 {scenario.max_turns} 轮")
     if scenario.expect_forced_conclusion:
@@ -508,7 +585,7 @@ def render_markdown(results: list[ScenarioResult], memory: dict) -> str:
         "",
         "## 剩余风险",
         "",
-        "- 当前真实人物场景主要围绕劳动欠薪，其他法律领域仍需继续补充同强度的真实回归场景。",
+        "- 已覆盖劳动、房屋租赁、消费、交通事故、网络诈骗及中途人身危险；家庭、行政救济等领域仍可继续补充同强度回归。",
         multimodal_note,
         "- 场景耗时包含多轮交互，但真实 LLM 调用仍是主要延迟来源；正式上线前应补充分位数延迟与并发压测。",
         "- 模型输出具有随机性，提示词、模型版本、法条库或案例库更新后应重新运行本评测。",

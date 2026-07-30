@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from difflib import SequenceMatcher
 from loguru import logger
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_deepseek import ChatDeepSeek
@@ -28,36 +29,52 @@ from src.agents.legal_guide.channel_catalog import (
     normalize_region_name,
 )
 from src.agents.legal_guide.formatters import fmt_channels, fmt_evidence_checklist
+from src.agents.legal_guide.case_model import (
+    active_case_facts,
+    evidence_from_case_facts,
+    format_case_context,
+    legacy_fact_updates,
+    latest_case_facts,
+    reduce_case_facts,
+)
+from src.agents.legal_guide.followup_planner import (
+    format_followup_authority,
+    plan_next_followup,
+)
+from src.agents.legal_guide.retrieval_query import build_case_retrieval_inputs
 from src.agents.legal_guide.authority_registry import format_domain_authority_summary
 from src.agents.legal_guide.evidence_rules import (
     format_evidence_source,
     resolve_state_evidence_checklist,
 )
 from src.agents.legal_guide.followup_catalog import (
-    EvidenceFollowup,
-    FactFollowup,
     assess_evidence_answer,
     assess_fact_answer,
     assess_initial_evidence,
     assess_initial_facts,
     evidence_effective_count,
-    evidence_followups,
-    evidence_rule_resolved,
-    fact_followups,
-    fact_rule_resolved,
     find_evidence_followup,
     find_fact_followup,
     format_evidence_assessments,
     format_fact_assessments,
+    get_domain_followups,
 )
 from src.agents.legal_guide.prompts import (
     URGENCY_CHECK_PROMPT, CLARIFY_PROMPT,
-    PARSE_DETAILS_PROMPT, CONCLUDE_PROMPT, SELF_REVIEW_PROMPT,
+    PARSE_DETAILS_PROMPT, CONCLUDE_PROMPT, PLAN_AUDIT_PROMPT, SELF_REVIEW_PROMPT,
     DOC_TYPE_MAP,
     DOMAIN_DETAIL_TEMPLATES, DOMAIN_LABELS,
 )
 
 settings = get_settings()
+
+_COMMON_CASE_REGIONS = (
+    "北京", "上海", "天津", "重庆", "杭州", "广州", "深圳", "南京", "成都",
+    "武汉", "西安", "郑州", "长沙", "苏州", "宁波", "青岛", "厦门", "福州",
+    "济南", "合肥", "南昌", "昆明", "贵阳", "南宁", "海口", "沈阳", "大连",
+    "长春", "哈尔滨", "石家庄", "太原", "呼和浩特", "兰州", "西宁", "银川",
+    "乌鲁木齐", "拉萨",
+)
 
 URGENCY_CRITICAL_RESPONSE = """听到您的情况，我非常担心您的安全。
 
@@ -84,6 +101,182 @@ def _long_term_memories(state: GuideState, limit: int = 5) -> list[str]:
     return [str(item).strip()[:300] for item in memories[:limit] if str(item).strip()]
 
 
+_MEMORY_RECALL_MARKERS = (
+    "之前说", "以前说", "上次说", "前面说", "还记得", "记得我", "我说过",
+    "之前的", "上次的", "以前的",
+)
+
+
+def _active_long_term_memories(state: GuideState) -> list[str]:
+    """Historical case facts enter reasoning only when the user explicitly recalls them."""
+    user_messages = [
+        str(message.content)
+        for message in state.messages
+        if isinstance(message, HumanMessage)
+    ]
+    if not user_messages:
+        return _long_term_memories(state)
+    if not any(marker in text for text in user_messages for marker in _MEMORY_RECALL_MARKERS):
+        return []
+    return _long_term_memories(state)
+
+
+def _with_memory_recall_preface(state: GuideState, user_message: str, reply: str) -> str:
+    """用户明确追问历史时，先复述一条最相关记忆，再继续当前流程。
+
+    长期记忆只作为可纠正的上下文，不把历史信息伪装成已经核验的事实。
+    """
+    if not any(marker in str(user_message or "") for marker in _MEMORY_RECALL_MARKERS):
+        return reply
+    memories = _active_long_term_memories(state)
+    if not memories:
+        return reply
+
+    def _rank(value: str) -> tuple[int, int]:
+        legal_summary = int("法律咨询摘要" in value or "案情事实" in value)
+        substantive = int(any(term in value for term in ("争议", "拖欠", "纠纷", "证据", "合同", "事故")))
+        return legal_summary + substantive, len(value)
+
+    memory = max(memories, key=_rank)
+    clean_memory = re.sub(r"^法律咨询摘要[:：]\s*", "", memory).strip().rstrip("。；")
+    if not clean_memory or clean_memory in reply:
+        return reply
+    return (
+        f"我记得您之前提到：{clean_memory}。\n"
+        "如果情况已有变化，以您这次说明为准。\n\n"
+        f"{reply}"
+    )
+
+
+def _merge_unique(old: list[str], new: list[str]) -> list[str]:
+    seen: set[str] = set()
+    return [item for item in old + new if item and not (item in seen or seen.add(item))]
+
+
+def _state_region_name(raw: str | None) -> str:
+    """Preserve a user-stated region even when local channel data is not piloted there."""
+    supported = normalize_region_name(raw)
+    if supported:
+        return supported
+    value = str(raw or "").strip()
+    if value in {"", "全国", "中国", "未说明", "未知", "不清楚", "所在地区"}:
+        return ""
+    if value in _COMMON_CASE_REGIONS:
+        return value
+    if re.fullmatch(r"[\u4e00-\u9fff]{2,12}(?:省|市|自治区|特别行政区|自治州|地区|盟|县|区)", value):
+        return value
+    return ""
+
+
+def _extract_case_region(text: str) -> str:
+    supported = extract_supported_region(text)
+    if supported:
+        return supported
+    value = str(text or "")
+    return next((region for region in _COMMON_CASE_REGIONS if region in value), "")
+
+
+_SUPPLEMENT_CONCLUDE_MARKERS = (
+    "现在生成", "直接生成", "生成方案", "给方案", "出方案", "先生成",
+    "不补充", "不用补充", "不继续", "不问了", "就这些", "按现有信息",
+)
+_SUPPLEMENT_CONTINUE_MARKERS = (
+    "继续补充", "继续问", "可以继续", "再问", "再补充", "完善一下",
+    "还要补充", "我继续说", "继续",
+)
+
+
+def _supplement_choice_from_text(message: str) -> str:
+    """仅在等待选择时解析用户意图，避免普通案情中的“继续”被误判。"""
+    compact = "".join(str(message or "").strip().split())
+    if any(marker in compact for marker in _SUPPLEMENT_CONCLUDE_MARKERS):
+        return "conclude"
+    if any(marker in compact for marker in _SUPPLEMENT_CONTINUE_MARKERS):
+        return "continue"
+    return ""
+
+
+def _supplement_contains_case_details(message: str) -> bool:
+    """Treat free-form facts as an implicit request to keep supplementing."""
+    compact = "".join(str(message or "").strip().split())
+    if compact in {"好", "好的", "行", "可以", "嗯", "哦", "知道了", "明白了"}:
+        return False
+    markers = sorted(
+        {*_SUPPLEMENT_CONCLUDE_MARKERS, *_SUPPLEMENT_CONTINUE_MARKERS},
+        key=len,
+        reverse=True,
+    )
+    for marker in markers:
+        compact = compact.replace(marker, "")
+    compact = re.sub(r"[，。；：、！？?（）()\[\]【】‘’“”\-]", "", compact)
+    if compact in {"", "现在", "直接", "先", "方案", "生成", "给", "出"}:
+        return False
+    compact = compact.strip("好的行可以嗯哦我请就吧")
+    return len(compact) >= 2
+
+
+def _normalized_question_text(value: str) -> str:
+    return re.sub(r"[\s，。；：、！？?（）()\[\]【】‘’“”\-]", "", str(value or ""))
+
+
+def _looks_like_question_repetition(answer: str, questions: list[str]) -> bool:
+    """识别用户把系统问题复制回来、但没有作出肯定或否定回答的情况。"""
+    answer_norm = _normalized_question_text(answer)
+    if not answer_norm:
+        return False
+    explicit_prefixes = ("有", "没有", "没", "是", "不是", "签了", "没签", "写了", "没写", "确认")
+    if answer_norm.startswith(explicit_prefixes):
+        return False
+    looks_interrogative = any(marker in answer for marker in ("？", "?", "是否", "有没有", "是不是", "吗"))
+    if not looks_interrogative:
+        return False
+    for question in questions:
+        question_norm = _normalized_question_text(question)
+        if not question_norm:
+            continue
+        if question_norm in answer_norm or answer_norm in question_norm:
+            return True
+        if SequenceMatcher(None, answer_norm, question_norm).ratio() >= 0.62:
+            return True
+    return False
+
+
+def _looks_like_user_question(value: str) -> bool:
+    """Conservative fallback when the detail parser mistakes a statement for a question."""
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return False
+    if any(marker in text for marker in ("？", "?", "为什么", "为何", "怎么", "如何", "什么是", "有什么用")):
+        return True
+    return text.endswith(("吗", "呢", "么"))
+
+
+def _is_usable_case_fact(value: str) -> bool:
+    """过滤疑问句、系统问题复述和纯推测，避免污染案情黑板。"""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return False
+    if any(marker in text for marker in ("？", "?", "是否", "有没有", "是不是")):
+        return False
+    if text.endswith("吗"):
+        return False
+    if re.search(r"使用[‘'\"“]?[^’'\"”]{1,12}[’'\"”]?一词", text):
+        return False
+    return True
+
+
+def _is_draftable_fact(value: str) -> bool:
+    """只有清晰、非推测的用户陈述才能进入正式文书事实池。"""
+    text = " ".join(str(value or "").split())
+    if not _is_usable_case_fact(text):
+        return False
+    if text.startswith("待核验线索"):
+        return False
+    if any(marker in text for marker in ("可能", "好像", "应该", "猜测", "听说", "据说")):
+        return False
+    return True
+
+
 # ════════════════════════════════════════════════════════════════════════
 # 节点函数
 # ════════════════════════════════════════════════════════════════════════
@@ -107,16 +300,38 @@ async def node_prepare_turn(state: GuideState, deps: GuideDeps) -> dict:
     last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
     conclude_phrases = (
         "不要再问", "别再问", "不用再问", "给方案", "给我方案", "给出方案",
-        "按现有信息", "按现在这些", "最终建议", "最终方案", "请收敛",
+        "生成方案", "现在生成方案", "按现有信息", "按现在这些", "最终建议", "最终方案", "请收敛",
         "只能说这些", "只说这些", "没有更多信息", "没有更多证据", "没更多信息",
     )
+    supplement_choice = ""
+    supplement_has_details = False
+    awaiting_supplement_choice = state.awaiting_supplement_choice
+    allow_extra_followups = state.allow_extra_followups
+    wants_conclude = state.wants_conclude or any(p in last_msg for p in conclude_phrases)
+    if state.awaiting_supplement_choice:
+        supplement_choice = _supplement_choice_from_text(last_msg)
+        supplement_has_details = _supplement_contains_case_details(last_msg)
+        if not supplement_choice and supplement_has_details:
+            supplement_choice = "continue"
+        if supplement_choice == "conclude":
+            wants_conclude = True
+            awaiting_supplement_choice = False
+        elif supplement_choice == "continue":
+            allow_extra_followups = True
+        # 旧版本持久化过这个菜单状态。新流程收到下一条消息后立即退出该状态，
+        # 再由动态规划器选择一个明确缺口或直接生成方案。
+        awaiting_supplement_choice = False
     total_rounds = state.total_rounds + 1
     return {
         **context_updates,
         "round": state.round + 1,
         "total_rounds": total_rounds,
-        "wants_conclude": state.wants_conclude or any(p in last_msg for p in conclude_phrases),
+        "wants_conclude": wants_conclude,
         "force_conclude": state.force_conclude or total_rounds >= settings.GUIDE_MAX_TOTAL_ROUNDS,
+        "awaiting_supplement_choice": awaiting_supplement_choice,
+        "supplement_choice": supplement_choice,
+        "supplement_has_details": supplement_has_details,
+        "allow_extra_followups": allow_extra_followups,
     }
 
 
@@ -130,7 +345,19 @@ async def node_check_urgency(state: GuideState, deps: GuideDeps) -> dict:
     if not last_msg:
         return {}
     logger.info("节点②紧急检测 | session={} round={}", state.session_id, state.round)
-    prompt = URGENCY_CHECK_PROMPT.format(user_input=last_msg)
+    recent_human_messages = [
+        str(message.content).strip()
+        for message in state.messages
+        if isinstance(message, HumanMessage) and str(message.content).strip()
+    ][-4:]
+    recent_dialogue = "\n".join(
+        f"- 第{index + 1}条：{message}"
+        for index, message in enumerate(recent_human_messages)
+    )
+    prompt = URGENCY_CHECK_PROMPT.format(
+        user_input=last_msg,
+        recent_dialogue=recent_dialogue or f"- {last_msg}",
+    )
     response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
     try:
         content = response.content.strip()
@@ -139,35 +366,117 @@ async def node_check_urgency(state: GuideState, deps: GuideDeps) -> dict:
         result = json.loads(content)
         urgency = result.get("urgency", "NORMAL")
         time_clue = result.get("time_clue", "")
-        if urgency == "CRITICAL":
+        recent_text = "\n".join(recent_human_messages)
+        explicitly_safe = any(
+            marker in recent_text
+            for marker in (
+                "今天暂时安全", "现在暂时安全", "目前暂时安全", "现在安全",
+                "目前安全", "已经安全", "没有安全危险", "现在没有危险",
+                "目前没有危险", "已经离开现场", "现在不在现场",
+            )
+        )
+        deterministic_current_danger = any(
+            marker in last_msg
+            for marker in (
+                "现在有危险", "目前有危险", "正在打", "正在施暴", "正在追",
+                "拿刀", "持刀", "要杀", "赶过来", "马上过来", "被困",
+                "不让我走", "无法离开", "就在门外",
+            )
+        )
+        allowed_safety_statuses = {"danger", "safe", "unknown", "not_applicable"}
+        model_safety_status = str(result.get("safety_status") or "").lower()
+        safety_relevant = bool(result.get("safety_relevant"))
+        safety_contract_present = (
+            "safety_relevant" in result or "safety_status" in result
+        )
+        if deterministic_current_danger:
+            safety_relevant = True
+            safety_status = "danger"
+        elif explicitly_safe:
+            safety_relevant = True
+            safety_status = "safe"
+        elif urgency == "CRITICAL" and not safety_contract_present:
+            # Backward-compatible fail-safe for an older/malformed model reply.
+            safety_relevant = True
+            safety_status = "danger"
+        elif safety_relevant:
+            safety_status = (
+                model_safety_status
+                if model_safety_status in allowed_safety_statuses - {"not_applicable", "safe"}
+                else "unknown"
+            )
+        else:
+            safety_status = "not_applicable"
+        current_danger = safety_status == "danger"
+        if urgency == "CRITICAL" and not current_danger and explicitly_safe:
+            logger.info("近期已明确当前安全且没有新增危险，继续法律梳理而不触发紧急终止")
+            return {
+                "urgency_level": "normal",
+                "safety_relevant": safety_relevant,
+                "current_safety_status": safety_status,
+            }
+        if urgency == "CRITICAL" and not current_danger:
+            logger.info("涉及人身安全但当前危险未确认，转入单问题安全确认")
+            return {
+                "urgency_level": "normal",
+                "safety_relevant": safety_relevant,
+                "current_safety_status": safety_status,
+            }
+        if urgency == "CRITICAL" and current_danger:
             logger.warning("节点②检测到CRITICAL紧急情形")
             return {
                 "urgency_level": "critical",
+                "safety_relevant": True,
+                "current_safety_status": "danger",
                 "phase": GuidePhase.END,
                 "messages": [AIMessage(content=URGENCY_CRITICAL_RESPONSE)],
             }
         if urgency == "TIME" and time_clue:
             warning = f'\n⚠️ **时效提醒**：您提到"{time_clue}"，请注意维权时效（劳动仲裁1年、一般民事3年），建议尽快行动。'
             logger.info("节点②检测到时效紧迫: {}", time_clue)
-            return {"urgency_level": "time", "time_warning": warning}
+            return {
+                "urgency_level": "time",
+                "safety_relevant": safety_relevant,
+                "current_safety_status": safety_status,
+                "time_warning": warning,
+            }
+        return {
+            "urgency_level": "normal",
+            "safety_relevant": safety_relevant,
+            "current_safety_status": safety_status,
+        }
     except Exception as e:
         logger.warning(f"紧急检测解析失败: {e}")
-    return {"urgency_level": "normal"}
+    return {
+        "urgency_level": "normal",
+        "safety_relevant": state.safety_relevant,
+        "current_safety_status": state.current_safety_status,
+    }
 
 
 async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
-    """节点③：三层法律问题标准化。拼接最近3条人类消息，避免多轮澄清后上下文丢失。
-
-    同时提取用户主动提供的证据（首轮优化）：如果用户在描述问题时已经提到证据，直接提取，
-    避免后续节点重复追问已有证据。
-    """
+    """节点③：标准化法律问题，并把当前消息归入通用原子案情。"""
     human_msgs = [m.content for m in state.messages if isinstance(m, HumanMessage)]
     if not human_msgs:
         return {}
-    # 取最近3条拼接，给LLM更完整的上下文
     combined_input = "\n".join(human_msgs[-3:])
-    memories = _long_term_memories(state)
-    normalizer_input = combined_input
+    memories = _active_long_term_memories(state)
+    prior_messages = human_msgs[-3:-1]
+    normalizer_input = (
+        "[近期对话，仅用于理解语境]\n"
+        + ("\n".join(prior_messages) or "无")
+        + "\n\n[当前用户消息]\n"
+        + human_msgs[-1]
+        + "\n\ncase_updates 只提取[当前用户消息]中的新增、更正或否定内容；"
+          "source_text 必须来自该消息原文。"
+    )
+    if state.case_facts:
+        normalizer_input += (
+            "\n\n[已有结构化事实及语义键]\n"
+            + format_case_context(state.case_facts)
+            + "\n当前消息若只是重复已有事实，不要换一个 key 再次写入；"
+              "若补充同一事实，沿用已有 key 或其下级 key。"
+        )
     if memories:
         normalizer_input += (
             "\n\n[相关长期记忆，仅作补充；与本轮冲突时以本轮为准]\n"
@@ -186,75 +495,57 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
         seen: set[str] = set()
         return [x for x in old + new if not (x in seen or seen.add(x))]
 
-    new_confirmed = _merge(state.confirmed_issues, result["standard"])
+    latest_user_text = human_msgs[-1]
+    result_standard = result["standard"]
+    new_confirmed = _merge(state.confirmed_issues, result_standard)
     # 已升级为标准术语的口语词，从口语池剔除，避免同一件事在两个池里各出现一次
-    promoted = set(result["term_map"])
+    result_term_map = dict(result["term_map"])
+    promoted = set(result_term_map)
     new_unmatched = [
         x for x in _merge(state.unmatched_issues, result["colloquial"])
         if x not in promoted
     ]
-    domain = result["domain"] or state.legal_domain
-    new_term_map = {**state.term_map, **result["term_map"]}
-    extracted_facts = result.get("collected_facts") or []
-    new_facts = _merge(state.collected_facts, extracted_facts)
-    fact_records = assess_initial_facts(extracted_facts, state.fact_records)
-
-    # 提取首轮主动提供的证据（避免重复追问）- 使用模糊匹配
-    new_evidence = state.evidence_confirmed.copy()
+    proposed_domain = result["domain"] or state.legal_domain
+    # The primary legal domain is stable for one case. New facts can broaden
+    # retrieval, but an inferred label must not silently replace the workflow.
+    domain = state.legal_domain or proposed_domain
+    new_term_map = {**state.term_map, **result_term_map}
+    raw_case_updates = result.get("case_updates") or legacy_fact_updates(
+        result.get("collected_facts") or [],
+        user_text=latest_user_text,
+    )
+    case_facts = reduce_case_facts(
+        state.case_facts,
+        raw_case_updates,
+        user_text=latest_user_text,
+        turn=state.round,
+    )
+    active_atoms = active_case_facts(case_facts)
+    atomic_statements = [
+        item["statement"] for item in active_atoms
+        if item.get("category") != "evidence" and item.get("statement")
+    ]
+    new_facts = atomic_statements if case_facts else _merge(state.collected_facts, atomic_statements)
+    fact_records = assess_initial_facts(atomic_statements, state.fact_records)
+    active_draftable_facts = [
+            item["statement"] for item in active_atoms
+            if item.get("category") != "evidence"
+            and item.get("status") == "asserted"
+            and item.get("statement")
+        ]
+    new_draftable_facts = (
+        active_draftable_facts
+        if case_facts
+        else _merge(state.draftable_facts, active_draftable_facts)
+    )
+    atom_evidence, atom_unavailable = evidence_from_case_facts(case_facts)
+    new_evidence = _merge(state.evidence_confirmed, atom_evidence)
+    new_unavailable = _merge(state.evidence_unavailable, atom_unavailable)
     region_extracted = (
-        normalize_region_name(state.region)
-        or normalize_region_name(result.get("region", ""))
-        or extract_supported_region(combined_input)
+        _state_region_name(state.region)
+        or _state_region_name(result.get("region", ""))
     )
     time_info = state.time_info or result.get("time_info", "")
-
-    if state.round <= 1 and len(human_msgs) == 1:  # 仅首轮生效
-        # 每组模式对应一个规范证据名称
-        evidence_patterns = [
-            (["劳动合同", "合同书", "劳动协议", "签合同", "签了合同"], "劳动合同"),
-            (["工资条", "工资单", "薪资条", "薪资单", "工资表"], "工资条"),
-            (["转账记录", "银行流水", "转账截图", "流水", "银行转账"], "转账记录"),
-            (["打卡记录", "考勤", "考勤表", "考勤记录", "打卡"], "考勤记录"),
-            (["聊天记录", "微信记录", "聊天截图", "微信聊天"], "聊天记录"),
-            (["照片", "图片", "拍照"], "照片"),
-            (["视频", "录像"], "视频"),
-            (["录音", "通话录音", "电话录音"], "录音"),
-            (["收据", "发票", "票据"], "收据"),
-            (["工作证", "工牌", "员工卡"], "工作证"),
-            (["合同", "协议"], "合同"),
-        ]
-
-        for patterns, canonical_name in evidence_patterns:
-            affirmed = False
-            for pattern in patterns:
-                start = combined_input.find(pattern)
-                if start < 0:
-                    continue
-                prefix = combined_input[max(0, start - 4):start]
-                if not any(negative in prefix for negative in ("没有", "没", "无", "不存在")):
-                    affirmed = True
-                    break
-            if affirmed:
-                if canonical_name not in new_evidence:
-                    new_evidence.append(canonical_name)
-
-        # 提取时间信息（判断是否提到时间）
-        time_patterns = [
-            r"\d+个?月",
-            r"\d+年",
-            r"(去年|前年|今年|上月|上个月)",
-            r"\d{4}年\d{1,2}月",
-            r"(一|二|三|四|五|六|七|八|九|十|几)个月",
-        ]
-        if not time_info:
-            for pattern in time_patterns:
-                match = re.search(pattern, combined_input)
-                if match:
-                    time_info = match.group(0)
-                    break
-
-        if new_evidence:
-            logger.info("节点③提取首轮证据 | evidence={}", new_evidence)
 
     logger.info(
         "节点③结果 | standard={} colloquial={} domain={} evidence={} region={} time_info={}",
@@ -265,11 +556,14 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
         "unmatched_issues": new_unmatched,
         "term_map": new_term_map,
         "collected_facts": new_facts,
+        "draftable_facts": new_draftable_facts,
+        "case_facts": case_facts,
         "fact_records": fact_records,
+        "evidence_unavailable": new_unavailable,
         "legal_domain": domain,
     }
 
-    if new_evidence:
+    if new_evidence != state.evidence_confirmed:
         updates["evidence_confirmed"] = new_evidence
         newly_found = [item for item in new_evidence if item not in state.evidence_confirmed]
         updates["evidence_assessments"] = assess_initial_evidence(
@@ -318,22 +612,10 @@ async def node_score(state: GuideState, deps: GuideDeps) -> dict:
         state.evidence_assessments,
     )
 
-    # 改进时间检测：检查用户输入中是否包含时间相关表达
-    import re
-    combined_input = "\n".join(
-        m.content for m in state.messages if isinstance(m, HumanMessage)
-    )
-    time_patterns = [
-        r"\d+个?月",
-        r"\d+年",
-        r"(去年|前年|今年|上月|上个月|最近)",
-        r"\d{4}年\d{1,2}月",
-        r"(一|二|三|四|五|六|七|八|九|十|几)个月",
-    ]
     time_known = (
         bool(state.time_warning) or
         bool(state.time_info) or
-        any(re.search(pattern, combined_input) for pattern in time_patterns)
+        any(item.get("category") == "time" for item in active_case_facts(state.case_facts))
     )
 
     conf = score_confidence(
@@ -389,13 +671,15 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
     - effective_domain 为空（domain=other）→ 仅全库向量检索
     避免 domain 识别错误时返回 0 条法律。
     """
-    # ── 双查询构建：Dense 与 Sparse 走不同的料 ────────────────────────────────
-    # sparse_query（BM25，字面匹配）：只用标准术语。BM25 对口语零召回，
-    #   混入领域标签/事实描述只会稀释 IDF 权重。
-    # question（Dense/HyDE，语义匹配）：标准术语 + 口语 + 已确认证据。
-    #   向量能容忍语义 gap，信息越具体召回越贴案情。
+    # ── 双查询构建：Dense 与 Sparse 走同一案情模型的两种投影 ────────────────
+    # Dense 保留完整语义；Sparse 只保留已确认的关系、行为、请求、时间和
+    # 程序词。两者都由原子事实生成，不再为具体行业维护关键词分支。
     domain = state.legal_domain
-    sparse_query = "、".join(state.confirmed_issues)
+    retrieval_inputs = build_case_retrieval_inputs(
+        state.confirmed_issues,
+        active_case_facts(state.case_facts),
+    )
+    sparse_query = str(retrieval_inputs["sparse_query"])
 
     dense_parts: list[str] = []
     if domain_label := DOMAIN_LABELS.get(domain, ""):
@@ -410,13 +694,19 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
     # → 召回经济补偿金计算/书面通知要求等具体条款
     if state.evidence_confirmed:
         dense_parts.append("、".join(state.evidence_confirmed[:3]))
-    if state.collected_facts:
+    semantic_phrases = list(retrieval_inputs["semantic_phrases"])
+    if semantic_phrases:
+        dense_parts.append("；".join(semantic_phrases[-10:]))
+    # Compatibility for states created before atomic case facts were added.
+    # New conversations use case_facts exclusively, avoiding stale corrected
+    # values; old persisted conversations still retain their semantic context.
+    if not state.case_facts and state.collected_facts:
         dense_parts.append("；".join(state.collected_facts[-6:]))
     if state.time_info:
         dense_parts.append(state.time_info)
     if state.region:
         dense_parts.append(state.region)
-    memories = _long_term_memories(state)
+    memories = _active_long_term_memories(state)
     if memories:
         dense_parts.append("；".join(memories))
 
@@ -523,12 +813,13 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
 
     # PG 字面补充：向量有结果也可能语义漂移，始终补充领域内的原文字面命中，
     # 再与向量候选统一精排。只传标准术语，避免口语词污染 LIKE 查询。
-    if deps.db_session and effective_domain and state.confirmed_issues:
+    lexical_phrases = list(retrieval_inputs["lexical_phrases"])
+    if deps.db_session and effective_domain and lexical_phrases:
         from src.agents.legal_knowledge.statute_rag import search_statutes_pg_fallback
         try:
             pg_hits = await search_statutes_pg_fallback(
                 effective_domain,
-                state.confirmed_issues,
+                lexical_phrases,
                 deps.db_session,
                 limit=16,
             )
@@ -583,6 +874,15 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
             logger.warning(f"获取法律标题失败（PostgreSQL不可用），降级显示: {e}")
     # primary_count=5：前5条作为核心法条，确保关键法律依据被充分展示
     law_context_formatted = format_statute_context(law_hits, law_titles, primary_count=5)
+    retrieved_law_refs = [
+        {
+            "law_id": str(hit.get("law_id") or ""),
+            "title": law_titles.get(str(hit.get("law_id") or ""), ""),
+            "article_no": str(hit.get("article_no") or ""),
+            "text": str(hit.get("text") or "")[:1200],
+        }
+        for hit in law_hits[:8]
+    ]
 
     # 渠道是精确结构化数据：以 PostgreSQL 为主库，按专属渠道、公共法律服务、
     # 12345 兜底分层查询。数据库异常时 Repository 内部返回最小全国渠道。
@@ -605,6 +905,7 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
 
     updates = {
         "candidate_laws": graph_laws,
+        "retrieved_law_refs": retrieved_law_refs,
         "similar_cases": similar_cases,
         "relevant_channels": channels,
         "law_context_str": law_context_formatted or "",
@@ -643,8 +944,16 @@ async def node_assess_retrieve(state: GuideState, deps: GuideDeps) -> dict:
     """节点⑤：规则评分与法条、类案、渠道检索合并为一个原子业务步骤。"""
     score_updates = await node_score(state, deps)
     scored_state = state.model_copy(update=score_updates)
-    if scored_state.wants_conclude and scored_state.retrieval_completed:
-        logger.info("节点⑤复用上一轮检索结果 | 用户已要求按现有信息收敛")
+    has_current_turn_facts = bool(
+        latest_case_facts(scored_state.case_facts, scored_state.round)
+    )
+    if (
+        scored_state.retrieval_completed
+        and (scored_state.wants_conclude or scored_state.supplement_choice in {"continue", "conclude"})
+        and not scored_state.supplement_has_details
+        and not has_current_turn_facts
+    ):
+        logger.info("节点⑤复用上一轮检索结果 | 用户已完成补充选择")
         retrieval_updates = {}
     else:
         retrieval_updates = await node_retrieve(scored_state, deps)
@@ -653,151 +962,190 @@ async def node_assess_retrieve(state: GuideState, deps: GuideDeps) -> dict:
         assessed_state,
         max_rounds=settings.GUIDE_MAX_TOTAL_ROUNDS,
     )
+    hard_stop = (
+        state.force_conclude
+        or force
+        or assessed_state.wants_conclude
+        or assessed_state.supplement_choice == "conclude"
+        or assessed_state.ask_rounds >= settings.GUIDE_MAX_ASK_ROUNDS
+        or assessed_state.consecutive_low_info_answers >= settings.GUIDE_MAX_LOW_INFO_ANSWERS
+    )
+    if hard_stop:
+        followup_plan = {"should_ask": False, "planner_mode": "converged"}
+    else:
+        followup_plan = await plan_next_followup(assessed_state, deps.llm)
     return {
         **score_updates,
         **retrieval_updates,
         "force_conclude": state.force_conclude or force,
+        "followup_plan": followup_plan,
     }
 
 
-def _remaining_fact_rules(state: GuideState) -> list[FactFollowup]:
-    return [
-        rule for rule in fact_followups(state.legal_domain)
-        if rule.id not in state.asked_followup_ids
-        and rule.question not in state.asked_details
-        and not fact_rule_resolved(rule, state)
-    ]
-
-
-def _remaining_fact_questions(state: GuideState) -> list[str]:
-    return [rule.question for rule in _remaining_fact_rules(state)]
-
-
-def _remaining_evidence_rules(state: GuideState) -> list[EvidenceFollowup]:
-    known = state.evidence_confirmed + state.evidence_unavailable
-    return [
-        rule for rule in evidence_followups(state.legal_domain)
-        if rule.id not in state.asked_followup_ids
-        and rule.question not in state.asked_details
-        and not evidence_rule_resolved(rule, known)
-    ]
-
-
-def _remaining_evidence_questions(state: GuideState) -> list[str]:
-    return [rule.item for rule in _remaining_evidence_rules(state)]
-
-
-_OPTIONAL_EVIDENCE_MARKERS = ("如有", "若有", "如涉及", "可选", "进入诉讼阶段时")
-
-_EVIDENCE_ALIAS_GROUPS = (
-    ("身份证明", "身份证", "主体资格", "营业执照", "工商信息"),
-    ("劳动合同", "书面劳动合同", "录用通知", "入职登记", "工作证", "工牌", "劳动关系"),
-    ("工资单", "工资条", "银行流水", "工资流水", "转账记录", "社会保险", "社保", "工资标准", "工资支付"),
-    ("考勤", "打卡", "排班", "加班"),
-    ("聊天记录", "微信", "短信", "邮件", "沟通记录"),
-)
-
-
-def _is_core_followup_evidence(item: str) -> bool:
-    """Only ask for generally necessary evidence during the conversation.
-
-    Conditional items still remain in the authoritative final checklist, but
-    asking about litigation-stage or injury-only documents in an ordinary wage
-    dispute creates unnecessary turns and is misleading to users.
-    """
-    if any(marker in item for marker in _OPTIONAL_EVIDENCE_MARKERS):
-        return False
-    # Identity and counterparty registration materials belong in the final
-    # filing checklist; they rarely improve the initial merits assessment.
-    return not any(marker in item for marker in ("身份证明", "主体资格"))
-
-
-def _is_relevant_followup_evidence(item: str, state: GuideState) -> bool:
-    """Drop channel-specific evidence that does not match the accumulated facts."""
-    recent_user_text = "".join(
-        str(message.content)[-500:]
-        for message in state.messages[-6:]
-        if isinstance(message, HumanMessage)
+def _followup_authority_hint(state: GuideState, *, ask_type: str, reason: str) -> str:
+    reason = _normalized_followup_reason(reason)
+    source = get_domain_followups(state.legal_domain).source
+    if source.authority_level == "system_guidance":
+        return f"追问依据：这是通用案情整理规则，用于{reason}，不是官方固定问卷。"
+    label = "事实栏目" if ask_type == "facts" else "证据和材料要素"
+    source_link = f"[{source.title}]({source.url})" if source.url else source.title
+    return (
+        f"追问依据：参考{source.issuer}发布的{source_link}中的{label}整理，"
+        f"用于{reason}；不是要求您必须提交的固定材料。"
     )
-    context = "".join(state.confirmed_issues + state.collected_facts) + recent_user_text
-    is_dine_in_food_case = (
-        state.legal_domain == "consumer_market"
-        and any(keyword in context for keyword in ("餐馆", "餐厅", "饭店", "就餐", "饭里", "菜里"))
-    )
-    if is_dine_in_food_case and any(
-        keyword in item for keyword in ("物流", "签收", "交付和验收", "验收单", "快递")
-    ):
-        return False
-    return True
 
 
-def _evidence_item_is_resolved(item: str, known_items: list[str]) -> bool:
-    """Treat common user wording as covering the matching official checklist row."""
-    if item in known_items:
-        return True
-    for known in known_items:
-        if not known:
-            continue
-        if known in item or item in known:
-            return True
-        for aliases in _EVIDENCE_ALIAS_GROUPS:
-            if any(alias in item for alias in aliases) and any(alias in known for alias in aliases):
-                return True
-    return False
+def _normalized_followup_reason(reason: str) -> str:
+    """将题库中的“用于/为了”前缀统一剥离，避免面向用户出现重复介词。"""
+    value = str(reason or "").strip().rstrip("。；")
+    for prefix in ("为了用于", "用于", "为了"):
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+            break
+    return value or "判断下一步处理方式"
 
 
-def _fact_question_is_resolved(question: str, state: GuideState) -> bool:
-    """Skip fact prompts already answered elsewhere on the state blackboard."""
-    if "距离事件发生多久" in question and state.time_info:
-        return True
-    user_context = "".join(
-        str(message.content)
-        for message in state.messages[-8:]
-        if isinstance(message, HumanMessage)
-    )
-    accumulated_context = "".join(state.collected_facts) + user_context
-    if "商家是否已经回应" in question:
-        has_merchant = any(token in accumulated_context for token in ("商家", "店家", "店里", "老板"))
-        has_response = any(
-            token in accumulated_context
-            for token in ("回应", "回复", "答应", "拒绝", "退钱", "退款", "赔偿", "承认", "不管")
+def _user_facing_case_text(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip("。；， ")
+    text = re.sub(r"^用户(?:称|表示|提到)", "您提到", text)
+    text = re.sub(r"^用户", "您", text)
+    return text.replace("用户本人", "您本人").replace("将用户", "将您")
+
+
+def _distinct_case_atoms(state: GuideState) -> list[dict]:
+    """Collapse repeated model paraphrases for display without hiding real facts."""
+    def semantic_tokens(value: str) -> set[str]:
+        text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", str(value or ""))
+        tokens = {text[index:index + 2] for index in range(max(len(text) - 1, 0))}
+        return tokens - {
+            "用户", "已经", "现在", "目前", "这个", "那个", "情况", "问题",
+            "相关", "进行", "表示", "提到", "现场", "发生", "发现",
+        }
+
+    def fact_score(item: dict) -> int:
+        structured = sum(bool(item.get(field)) for field in ("subject", "relation", "value"))
+        return len(str(item.get("statement") or "")) + 12 * structured + 8 * bool(
+            re.search(r"\d", str(item.get("statement") or ""))
         )
-        if has_merchant and has_response:
-            return True
-    evidence_like = ("合同", "工资单", "工资条", "银行流水", "打卡", "考勤")
-    if any(token in question for token in evidence_like):
-        known = state.evidence_confirmed + state.evidence_unavailable
-        return _evidence_item_is_resolved(question, known)
-    return False
+
+    result: list[dict] = []
+    for item in active_case_facts(state.case_facts):
+        if item.get("category") == "evidence" or item.get("status") != "asserted":
+            continue
+        value = re.sub(r"\W+", "", str(item.get("value") or "").lower())
+        duplicate_index = next(
+            (
+                index for index, old in enumerate(result)
+                if item.get("key") == old.get("key")
+                or (
+                    value and len(value) >= 2
+                    and item.get("category") == old.get("category")
+                    and value == re.sub(r"\W+", "", str(old.get("value") or "").lower())
+                    and (
+                        item.get("subject") == old.get("subject")
+                        or item.get("relation") == old.get("relation")
+                    )
+                )
+                or (
+                    item.get("category") == old.get("category") == "event"
+                    and (
+                        str(item.get("key") or "").startswith("legacy.raw.")
+                        or str(old.get("key") or "").startswith("legacy.raw.")
+                    )
+                    and semantic_tokens(item.get("statement", ""))
+                    & semantic_tokens(old.get("statement", ""))
+                )
+            ),
+            None,
+        )
+        if duplicate_index is None:
+            result.append(dict(item))
+            continue
+        old = result[duplicate_index]
+        if fact_score(item) > fact_score(old):
+            result[duplicate_index] = dict(item)
+    return result
 
 
-def _next_ask_type(state: GuideState) -> str:
-    """根据置信档位选择下一类追问，并在任一清单耗尽时自动回退。"""
-    if (
-        state.ask_rounds >= settings.GUIDE_MAX_ASK_ROUNDS
-        or state.ask_rounds >= settings.GUIDE_SOFT_ASK_ROUNDS
-        or state.consecutive_low_info_answers >= settings.GUIDE_MAX_LOW_INFO_ANSWERS
-    ):
-        return ""
+def _format_case_summary(state: GuideState) -> str:
+    labels = {
+        "actor": "相关主体", "relationship": "关系", "event": "经过",
+        "claim": "诉求", "amount": "金额", "time": "时间", "location": "地点",
+        "procedure": "沟通或处理", "harm": "损失或影响", "uncertainty": "待核实",
+    }
+    buckets: dict[str, list[str]] = {}
+    for item in _distinct_case_atoms(state):
+        category = str(item.get("category") or "event")
+        label = labels.get(category, "其他事实")
+        if category in {"amount", "time", "location"}:
+            value = _user_facing_case_text(item.get("value") or item.get("statement", ""))
+        else:
+            value = _user_facing_case_text(item.get("statement", ""))
+        if value and value not in buckets.setdefault(label, []):
+            buckets[label].append(value)
+    ordered_labels = [
+        "经过", "相关主体", "关系", "地点", "金额", "时间",
+        "损失或影响", "沟通或处理", "诉求", "待核实", "其他事实",
+    ]
+    parts = [
+        f"{label}：{'、'.join(buckets[label])}"
+        for label in ordered_labels if buckets.get(label)
+    ]
+    return "；".join(parts)
 
-    facts_available = (
-        state.facts_rounds < settings.GUIDE_MAX_FACT_ROUNDS
-        and bool(_remaining_fact_questions(state))
+
+def _followup_case_anchor(state: GuideState, limit: int = 72) -> str:
+    current = [
+        item for item in _distinct_case_atoms(state)
+        if int(item.get("turn") or 0) == int(state.round or 0)
+    ]
+    selected = current or _distinct_case_atoms(state)[-3:]
+    statements: list[str] = []
+    for item in selected[-3:]:
+        statement = _user_facing_case_text(item.get("statement", ""))
+        if statement and statement not in statements:
+            statements.append(statement)
+    value = "；".join(statements)
+    return value[:limit].rstrip("；，。 ")
+
+
+def _contextualize_followup_question(state: GuideState, question: str) -> str:
+    anchor = _followup_case_anchor(state)
+    if not anchor:
+        return question
+    compact_question = re.sub(r"\W+", "", question)
+    atoms = [
+        re.sub(r"\W+", "", str(item.get(field) or ""))
+        for item in _distinct_case_atoms(state)[-4:]
+        for field in ("value", "subject")
+    ]
+    if any(len(atom) >= 2 and atom in compact_question for atom in atoms):
+        return question
+    return f"结合您说的“{anchor}”，{question}"
+
+
+def _followup_opening(state: GuideState) -> str:
+    if state.supplement_choice == "continue":
+        return "好的，我们继续，只补充真正会影响方案的信息。"
+    acknowledgement = str(state.followup_plan.get("acknowledgement") or "").strip()
+    if acknowledgement:
+        return f"{acknowledgement.rstrip('。')}。"
+    latest_statements = [
+        item.get("statement", "")
+        for item in active_case_facts(state.case_facts)
+        if int(item.get("turn") or 0) == state.round and item.get("statement")
+    ][:2]
+    if latest_statements:
+        recorded = "；".join(_user_facing_case_text(item) for item in latest_statements)
+        return f"好的，{recorded}，我已经记下。"
+    latest = next(
+        (str(message.content).strip() for message in reversed(state.messages) if isinstance(message, HumanMessage)),
+        "",
     )
-    evidence_available = (
-        state.evidence_rounds < settings.GUIDE_MAX_EVIDENCE_ROUNDS
-        and bool(_remaining_evidence_questions(state))
-    )
-
-    if state.confidence_tier == "LOW" and facts_available and state.facts_rounds < 2:
-        return "facts"
-    if evidence_available:
-        return "evidence"
-    if facts_available:
-        return "facts"
-    if evidence_available:
-        return "evidence"
-    return ""
+    if latest:
+        return "好的，您刚补充的内容我已经记录。"
+    issues = "、".join(state.confirmed_issues[:2]) or f"{DOMAIN_LABELS.get(state.legal_domain, '法律')}问题"
+    return f"我会继续按“{issues}”帮您梳理。"
 
 
 def _format_followup_reply(
@@ -807,98 +1155,97 @@ def _format_followup_reply(
     ask_type: str,
     reason: str,
     answer_hint: str = "",
+    rule_id: str = "",
 ) -> str:
     """每轮只问一个关键问题，后台评估不增加用户的表单负担。"""
-    domain_label = DOMAIN_LABELS.get(state.legal_domain, "法律")
-    issues = "、".join(state.confirmed_issues[:2]) or f"{domain_label}问题"
-    question = question.strip()
+    question = _contextualize_followup_question(state, question.strip())
     if "？" not in question and "?" not in question:
         question += "？"
-    lines = [f"已定位到与“{issues}”相关的法律方向。我只再确认一个关键点：", question]
-    if ask_type == "evidence":
-        lines.append(f"这项材料主要用于{reason}。没有或不确定都可以直接说，我会给替代办法。")
+    reason = _normalized_followup_reason(reason)
+    contextual_reason = str(state.followup_plan.get("contextual_reason") or "").strip().rstrip("。；")
+    lines = [_followup_opening(state)]
+    if contextual_reason:
+        lines.append(f"{contextual_reason}。")
+    elif ask_type == "evidence":
+        anchor = _followup_case_anchor(state)
+        prefix = f"针对您说的“{anchor}”，" if anchor else ""
+        lines.append(f"{prefix}这项材料主要用于{reason}。")
     else:
-        lines.append(f"这是为了{reason}。{answer_hint or '不清楚时可以说大概情况或“不知道”。'}")
+        anchor = _followup_case_anchor(state)
+        prefix = f"结合您目前说清的“{anchor}”，" if anchor else ""
+        lines.append(f"{prefix}再确认这一点是为了{reason}。")
+    lines.append(question)
+    if ask_type == "evidence":
+        lines.append("没有或不确定都可以直接说，我会给替代办法。")
+    else:
+        lines.append(answer_hint or "不清楚时可以说大概情况或“不知道”。")
+    if state.followup_plan:
+        lines.append(format_followup_authority(state.followup_plan))
+    else:
+        lines.append(_followup_authority_hint(state, ask_type=ask_type, reason=reason))
+    lines.append("如果不方便补充，直接回复“现在生成方案”，我会按现有信息给出建议。")
     return "\n".join(lines)
 
 
 async def node_ask_facts(state: GuideState, deps: GuideDeps) -> dict:
-    """节点⑥辅助分支：追问时间、金额、合同类型等构成要件。"""
-    domain = state.legal_domain
-    pending_rules = _remaining_fact_rules(state)
-    if not pending_rules:
-        logger.info("节点⑥事实分支无细节模板，跳过 | domain={}", domain)
-        return {}
-    if state.facts_rounds >= settings.GUIDE_MAX_FACT_ROUNDS:
-        logger.info("节点⑥事实分支细节已齐 | facts_rounds={}", state.facts_rounds)
-        return {}
-    rule = pending_rules[0]
-    to_ask = [rule.question]
-    reply = _format_followup_reply(
-        state,
-        rule.question,
-        ask_type="facts",
-        reason=rule.why,
-        answer_hint=rule.answer_hint,
-    )
-    logger.info("节点⑥事实分支追问 | domain={} facts_rounds={} questions={}",
-                domain, state.facts_rounds, to_ask)
-
-    return {
-        "phase": GuidePhase.DETAIL_GATHER,
-        "ask_rounds": state.ask_rounds + 1,
-        "facts_rounds": state.facts_rounds + 1,
-        "asked_details": state.asked_details + to_ask,
-        "pending_ask_details": to_ask,
-        "pending_ask_type": "facts",
-        "asked_followup_ids": state.asked_followup_ids + [rule.id],
-        "pending_followup_ids": [rule.id],
-        "messages": [AIMessage(content=reply)],
-    }
+    """Compatibility wrapper around the single dynamic follow-up planner."""
+    return await _ask_from_dynamic_plan(state, deps, preferred_type="facts")
 
 
 async def node_ask_evidence(state: GuideState, deps: GuideDeps) -> dict:
-    """节点⑥辅助分支：追问聊天记录、合同、转账凭证等证据材料。"""
-    domain = state.legal_domain
-    pending_rules = _remaining_evidence_rules(state)
-    if not pending_rules:
-        logger.info("节点⑥证据分支已齐 | evidence_rounds={}", state.evidence_rounds)
-        return {}
-    if state.evidence_rounds >= settings.GUIDE_MAX_EVIDENCE_ROUNDS:
-        return {}
-    rule = pending_rules[0]
-    to_ask = [rule.question]
-    reply = _format_followup_reply(
-        state,
-        rule.question,
-        ask_type="evidence",
-        reason=rule.purpose,
-    )
-    logger.info("节点⑥证据分支追问 | domain={} evidence_rounds={} questions={}",
-                domain, state.evidence_rounds, to_ask)
+    """Compatibility wrapper around the single dynamic follow-up planner."""
+    return await _ask_from_dynamic_plan(state, deps, preferred_type="evidence")
 
+
+async def _ask_from_dynamic_plan(
+    state: GuideState,
+    deps: GuideDeps,
+    *,
+    preferred_type: str = "",
+) -> dict:
+    plan = state.followup_plan or await plan_next_followup(state, deps.llm)
+    if not plan.get("should_ask"):
+        return {}
+    ask_type = str(plan.get("ask_type") or preferred_type or "facts")
+    question = str(plan.get("question") or "").strip()
+    if not question:
+        return {}
+    planned_state = state.model_copy(update={"followup_plan": plan})
+    reply = _format_followup_reply(
+        planned_state,
+        question,
+        ask_type=ask_type,
+        reason=str(plan.get("reason") or "判断下一步处理方式"),
+        answer_hint=str(plan.get("answer_hint") or ""),
+        rule_id=str(plan.get("candidate_id") or ""),
+    )
+    candidate_id = str(plan.get("candidate_id") or "").strip()
+    decision_key = str(plan.get("decision_key") or candidate_id).strip()
+    pending_ids = [candidate_id] if candidate_id else []
+    logger.info(
+        "节点⑥动态追问 | type={} decision={} candidate={} gain={} burden={} mode={}",
+        ask_type, decision_key, candidate_id, plan.get("information_gain"),
+        plan.get("user_burden"), plan.get("planner_mode"),
+    )
     return {
         "phase": GuidePhase.DETAIL_GATHER,
         "ask_rounds": state.ask_rounds + 1,
-        "evidence_rounds": state.evidence_rounds + 1,
-        "asked_details": state.asked_details + to_ask,
-        "pending_ask_details": to_ask,
-        "pending_ask_type": "evidence",
-        "asked_followup_ids": state.asked_followup_ids + [rule.id],
-        "pending_followup_ids": [rule.id],
+        "facts_rounds": state.facts_rounds + (1 if ask_type == "facts" else 0),
+        "evidence_rounds": state.evidence_rounds + (1 if ask_type == "evidence" else 0),
+        "asked_details": _merge_unique(state.asked_details, [question]),
+        "pending_ask_details": [question],
+        "pending_ask_type": ask_type,
+        "asked_followup_ids": _merge_unique(state.asked_followup_ids, pending_ids),
+        "pending_followup_ids": pending_ids,
+        "asked_decision_keys": _merge_unique(state.asked_decision_keys, [decision_key]),
+        "followup_plan": plan,
         "messages": [AIMessage(content=reply)],
     }
 
 
 async def node_ask_followup(state: GuideState, deps: GuideDeps) -> dict:
-    """节点⑥：LOW 优先补事实，MEDIUM/HIGH 优先补证据。"""
-    ask_type = _next_ask_type(state)
-    if ask_type == "facts":
-        return await node_ask_facts(state, deps)
-    if ask_type == "evidence":
-        return await node_ask_evidence(state, deps)
-    logger.info("统一追问节点无可追问项 | tier={}", state.confidence_tier)
-    return {}
+    """节点⑥：展示节点⑤按信息增益动态选出的唯一追问。"""
+    return await _ask_from_dynamic_plan(state, deps)
 
 
 async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
@@ -910,9 +1257,20 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
     last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
     if not last_msg or not state.pending_ask_details:
         return {}
+    if state.wants_conclude and not _supplement_contains_case_details(last_msg):
+        # A pure flow-control command changes routing only. It is not a fact,
+        # evidence item or document statement, and does not need an LLM parse.
+        return {
+            "pending_ask_details": [],
+            "pending_ask_type": "",
+            "pending_followup_ids": [],
+            "followup_plan": {},
+            "phase": GuidePhase.ISSUE_SEARCH,
+        }
     prompt = PARSE_DETAILS_PROMPT.format(
         asked_details="\n".join(f"- {q}" for q in state.pending_ask_details),
         user_answer=last_msg,
+        case_context=format_case_context(state.case_facts),
     )
     response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
     try:
@@ -927,6 +1285,58 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
 
     user_question = (parsed.get("user_question") or "").strip()
     is_answer = parsed.get("is_answer", True)
+    answers_asked_question = parsed.get("answers_asked_question", is_answer)
+    parser_missed_declarative_detail = not is_answer and not _looks_like_user_question(last_msg)
+    if parser_missed_declarative_detail:
+        logger.info("节点⑦将非疑问陈述按主动补充处理 | text={}", last_msg[:120])
+        is_answer = True
+        answers_asked_question = False
+        user_question = ""
+        if not parsed.get("collected_facts"):
+            parsed["collected_facts"] = [last_msg]
+    if state.wants_conclude and any(
+        phrase in last_msg
+        for phrase in ("现在生成方案", "生成方案", "给方案", "按现有信息", "不要再问", "别再问")
+    ):
+        # 这是流程控制指令，不是需要在结论中回答的法律问题。
+        user_question = ""
+
+    if _looks_like_question_repetition(last_msg, state.pending_ask_details):
+        fact_records = dict(state.fact_records)
+        for rule_id in state.pending_followup_ids:
+            if state.pending_ask_type != "facts":
+                continue
+            rule = find_fact_followup(state.legal_domain, rule_id)
+            if rule:
+                record = assess_fact_answer(rule, last_msg, fact_records.get(rule_id))
+                record["status"] = "ambiguous"
+                fact_records[rule_id] = record
+        low_info_count = state.consecutive_low_info_answers + 1
+        stalled = low_info_count >= settings.GUIDE_MAX_LOW_INFO_ANSWERS
+        if stalled:
+            return {
+                "fact_records": fact_records,
+                "consecutive_low_info_answers": low_info_count,
+                "pending_ask_details": [],
+                "pending_ask_type": "",
+                "pending_followup_ids": [],
+                "force_conclude": True,
+                "phase": GuidePhase.ISSUE_SEARCH,
+            }
+        question = state.pending_ask_details[0]
+        clarification = (
+            "我看到这句话更像是把问题重复了一遍，还不能确定您的答案。\n"
+            f"请直接回答这个问题：{question}\n"
+            "可以用一句很短的话回答，例如“有”“没有”“大概是……”或“不清楚”。"
+        )
+        return {
+            "fact_records": fact_records,
+            "consecutive_low_info_answers": low_info_count,
+            "pending_ask_details": state.pending_ask_details,
+            "pending_ask_type": state.pending_ask_type,
+            "pending_followup_ids": state.pending_followup_ids,
+            "messages": [AIMessage(content=clarification)],
+        }
 
     # 用户只是反问，没有回答 → 保留待答问题，不污染证据
     if not is_answer:
@@ -963,14 +1373,14 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         return [item for item in old + new if item and not (item in seen or seen.add(item))]
 
     is_multimodal_evidence = last_msg.startswith("【图片证据补充（视觉模型识别")
-    parsed_new_issues = parsed.get("new_issues") or []
-    if is_multimodal_evidence:
-        parsed_new_issues = [
-            item for item in parsed_new_issues
-            if not any(marker in item for marker in ("可能", "疑似", "或许", "推测"))
-        ]
-    new_issues = _merge(state.confirmed_issues, parsed_new_issues)
-    parsed_facts = parsed.get("collected_facts") or []
+    # This node parses answers into facts and evidence only. Promoting a legal
+    # classification here allowed an unverified model inference to change the
+    # whole case track, so issue normalization remains the sole owner.
+    new_issues = list(state.confirmed_issues)
+    parsed_facts = [
+        item for item in (parsed.get("collected_facts") or [])
+        if _is_usable_case_fact(item)
+    ]
     if is_multimodal_evidence:
         possession_verbs = ("持有", "保留", "手中有", "另有", "带走", "拍摄")
         evidence_nouns = ("实物", "照片", "录音", "原件", "合同", "票据", "凭证")
@@ -983,7 +1393,45 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             )
             for item in parsed_facts
         ]
-    new_facts = _merge(state.collected_facts, parsed_facts)
+    current_turn_keys = {
+        str(item.get("key") or "")
+        for item in latest_case_facts(state.case_facts, state.round)
+        if item.get("key")
+    }
+    parsed_case_updates = parsed.get("case_updates") or []
+    if parsed_case_updates:
+        raw_case_updates = [
+            item for item in parsed_case_updates
+            if str(item.get("key") or "") not in current_turn_keys
+        ]
+    elif current_turn_keys:
+        raw_case_updates = []
+    else:
+        raw_case_updates = legacy_fact_updates(parsed_facts, user_text=last_msg)
+    case_facts = reduce_case_facts(
+        state.case_facts,
+        raw_case_updates,
+        user_text=last_msg,
+        turn=state.round,
+    )
+    if parser_missed_declarative_detail and not latest_case_facts(case_facts, state.round):
+        case_facts = reduce_case_facts(
+            state.case_facts,
+            legacy_fact_updates(parsed_facts, user_text=last_msg),
+            user_text=last_msg,
+            turn=state.round,
+        )
+    active_atoms = active_case_facts(case_facts)
+    atomic_statements = [
+        item["statement"] for item in active_atoms
+        if item.get("category") != "evidence" and item.get("statement")
+    ]
+    new_facts = (
+        atomic_statements
+        if case_facts
+        else _merge(state.collected_facts, parsed_facts)
+    )
+    atom_evidence, atom_unavailable = evidence_from_case_facts(case_facts)
     parsed_evidence = parsed.get("evidence") or []
     if is_multimodal_evidence:
         type_match = re.search(r"【证据类型】\s*([^\n]+)", last_msg)
@@ -1005,9 +1453,19 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         ]
     if len(present_evidence) != len(parsed_evidence):
         logger.info("节点⑦未核验证据线索不计入置信度 | evidence={}", parsed_evidence)
+    present_evidence = _merge(present_evidence, atom_evidence)
     new_evidence = _merge(state.evidence_confirmed, present_evidence)
     new_unverified = _merge(state.evidence_unverified, unverified_evidence)
-    unavailable = _merge(state.evidence_unavailable, parsed.get("evidence_unavailable") or [])
+    evidence_denial_markers = (
+        "没有", "没拍", "没留", "没保存", "未拍", "未留", "未保存",
+        "找不到", "拿不出", "丢了", "遗失", "无法提供",
+    )
+    explicit_evidence_denial = any(marker in last_msg for marker in evidence_denial_markers)
+    parsed_unavailable = (parsed.get("evidence_unavailable") or []) if explicit_evidence_denial else []
+    unavailable = _merge(
+        state.evidence_unavailable,
+        _merge(parsed_unavailable, atom_unavailable),
+    )
     new_adverse = _merge(state.adverse_facts, parsed.get("adverse_facts") or [])
 
     fact_records = dict(state.fact_records)
@@ -1016,20 +1474,21 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         state.evidence_assessments,
     )
     low_info_answer = False
-    negative_markers = ("没有", "没留", "没保存", "找不到", "拿不出", "不清楚", "不知道", "不记得")
-    answer_is_negative = any(marker in last_msg for marker in negative_markers)
-    for rule_id in state.pending_followup_ids:
+    pending_fact_statuses: list[str] = []
+    answer_is_negative = explicit_evidence_denial
+    for rule_id in (state.pending_followup_ids if answers_asked_question else []):
         if state.pending_ask_type == "facts":
             rule = find_fact_followup(state.legal_domain, rule_id)
             if rule:
                 record = assess_fact_answer(rule, last_msg, fact_records.get(rule_id))
                 fact_records[rule_id] = record
-                low_info_answer = low_info_answer or record["status"] == "unknown"
+                pending_fact_statuses.append(record["status"])
+                low_info_answer = low_info_answer or record["status"] in {"unknown", "ambiguous"}
         elif state.pending_ask_type == "evidence":
             rule = find_evidence_followup(state.legal_domain, rule_id)
             if not rule:
                 continue
-            unavailable_items = parsed.get("evidence_unavailable") or []
+            unavailable_items = parsed_unavailable
             explicitly_unavailable = answer_is_negative or any(
                 item in rule.item or rule.item in item or any(keyword in item for keyword in rule.match_keywords)
                 for item in unavailable_items
@@ -1051,7 +1510,11 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             if record["availability"] == "unavailable":
                 unavailable = _merge(unavailable, [rule.item])
             elif record["availability"] in {"uploaded_copy", "user_claimed_present", "conflicted"}:
-                new_evidence = _merge(new_evidence, [rule.item])
+                # Prefer the user's concrete material name (for example
+                # "付款记录") over the catalog umbrella label. Add the
+                # umbrella only when the parser found no specific material.
+                if not present_evidence:
+                    new_evidence = _merge(new_evidence, [rule.item])
             low_info_answer = low_info_answer or record["availability"] in {"unavailable", "unclear"}
 
     if not state.pending_followup_ids:
@@ -1059,21 +1522,61 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             low_info_answer = any(marker in last_msg for marker in ("不知道", "不清楚", "不记得", "记不清"))
         elif state.pending_ask_type == "evidence":
             low_info_answer = answer_is_negative
+    draft_candidates = [
+        item["statement"] for item in active_atoms
+        if item.get("category") != "evidence"
+        and item.get("status") == "asserted"
+        and item.get("statement")
+    ]
+    if not draft_candidates:
+        draft_candidates = [item for item in parsed_facts if _is_draftable_fact(item)]
+    if any(status in {"ambiguous", "conflicted", "unknown"} for status in pending_fact_statuses):
+        draft_candidates = []
+    new_draftable_facts = (
+        draft_candidates
+        if case_facts
+        else _merge(state.draftable_facts, draft_candidates)
+    )
     consecutive_low_info = state.consecutive_low_info_answers + 1 if low_info_answer else 0
     force_low_info_conclusion = consecutive_low_info >= settings.GUIDE_MAX_LOW_INFO_ANSWERS
     region = (
-        normalize_region_name(parsed.get("region", ""))
-        or normalize_region_name(state.region)
-        or extract_supported_region(last_msg)
+        _state_region_name(parsed.get("region", ""))
+        or _state_region_name(state.region)
     )
     time_info = (parsed.get("time_info") or "").strip() or state.time_info
     logger.info("节点⑦解析结果 | type={} new_issues={} facts={} evidence={} unavailable={} adverse={} region={} time={} deferred={}",
                 state.pending_ask_type,
                 parsed.get("new_issues"), parsed.get("collected_facts"), parsed.get("evidence"),
                 parsed.get("evidence_unavailable"), parsed.get("adverse_facts"), region, time_info, user_question)
-    return {
+    case_conflicts = [
+        item for item in active_atoms
+        if item.get("status") == "conflicted" and int(item.get("turn") or 0) == state.round
+    ]
+    needs_fact_confirmation = bool(case_conflicts) or any(
+        status in {"ambiguous", "conflicted"}
+        for status in pending_fact_statuses
+    )
+    confirmation_messages: list[AIMessage] = []
+    if needs_fact_confirmation:
+        question = state.pending_ask_details[0]
+        if case_conflicts:
+            conflict_key = case_conflicts[0].get("key", "这项信息")
+            alternatives = [
+                item.get("statement", "") for item in active_atoms
+                if item.get("key") == conflict_key and item.get("statement")
+            ]
+            question = f"关于{' / '.join(dict.fromkeys(alternatives))}，请确认哪一个说法为准？"
+        status_text = "与前面记录不一致" if case_conflicts or "conflicted" in pending_fact_statuses else "仍有两种可能的理解"
+        confirmation_messages = [AIMessage(content=(
+            f"我暂时没有把这项内容写成确定事实，因为您的回答{status_text}。\n"
+            f"请再明确一次：{question}\n"
+            "如果是在更正之前的说法，可以直接以“更正：……”开头；不清楚也可以直接说“不清楚”。"
+        ))]
+    updates = {
         "confirmed_issues": new_issues,
         "collected_facts": new_facts,
+        "draftable_facts": new_draftable_facts,
+        "case_facts": case_facts,
         "evidence_confirmed": new_evidence,
         "evidence_unverified": new_unverified,
         "evidence_unavailable": unavailable,
@@ -1082,15 +1585,35 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         "adverse_facts": new_adverse,
         "region": region,
         "time_info": time_info,
-        "pending_ask_details": [],
-        "pending_ask_type": "",
-        "pending_followup_ids": [],
+        "pending_ask_details": [question] if needs_fact_confirmation else [],
+        "pending_ask_type": state.pending_ask_type if needs_fact_confirmation else "",
+        "pending_followup_ids": state.pending_followup_ids if needs_fact_confirmation else [],
         "consecutive_counter_questions": 0,
         "consecutive_low_info_answers": consecutive_low_info,
         "force_conclude": state.force_conclude or force_low_info_conclusion,
-        "phase": GuidePhase.ISSUE_SEARCH,
+        "phase": GuidePhase.DETAIL_GATHER if needs_fact_confirmation else GuidePhase.ISSUE_SEARCH,
+        "followup_plan": {},
         "deferred_questions": state.deferred_questions + ([user_question] if user_question else []),
+        "messages": confirmation_messages,
     }
+    meaningful_optional_supplement = (
+        state.allow_extra_followups
+        and is_answer
+        and not low_info_answer
+        and not needs_fact_confirmation
+        and not state.force_conclude
+        and not state.wants_conclude
+    )
+    if meaningful_optional_supplement:
+        # 用户主动补充一项后，把节奏重新交还给用户：继续补充或按现有信息出方案。
+        updates.update({
+            "awaiting_supplement_choice": False,
+            "supplement_choice_offered": False,
+            "supplement_choice": "",
+            "supplement_has_details": False,
+            "allow_extra_followups": False,
+        })
+    return updates
 
 
 _ARTICLE_PATTERN = r"第[零〇一二三四五六七八九十百千万两\d]+条(?:之[零〇一二三四五六七八九十百千万两\d]+)?"
@@ -1142,6 +1665,7 @@ def _sanitize_statute_citations(reply: str, law_context: str) -> str:
 
     safe_lines: list[str] = []
     replacement = "> 注：本段涉及的具体条文未在本轮检索结果中出现，已省略；请拨打 12348 核对后再主张。"
+    replacement_added = False
     removed_numbered_items = 0
     for line in reply.splitlines():
         if re.match(r"^\s*\*\*【.+】\*\*\s*$", line):
@@ -1185,8 +1709,9 @@ def _sanitize_statute_citations(reply: str, law_context: str) -> str:
             logger.warning("结论引用白名单过滤 | line={}", line[:160])
             if ordinal:
                 removed_numbered_items += 1
-            if not safe_lines or safe_lines[-1] != replacement:
+            if not replacement_added:
                 safe_lines.append(replacement)
+                replacement_added = True
             continue
         if ordinal and removed_numbered_items:
             number = max(1, int(ordinal.group(2)) - removed_numbered_items)
@@ -1200,164 +1725,154 @@ def _sanitize_statute_citations(reply: str, law_context: str) -> str:
     return "\n".join(safe_lines)
 
 
+def _grounded_statute_entries(law_context: str, limit: int = 8) -> list[tuple[str, str, str]]:
+    """Extract exact statute title, article and source text from formatted retrieval context."""
+    pattern = re.compile(
+        rf"法条\d+【(?P<title>.+?)\s+(?P<article>{_ARTICLE_PATTERN})】\s*\n"
+        r"(?P<text>.*?)(?=\n\n---\n\n|\Z)",
+        re.S,
+    )
+    entries: list[tuple[str, str, str]] = []
+    for match in pattern.finditer(law_context or ""):
+        text = re.sub(r"\s+", " ", match.group("text")).strip()
+        text = re.sub(rf"^{re.escape(match.group('article'))}\s*", "", text)
+        if text:
+            entries.append((match.group("title").strip(), match.group("article"), text))
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _select_grounded_statute_entries(
+    entries: list[tuple[str, str, str]],
+    state: GuideState | None,
+    limit: int = 2,
+) -> list[tuple[str, str, str]]:
+    # Retrieval already performs domain/full-corpus fusion and semantic reranking.
+    # Preserve that order instead of adding scenario-specific article priorities.
+    return entries[:limit]
+
+
+def _ensure_grounded_legal_basis(
+    reply: str,
+    law_context: str,
+    state: GuideState | None = None,
+) -> str:
+    """Render the legal-basis section directly from this turn's retrieved source text."""
+    entries = _select_grounded_statute_entries(
+        _grounded_statute_entries(law_context),
+        state,
+    )
+    if not entries:
+        return reply
+    heading = re.search(r"(?m)^\s*(?:#{1,6}\s*)?\*{0,2}【法律依据】\*{0,2}\s*$", reply)
+    block = (
+        "> 以下条文直接来自本轮知识库检索原文。\n"
+        + "\n".join(f"- 《{name}》{article}：{text}" for name, article, text in entries)
+    )
+    if not heading:
+        section = f"**【法律依据】**\n{block}\n\n"
+        next_heading = re.search(r"(?m)^\s*(?:#{1,6}\s*)?\*{0,2}【(?:维权路径|类似案例)", reply)
+        if next_heading:
+            return reply[:next_heading.start()].rstrip() + "\n\n" + section + reply[next_heading.start():]
+        return section + reply
+
+    next_heading = re.search(
+        r"(?m)^\s*(?:#{1,6}\s*)?\*{0,2}【[^】]+】\*{0,2}\s*$",
+        reply[heading.end():],
+    )
+    section_end = heading.end() + next_heading.start() if next_heading else len(reply)
+    return reply[:heading.end()] + "\n" + block + "\n\n" + reply[section_end:].lstrip()
+
+
 def _sanitize_forced_followups(reply: str) -> str:
-    """强制收敛后移除要求用户继续补充并等待下一版方案的尾段。"""
+    """结论阶段移除要求用户继续补充并等待下一版方案的尾段。"""
     phrases = (
         "请补充以下关键信息", "请继续补充", "补充上述信息后", "补充后我将",
         "我将为您生成更精准", "请回答以下问题", "还需要您补充",
         "请务必先回答", "先回答上面",
     )
-    positions = [reply.find(phrase) for phrase in phrases if phrase in reply]
-    if not positions:
-        return reply
-
-    position = min(positions)
-    line_start = reply.rfind("\n", 0, position) + 1
-    line_end = reply.find("\n", position)
-    if line_end < 0:
-        line_end = len(reply)
-    current_line = reply[line_start:line_end]
-    line_only = bool(re.match(r"\s*\d+[.、)]", current_line)) and "以下" not in current_line
-    if line_only:
-        note = (
-            "> 当前仍有事实和证据缺口，因此胜算只能作初步判断。"
-            "您无需继续回答也可先按行动清单执行，并拨打 12348 核验。"
+    lines = reply.splitlines()
+    kept: list[str] = []
+    removed = False
+    skip_supplement_section = False
+    for line in lines:
+        heading_text = re.sub(r"[#*【】\s]", "", line)
+        is_supplement_heading = any(
+            marker in heading_text for marker in ("关键缺失信息清单", "强烈建议")
         )
-        return reply[:line_start] + note + reply[line_end:]
+        if is_supplement_heading:
+            skip_supplement_section = True
+            removed = True
+            continue
+        if skip_supplement_section:
+            is_next_section = (
+                line.strip() == "---"
+                or bool(re.match(r"\s*#{1,6}\s+", line))
+                or "【" in line and "】" in line
+            )
+            if not is_next_section:
+                continue
+            skip_supplement_section = False
+        if any(phrase in line for phrase in phrases):
+            removed = True
+            continue
+        kept.append(line)
 
-    section_starts = [
-        reply.rfind(marker, 0, position)
-        for marker in ("\n**", "\n##", "\n【")
-    ]
-    start = max(section_starts)
-    if start < 0:
-        start = position
-    end = reply.find("\n---", position)
-    if end < 0:
-        end = len(reply)
+    cleaned = "\n".join(kept).strip()
+    if not removed:
+        return cleaned
     note = (
-        "\n\n> 当前仍有事实和证据缺口，因此胜算只能作初步判断。"
-        "您无需继续回答也可先按上述行动清单保存证据、咨询 12348，并在时效内启动适当程序。"
+        "> 当前仍有事实和证据缺口，因此胜算只能作初步判断。"
+        "您无需继续回答也可先按行动清单执行，并拨打 12348 核验。"
     )
-    return reply[:start].rstrip() + note + reply[end:]
+    marker = "\n\n---\n📄"
+    position = cleaned.find(marker)
+    if position >= 0:
+        return cleaned[:position].rstrip() + "\n\n" + note + cleaned[position:]
+    return cleaned.rstrip() + "\n\n" + note
 
 
-def _sanitize_evidence_overconfidence(reply: str) -> str:
-    """Remove deterministic overclaims that remain unsafe at any confidence tier."""
-    replacements = (
-        ("铁证如山", "证明力仍需结合原始载体核验"),
-        ("直接铁证", "较有力但仍需核验的证据"),
-        ("铁证", "较有力但仍需核验的证据"),
-        ("证据链完整", "现有材料可以相互印证，但仍有核验缺口"),
-        ("证据链相对完整", "现有材料覆盖面较广，但仍需核验原件和内容"),
-        ("已经足够证明", "可用于初步证明"),
-        ("完全可以证明", "可用于初步证明，但仍需结合原始载体核验"),
-        ("胜诉希望很大", "具备一定主张基础，结果仍取决于证据核验和受理机关判断"),
-        ("可能性非常大", "具备一定主张基础，最终结果仍取决于证据和审理判断"),
-        ("几乎等于承认", "可作为对相关事实的承认线索"),
-        ("这几乎不可能", "这仍需双方结合证据说明"),
-        ("法院通常对消费者较为宽容", "是否获得支持仍以具体证据和审理结果为准"),
-        ("法定最高赔偿（1000元）", "符合适用条件时可主张的惩罚性赔偿"),
-        ("您已经完成了主要的举证责任", "您现有材料可用于初步举证，但原件和内容仍需核验"),
-        (
-            "举证责任主要在公司，公司需要证明它“没有拖欠”或“有正当理由拖欠”",
-            "公司也应就工资支付情况提供由其掌握的记录，但您仍需先证明劳动关系、工资标准和欠薪事实",
-        ),
-    )
-    for old, new in replacements:
-        reply = reply.replace(old, new)
-    return reply
-
-
-def _sanitize_user_facing_tone(reply: str) -> str:
-    """Replace unnecessarily harsh wording without weakening the legal risk message."""
-    replacements = (
-        ("这是非常致命的", "这会明显增加举证难度"),
-        ("非常致命", "会明显增加举证难度"),
-        ("证明力严重不足", "现阶段证明力有限，仍需结合内容补强"),
-        ("完全错误", "并不准确"),
-        ("够不够硬", "能否形成初步证明"),
-    )
-    for old, new in replacements:
-        reply = reply.replace(old, new)
-    return reply
-
-
-def _sanitize_labor_procedure_claims(reply: str, state: GuideState) -> str:
-    """Keep common labor remedies conditional when the model overstates them."""
-    context = "".join(state.confirmed_issues + state.collected_facts)
-    if state.legal_domain != "labor_social_security" and not any(
-        word in context for word in ("劳动", "工资", "欠薪")
-    ):
+def _ensure_contextual_understanding(reply: str, state: GuideState) -> str:
+    """Render the opening from grounded case atoms for every legal domain."""
+    atoms = active_case_facts(state.case_facts)
+    if not atoms:
         return reply
+    def _user_facing(value: str) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"^用户(?:称|表示|提到)", "您提到", text)
+        text = re.sub(r"^用户卡内", "您的卡内", text)
+        text = re.sub(r"^用户", "您", text)
+        return text.replace("用户本人", "您本人").replace("将用户", "将您")
 
-    safe_compensation = (
-        "可依法提出有证据支持的劳动争议请求；加付赔偿须先满足劳动行政部门责令限期支付后"
-        "仍逾期不支付等法定条件，不能作为劳动仲裁当然支持的请求"
-    )
-    percentage_pattern = (
-        r"(?:50\s*%\s*(?:[-—至~]|到)\s*100\s*%|"
-        r"百分之五十以上百分之一百以下|欠薪数额的一半到一倍)"
-    )
-    lines: list[str] = []
-    section = ""
-    for line in reply.splitlines():
-        if header := re.search(r"【([^】]+)】", line):
-            section = header.group(1)
-        is_law_section = section == "法律依据"
-        if not is_law_section and "加付" in line and "赔偿" in line and (
-            "仲裁" in line or "主张" in line or re.search(percentage_pattern, line)
-        ):
-            line = re.sub(
-                rf"(?:可以|可)(?:一并)?(?:主张)?[^。；|\n]{{0,100}}?加付赔偿金?\s*[（(]?{percentage_pattern}[）)]?(?:、[^。；|\n]{{0,40}})?",
-                safe_compensation,
-                line,
-            )
-            line = re.sub(
-                rf"(?:如果)?[^。；|\n]{{0,50}}?仲裁[^。；|\n]{{0,80}}?{percentage_pattern}[^。；|\n]*?加付赔偿金?",
-                safe_compensation,
-                line,
-            )
-            line = re.sub(
-                rf"(?:请求|主张)[^。；|\n]{{0,40}}?{percentage_pattern}[^。；|\n]*?赔偿金?",
-                "就加付赔偿问题先向劳动监察部门核实是否已具备法定前提",
-                line,
-            )
-            if "不能作为劳动仲裁当然支持" not in line and "法定前提" not in line:
-                line = re.sub(
-                    rf"[^。；|\n]{{0,100}}?加付赔偿金?[^。；|\n]*",
-                    safe_compensation,
-                    line,
-                    count=1,
-                )
-        if not is_law_section:
-            line = line.replace(
-                "除了要回工资，还有可能要到刚才说的那笔额外赔偿金",
-                "可依法请求支付工资；其他请求要结合事实和受理规则核验",
-            )
-        lines.append(line)
-    reply = "\n".join(lines)
+    asserted = [
+        _user_facing(item.get("statement", "")) for item in atoms
+        if item.get("category") != "evidence"
+        and item.get("status") == "asserted"
+        and item.get("statement")
+    ][-6:]
+    uncertain = [
+        _user_facing(item.get("statement", "")) for item in atoms
+        if item.get("category") != "evidence"
+        and item.get("status") in {"uncertain", "conflicted"}
+        and item.get("statement")
+    ][-2:]
+    if not asserted and not uncertain:
+        return reply
+    summary_parts = []
+    if asserted:
+        summary_parts.append("我已按您的陈述记录：" + "；".join(dict.fromkeys(asserted)) + "。")
+    if uncertain:
+        summary_parts.append("仍需核对：" + "；".join(dict.fromkeys(uncertain)) + "。")
+    summary = "".join(summary_parts)
 
-    reply = re.sub(
-        r"（注：这项权益[^）]{0,160}?从您知道权利被侵害之日起算。?）",
-        "（注：是否可主张及仲裁时效起算，需结合用工状态、未签合同期间和当地裁判规则核验，不能仅按‘知道权利被侵害之日’概括。）",
-        reply,
+    section_pattern = re.compile(
+        r"(?ms)^(?P<header>\s*(?:#{1,6}\s*)?\*{0,2}【理解您的情况】\*{0,2}\s*)$"
+        r"\n.*?(?=^\s*(?:#{1,6}\s*)?\*{0,2}【法律依据】\*{0,2}\s*$)"
     )
-    reply = re.sub(
-        r"（[^（）\n]{0,40}?可主张\s*\d+\s*个月的双倍工资[^）\n]*）",
-        "（是否可主张及可支持期间，需结合实际用工起止时间、书面合同签订情况和仲裁时效核验。）",
-        reply,
-    )
-    if any(word in context for word in ("拖欠劳动报酬", "拖欠工资", "欠薪")):
-        reply = re.sub(
-            r"劳动仲裁的时效是\*{0,2}一年\*{0,2}[，,]?从您知道或应当知道权利被侵害之日起(?:计算)?",
-            (
-                "劳动争议通常适用一年仲裁时效；但劳动关系存续期间因拖欠劳动报酬发生争议，"
-                "不受该一般期间限制，劳动关系终止的应自终止之日起一年内提出"
-            ),
-            reply,
-        )
-    return reply
+    if not section_pattern.search(reply):
+        return reply
+    return section_pattern.sub(lambda match: f"{match.group('header')}\n{summary}\n\n", reply)
 
 
 def _uses_accessible_language(state: GuideState) -> bool:
@@ -1390,29 +1905,30 @@ def _audience_guidance(state: GuideState) -> str:
         "启用易读模式：用户明确表示年纪大、记不清或说不清。使用简单短句，不用表格，"
         "不责备用户，不连续堆砌术语。全文以1800字为上限；法律依据最多选2条，路径最多2种，"
         "行动清单只保留最重要的3步，并优先给出可以电话办理或由家人协助的方式。"
-        "避免使用‘致命’‘严重不足’‘完全错误’‘够不够硬’等刺激性说法。"
+        "避免使用刺激性、责备性或夸大说法。"
     )
 
 
-def _compact_final_reply(reply: str, accessible: bool) -> str:
+def _compact_final_reply(
+    reply: str,
+    accessible: bool,
+    *,
+    compact: bool = False,
+) -> str:
     """Remove optional repetition while preserving every required result section."""
-    limit = 2200 if accessible else 3000
+    limit = 2200 if accessible else (2600 if compact else 3000)
     if len(reply) <= limit and not accessible:
         return reply
-
-    # The confidence badge already communicates the caveat, so a generated preamble is redundant.
     understanding = re.search(r"\*{0,2}【理解您的情况】\*{0,2}", reply)
     if understanding:
         badge = re.match(r"\s*(\*\*📊[^\n]+\*\*)", reply)
         prefix = f"{badge.group(1)}\n\n" if badge else ""
         reply = prefix + reply[understanding.start():]
-
     optional_section = re.compile(
         r"\n*\*{0,2}(?:（可选）\s*)?【(?:常见误区|关键缺失信息清单)】\*{0,2}.*?(?=\n---|\n\*{0,2}【|\Z)",
         re.S,
     )
     reply = optional_section.sub("", reply)
-
     if accessible:
         reply = re.sub(
             r"\n\s*[*+-]\s+\*\*(?:一句话解释|直接支持|行动依据)\*\*：[^\n]*",
@@ -1425,7 +1941,6 @@ def _compact_final_reply(reply: str, accessible: bool) -> str:
             reply,
             flags=re.S,
         )
-
     if accessible and len(reply) > limit:
         reply = re.sub(
             r"\n*\*{0,2}最后，最重要的建议：?\*{0,2}.*?(?=\n---|\Z)",
@@ -1433,12 +1948,193 @@ def _compact_final_reply(reply: str, accessible: bool) -> str:
             reply,
             flags=re.S,
         )
-    return re.sub(r"\n{3,}", "\n\n", reply).strip()
+    reply = re.sub(
+        r"\n*\*{0,2}【(?:维权情况分析|有利因素与风险|因素分析)】\*{0,2}.*?"
+        r"(?=\n(?:#{1,6}\s*)?\*{0,2}【|\n---|\Z)",
+        "",
+        reply,
+        flags=re.S,
+    )
+    reply = re.sub(r"\s*\[[a-z_]+(?:\.[a-z_]+)+\]", "", reply)
+    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+    if len(reply) <= limit:
+        return reply
+
+    suffix = ""
+    for marker in ("\n\n---\n📄", "\n---\n📄", "\n📄 **需要参考文书"):
+        if (position := reply.find(marker)) >= 0:
+            suffix = reply[position:].strip()
+            reply = reply[:position].rstrip()
+            break
+    core_limit = max(600, limit - len(suffix) - (2 if suffix else 0))
+
+    # The prompt's word limit is advisory. Enforce a deterministic display
+    # budget at section boundaries while preserving the response contract.
+    section_pattern = re.compile(
+        r"(?m)^\s*(?:#{1,6}\s*)?\*{0,2}【(?P<title>[^】]+)】\*{0,2}\s*$"
+    )
+    matches = list(section_pattern.finditer(reply))
+    if not matches:
+        core = reply[: core_limit - 1].rstrip() + "…"
+        return core + (f"\n\n{suffix}" if suffix else "")
+
+    prefix = reply[: matches[0].start()].strip()
+    sections: list[tuple[str, str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(reply)
+        header = reply[match.start():match.end()].strip()
+        body = reply[match.end():end].strip()
+        sections.append((match.group("title"), header, body))
+
+    budgets = {
+        "理解您的情况": 240 if not accessible else 180,
+        "法律依据": 750 if not accessible else 600,
+        "类似案例参考": 280 if not accessible else 200,
+        "维权路径比较": 550 if not accessible else 400,
+        "维权胜算评估": 180 if not accessible else 150,
+        "行动清单": 650 if not accessible else 450,
+    }
+
+    def _shorten(body: str, budget: int) -> str:
+        if len(body) <= budget:
+            return body
+        units = [
+            unit.strip()
+            for unit in re.split(
+                r"(?<=。)\s*|(?<=；)\s*|(?=\n\s*(?:[-*□]|\d+[.、]))",
+                body,
+            )
+            if unit.strip()
+        ]
+        kept: list[str] = []
+        for unit in units:
+            projected = len("\n".join(kept + [unit]))
+            if kept and projected > budget - 18:
+                break
+            remaining = budget - len("\n".join(kept)) - 18
+            kept.append(unit[:max(20, remaining)])
+            if len("\n".join(kept)) >= budget - 18:
+                break
+        return ("\n".join(kept).rstrip("，；。") + "……")[:budget]
+
+    rendered = [prefix] if prefix else []
+    for title, header, body in sections:
+        rendered.append(f"{header}\n{_shorten(body, budgets.get(title, 420))}".strip())
+    compacted = "\n\n".join(item for item in rendered if item).strip()
+    result = compacted + (f"\n\n{suffix}" if suffix else "")
+    if len(result) <= limit:
+        return result
+    notice = "\n\n> 内容已按易读长度压缩。"
+    core = compacted[: max(100, core_limit - len(notice) - 2)].rstrip("，；。\n ") + "……" + notice
+    return core + (f"\n\n{suffix}" if suffix else "")
 
 
 def _normalize_required_sections(reply: str) -> str:
     """Keep model wording compatible with the stable user-facing response contract."""
-    return reply.replace("【初步方向建议】", "【维权路径比较】")
+    normalized = reply.replace("【初步方向建议】", "【维权路径比较】")
+    normalized = re.sub(
+        r"(?m)^\s*#{1,6}\s*(?:检索到的)?(?:相关)?法律依据\s*$",
+        "**【法律依据】**",
+        normalized,
+    )
+    return normalized
+
+
+def _insert_before_document_offer(reply: str, section: str) -> str:
+    """Insert a required result section before the optional document offer."""
+    markers = ("\n\n---\n📄", "\n---\n📄", "\n📄 **需要参考文书")
+    positions = [position for marker in markers if (position := reply.find(marker)) >= 0]
+    if not positions:
+        return reply.rstrip() + "\n\n" + section.strip()
+    position = min(positions)
+    return reply[:position].rstrip() + "\n\n" + section.strip() + "\n\n" + reply[position:].lstrip()
+
+
+def _channel_summary_lines(state: GuideState, *, limit: int = 2) -> list[str]:
+    """Build fallback routing text from retrieved channel records, not domains."""
+    lines: list[str] = []
+    for channel in state.relevant_channels:
+        if not isinstance(channel, dict):
+            continue
+        name = str(channel.get("name") or "").strip()
+        if not name:
+            continue
+        contacts = [
+            str(value).strip()
+            for value in (channel.get("phone"), channel.get("url"))
+            if str(value or "").strip()
+        ]
+        suffix = f"（{'；'.join(contacts)}）" if contacts else ""
+        lines.append(f"- **{name}**{suffix}：具体受理范围和材料以该机构答复为准。")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _ensure_action_checklist(reply: str, state: GuideState) -> str:
+    """Restore a generic checklist from structured state when the model omits it."""
+    if "【行动清单】" in reply:
+        return reply
+    channel = "方案中列明的受理机构"
+    for item in state.relevant_channels:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        contacts = [
+            str(value).strip()
+            for value in (item.get("phone"), item.get("url"))
+            if str(value or "").strip()
+        ]
+        channel = f"{name}（{'；'.join(contacts)}）" if contacts else name
+        break
+    steps = (
+        "1. 备份原始材料，保留原始载体，并按时间顺序整理已经确认的事实。\n"
+        f"2. 联系{channel}核对受理范围、管辖和所需材料；提交后保存回执或受理编号。\n"
+        "3. 对时效、费用或程序仍不清楚时，可拨打 12348 进一步核验。"
+    )
+    return _insert_before_document_offer(reply, f"**【行动清单】**\n{steps}")
+
+
+def _ensure_required_plan_sections(reply: str, state: GuideState) -> str:
+    """最终压缩后再次核对稳定输出合同，避免模型随机漏段。"""
+    if "【维权路径" not in reply:
+        routes = _channel_summary_lines(state)
+        if not routes:
+            routes = [
+                "- 当前没有可核验的本地渠道记录，请先拨打 12348 核对受理机构、管辖和程序。"
+            ]
+        fallback = "**【维权路径比较】**\n" + "\n".join(routes)
+        reply = _insert_before_document_offer(reply, fallback)
+    if "【维权胜算评估】" not in reply:
+        tier_label = {"HIGH": "较充分", "MEDIUM": "一般", "LOW": "有限"}.get(
+            state.confidence_tier, "一般"
+        )
+        reply = _insert_before_document_offer(
+            reply,
+            (
+                "**【维权胜算评估】**\n"
+                f"- **当前信息充分度：{tier_label}**。系统不据此计算胜诉率；"
+                "最终结果仍取决于事实核验、原始证据、法律适用、对方抗辩及履行能力。"
+            ),
+        )
+    empty_recommendation = re.compile(
+        r"(?m)(?:#{1,6}\s*)?\*{0,2}【推荐方案】\*{0,2}\s*"
+        r"(?=(?:\n#{1,6}\s*)?\*{0,2}【维权胜算评估】\*{0,2})"
+    )
+    if empty_recommendation.search(reply):
+        first_channel = next(iter(_channel_summary_lines(state, limit=1)), "")
+        recommendation = (
+            f"优先核对并使用已检索到的渠道：{first_channel.lstrip('- ')}"
+            if first_channel
+            else "先保存原始材料，并拨打 12348 核对受理机构、管辖和时效。"
+        )
+        reply = empty_recommendation.sub(
+            f"【推荐方案】\n{recommendation}\n\n",
+            reply,
+        )
+    return _ensure_action_checklist(reply, state)
 
 
 def _sanitize_unverified_evidence_assertions(
@@ -1461,34 +2157,13 @@ def _sanitize_unverified_evidence_assertions(
     return reply
 
 
-def _sanitize_food_compensation_certainty(reply: str, state: GuideState) -> str:
-    """Keep the Food Safety Law minimum-additional-compensation rule conditional."""
-    context = "".join(state.confirmed_issues + state.collected_facts)
-    if "食品" not in context and "玻璃渣" not in context and "异物" not in context:
-        return reply
-    replacements = (
-        (
-            "所以您最低可以索赔 **1000元**",
-            "若经核验符合第一百四十八条的适用条件，可主张增加赔偿不足1000元按1000元计算；是否支持仍由处理机关结合证据判断",
-        ),
-        (
-            "所以您最低可以索赔1000元",
-            "若经核验符合第一百四十八条的适用条件，可主张增加赔偿不足1000元按1000元计算；是否支持仍由处理机关结合证据判断",
-        ),
-        ("最低赔偿1000元", "符合第一百四十八条适用条件时的增加赔偿最低额规则"),
-        ("经营存在习惯性问题", "曾出现过类似问题的线索，仍需进一步核验"),
-    )
-    for old, new in replacements:
-        reply = reply.replace(old, new)
-    return reply
-
-
 def _ensure_case_reference(
     reply: str,
     similar_cases: list[dict],
     case_context: str = "",
+    state: GuideState | None = None,
 ) -> str:
-    """模型漏写类案部分时，用结构化检索结果补一条简短摘要。"""
+    """Render case references only from structured retrieval results."""
     cases = list(similar_cases)
     if not cases and case_context:
         title_match = re.search(r"案例\d+【([^】]+)】", case_context)
@@ -1501,31 +2176,59 @@ def _ensure_case_reference(
                 "gist": gist_match.group(1).strip() if gist_match else "",
                 "text": "",
             })
-    if "类似案例" in reply:
-        if cases:
-            return reply
-        return re.sub(
-            r"\n*\*{0,2}【类似案例(?:参考)?】\*{0,2}.*?(?=\n---|\n\*{0,2}【|\Z)",
-            "",
-            reply,
-            flags=re.S,
-        ).strip()
-    if not cases:
-        return reply
-    case = cases[0]
-    title = str(case.get("title") or "相似案件").strip()
-    case_number = str(case.get("case_number") or "").strip()
-    summary = str(case.get("gist") or case.get("text") or "").strip()
-    summary = re.sub(r"\s+", " ", summary)[:500]
-    if not summary:
-        return reply
-    label = f"{title}（{case_number}）" if case_number else title
-    block = (
-        "\n\n**【类似案例参考】**\n"
-        f"- **{label}**：{summary}\n"
-        "- 类案仅用于说明裁判思路，不能替代对您本人证据和事实的判断。"
+    grounded_cases: list[dict] = []
+    seen_titles: set[str] = set()
+    for case in cases:
+        title = str(case.get("title") or "").strip()
+        summary = str(case.get("gist") or case.get("text") or "").strip()
+        if not title or not summary or title in seen_titles:
+            continue
+        seen_titles.add(title)
+        grounded_cases.append(case)
+        if len(grounded_cases) >= 2:
+            break
+
+    section_pattern = re.compile(
+        r"\n*\*{0,2}【类似案例(?:参考)?】\*{0,2}.*?"
+        r"(?=\n(?:#{1,6}\s*)?\*{0,2}【|\n---|\Z)",
+        re.S,
     )
-    return reply.rstrip() + block
+    reply = section_pattern.sub("", reply).strip()
+    if not grounded_cases:
+        return reply
+
+    lines = ["**【类似案例参考】**"]
+    for case in grounded_cases:
+        title = str(case.get("title") or "相似案件").strip()
+        case_number = str(case.get("case_number") or "").strip()
+        summary = re.sub(
+            r"\s+",
+            " ",
+            str(case.get("gist") or case.get("text") or ""),
+        ).strip()
+        if len(summary) > 180:
+            shortened = summary[:180]
+            sentence_end = max(shortened.rfind("。"), shortened.rfind("；"))
+            summary = (shortened[: sentence_end + 1] if sentence_end >= 90 else shortened.rstrip("，；。")) + "……"
+        label = f"{title}（{case_number}）" if case_number else title
+        original_url = str(case.get("original_url") or "").strip()
+        source_link = f" [查看原始链接]({original_url})" if original_url else ""
+        lines.append(f"- **{label}**：{summary}{source_link}")
+    lines.append("- 类案仅用于说明裁判思路，不能替代对您本人证据和事实的判断。")
+    block = "\n".join(lines)
+    next_section = re.search(
+        r"(?m)^\s*(?:#{1,6}\s*)?\*{0,2}【维权路径(?:比较)?】\*{0,2}\s*$",
+        reply,
+    )
+    if next_section:
+        return (
+            reply[:next_section.start()].rstrip()
+            + "\n\n"
+            + block
+            + "\n\n"
+            + reply[next_section.start():]
+        )
+    return reply.rstrip() + "\n\n" + block
 
 
 async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
@@ -1577,7 +2280,7 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
         region=region,
         time_info=state.time_info or "暂未确认",
         collected_facts="；".join(state.collected_facts) or "暂未确认",
-        long_term_memories="；".join(_long_term_memories(state)) or "（无相关长期记忆）",
+        long_term_memories="；".join(_active_long_term_memories(state)) or "（无相关长期记忆）",
         evidence_confirmed="、".join(state.evidence_confirmed) or "暂未确认",
         evidence_unverified="、".join(state.evidence_unverified) or "（无）",
         evidence_unavailable="、".join(state.evidence_unavailable) or "（无）",
@@ -1596,21 +2299,37 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
         force_conclude_note=force_note,
     )
     response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    audited_content = response.content
+    try:
+        audit_prompt = PLAN_AUDIT_PROMPT.format(
+            case_context=format_case_context(state.case_facts),
+            evidence_confirmed="、".join(state.evidence_confirmed) or "暂未确认",
+            law_context=state.law_context_str or "（本轮未检索到可引用条文）",
+            draft=response.content,
+        )
+        audit_response = await deps.llm.ainvoke([SystemMessage(content=audit_prompt)])
+        if str(audit_response.content or "").strip():
+            audited_content = audit_response.content
+    except Exception as exc:
+        logger.warning("行动方案动态审校失败，继续执行确定性来源校验: {}", exc)
 
     # 在回复末尾添加检索错误降级提示（如果有）
-    final_reply = _normalize_required_sections(response.content)
+    final_reply = _normalize_required_sections(audited_content)
     final_reply = _sanitize_statute_citations(final_reply, state.law_context_str)
-    final_reply = _sanitize_evidence_overconfidence(final_reply)
-    final_reply = _sanitize_user_facing_tone(final_reply)
+    final_reply = _ensure_grounded_legal_basis(final_reply, state.law_context_str, state)
     final_reply = _sanitize_unverified_evidence_assertions(
         final_reply,
         state.evidence_unverified,
     )
-    final_reply = _sanitize_food_compensation_certainty(final_reply, state)
-    final_reply = _sanitize_labor_procedure_claims(final_reply, state)
-    if state.force_conclude or state.wants_conclude:
-        final_reply = _sanitize_forced_followups(final_reply)
-    final_reply = _ensure_case_reference(final_reply, state.similar_cases, state.case_context_str)
+    final_reply = _ensure_contextual_understanding(final_reply, state)
+    final_reply = _sanitize_forced_followups(final_reply)
+    final_reply = _ensure_action_checklist(final_reply, state)
+    final_reply = _ensure_case_reference(
+        final_reply,
+        state.similar_cases,
+        state.case_context_str,
+        state,
+    )
     if state.retrieval_error_note:
         final_reply += state.retrieval_error_note
 
@@ -1618,13 +2337,18 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
     _tier_badge = {
         "HIGH":   "**📊 当前事实和法律依据较充分，可作为行动参考；原始证据仍需核对。**",
         "MEDIUM": "**📊 基本法律依据已找到，但信息尚有缺口，请结合实际情况判断。**",
-        "LOW":    "**📊 知识库检索到的法律依据有限，以下方案仅供初步参考，重要决策前请拨打 12348 咨询专业律师。**",
+        "LOW":    "**📊 已找到相关法律依据，但部分事实或证据仍待核验；以下方案供初步行动参考，重要决定前可拨打 12348 咨询专业律师。**",
     }
     badge = _tier_badge.get(state.confidence_tier or "", "")
     if badge:
         final_reply = badge + "\n\n" + final_reply
 
-    final_reply = _compact_final_reply(final_reply, compact_mode)
+    final_reply = _compact_final_reply(
+        final_reply,
+        accessible_mode,
+        compact=compact_mode,
+    )
+    final_reply = _ensure_required_plan_sections(final_reply, state)
 
     # ── 案例未命中时，把 fallback 指引拼入回复（告知用户去哪里查案例） ──────
     if (
@@ -1661,13 +2385,17 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
     if state.confirmed_issues or (state.legal_domain and state.legal_domain != "other"):
         doc_type = DOC_TYPE_MAP.get(state.legal_domain, "投诉信/申请书")
         low_note = "当前信息仍有限，生成后请重点补全占位信息并交由专业人士核对。" if state.confidence_tier == "LOW" else ""
-        if not compact_mode or len(final_reply) <= 2000:
+        if "生成文书" not in final_reply:
             final_reply += (
                 f"\n\n---\n📄 **需要参考文书？** {low_note}"
                 f"如需生成{doc_type}草稿，请回复「生成文书」。"
             )
 
-    final_reply = _compact_final_reply(final_reply, compact_mode)
+    final_reply = _compact_final_reply(
+        final_reply,
+        accessible_mode,
+        compact=compact_mode,
+    )
 
     # 自动保存关键信息到长期记忆
     user_id = state.user_context.get("user_id")
@@ -1750,8 +2478,25 @@ def route_after_urgency(state: GuideState) -> str:
     """高危直接熔断；等待追问回答时先解析，否则提取法律问题。"""
     if state.phase == GuidePhase.END:
         return END
+    if state.awaiting_supplement_choice and not state.supplement_choice:
+        return "ask_followup"
+    if state.supplement_choice in {"continue", "conclude"}:
+        if state.supplement_has_details:
+            return "parse_details" if state.pending_ask_details else "extract_issues"
+        return "assess_retrieve"
     if state.pending_ask_details:
         return "parse_details"
+    if (
+        state.wants_conclude
+        and state.confirmed_issues
+        and not _supplement_contains_case_details(
+            next(
+                (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
+                "",
+            )
+        )
+    ):
+        return "assess_retrieve"
     return "extract_issues"
 
 
@@ -1774,14 +2519,10 @@ def route_after_parse(state: GuideState) -> str:
 
 
 def route_after_assess_retrieve(state: GuideState) -> str:
-    """信息足够或达到上限时收敛，否则只输出一条针对性追问。"""
-    should_stop, _ = should_conclude(
-        state,
-        max_rounds=settings.GUIDE_MAX_TOTAL_ROUNDS,
-    )
-    if state.force_conclude or should_stop:
+    """Route from the planner decision without checking fixed field completion."""
+    if state.force_conclude or state.wants_conclude or state.supplement_choice == "conclude":
         return "conclude"
-    if _next_ask_type(state):
+    if state.followup_plan.get("should_ask"):
         return "ask_followup"
     return "conclude"
 
@@ -1821,7 +2562,13 @@ def build_guide_graph(deps: GuideDeps):
     graph.add_edge("save_record",  END)
 
     graph.add_conditional_edges("check_urgency",  route_after_urgency,
-        {"parse_details": "parse_details", "extract_issues": "extract_issues", END: END})
+        {
+            "parse_details": "parse_details",
+            "extract_issues": "extract_issues",
+            "assess_retrieve": "assess_retrieve",
+            "ask_followup": "ask_followup",
+            END: END,
+        })
     graph.add_conditional_edges("extract_issues", route_after_extract,
         {"clarify": "clarify", "assess_retrieve": "assess_retrieve"})
     graph.add_conditional_edges("parse_details",  route_after_parse,
@@ -1881,6 +2628,8 @@ async def run_guide(
         if isinstance(msg, AIMessage):
             reply = msg.content
             break
+
+    reply = _with_memory_recall_preface(new_state, user_message, reply)
 
     logger.info("run_guide complete | session={} phase={} round={} reply_len={}",
                 thread_id, new_state.phase, new_state.round, len(reply))

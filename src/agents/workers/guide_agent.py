@@ -71,11 +71,11 @@ async def call_guide_agent_impl(
 
     state_key = f"guide_state:{user_id}:{session_id}"
     active_key = f"guide_active:{user_id}:{session_id}"
-    ttl = settings.REDIS_SESSION_TTL
+    ttl = settings.GUIDE_SESSION_TTL
 
-    # 结论中邀请生成文书时保留结束状态，下一轮由 API 独立生成文书。
+    # 已识别具体法律问题的终态仍需保留，下一轮可生成或重生成参考文书。
     if new_state.phase == GuidePhase.END:
-        if not new_state.doc_draft and "生成文书" in reply:
+        if new_state.confirmed_issues:
             await redis.set(state_key, new_state.model_dump_json(), ex=ttl)
             await redis.set(active_key, "1", ex=ttl)
         return reply

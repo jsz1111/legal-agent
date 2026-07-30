@@ -84,6 +84,7 @@ def find_evidence_followup(domain: str, rule_id: str) -> EvidenceFollowup | None
 _UNKNOWN_MARKERS = ("不知道", "不清楚", "不记得", "记不清", "忘了", "没注意", "说不准")
 _APPROXIMATE_MARKERS = ("大概", "差不多", "可能", "好像", "左右", "约", "应该")
 _CORRECTION_MARKERS = ("更正", "说错了", "不是", "改一下", "准确说")
+_QUESTION_MARKERS = ("？", "?", "是否", "有没有", "是不是", "吗")
 
 
 def _short(value: str, limit: int = 300) -> str:
@@ -94,17 +95,11 @@ def fact_rule_resolved(rule: FactFollowup, state: Any) -> bool:
     record = (getattr(state, "fact_records", {}) or {}).get(rule.id) or {}
     if record.get("status") in {"user_stated", "approximate", "corrected"}:
         return True
-    if rule.slot == "event_time" and getattr(state, "time_info", ""):
-        return True
+    if rule.slot == "event_time":
+        return bool(getattr(state, "time_info", ""))
     if rule.slot == "region" and getattr(state, "region", ""):
         return True
-    context = "".join(getattr(state, "collected_facts", []) or [])
-    context += "".join(
-        str(getattr(message, "content", ""))
-        for message in (getattr(state, "messages", []) or [])[-8:]
-        if getattr(message, "type", "") == "human"
-    )
-    return bool(rule.resolve_keywords) and any(keyword in context for keyword in rule.resolve_keywords)
+    return False
 
 
 def evidence_rule_resolved(rule: EvidenceFollowup, known_items: list[str]) -> bool:
@@ -125,7 +120,10 @@ def assess_fact_answer(
 ) -> dict:
     """只评估陈述清晰度，不把用户回答误标为已查证事实。"""
     value = _short(answer)
-    if any(marker in value for marker in _UNKNOWN_MARKERS):
+    explicit_answer = value.startswith(("有", "没有", "没", "是", "不是", "签了", "没签", "写了", "没写"))
+    if any(marker in value for marker in _QUESTION_MARKERS) and not explicit_answer:
+        status = "ambiguous"
+    elif any(marker in value for marker in _UNKNOWN_MARKERS):
         status = "unknown"
     elif any(marker in value for marker in _CORRECTION_MARKERS):
         status = "corrected"
@@ -158,7 +156,9 @@ def assess_initial_facts(facts: list[str], existing: dict[str, dict] | None = No
         if not value:
             continue
         key = "statement_" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
-        if any(marker in value for marker in _UNKNOWN_MARKERS):
+        if any(marker in value for marker in _QUESTION_MARKERS):
+            status = "ambiguous"
+        elif any(marker in value for marker in _UNKNOWN_MARKERS):
             status = "unknown"
         elif any(marker in value for marker in _APPROXIMATE_MARKERS):
             status = "approximate"
@@ -203,8 +203,7 @@ def assess_evidence_answer(
         availability = "conflicted"
     limitations = []
     if availability not in {"unavailable", "unclear"}:
-        limitations.append("真实性、完整性、取得方式和证明力尚未由系统核验")
-        limitations.append("截图或复制件应尽量保留原始载体、完整上下文和形成时间")
+        limitations.extend(_evidence_limitations(f"{rule.item} {value}"))
     return {
         "rule_id": rule.id,
         "evidence_key": rule.evidence_key,
@@ -241,10 +240,26 @@ def assess_initial_evidence(
             "legal_admissibility": "not_determined",
             "purpose": "需结合具体争议判断证明目的",
             "alternatives": [],
-            "limitations": ["真实性、完整性、取得方式和证明力尚未由系统核验"],
+            "limitations": _evidence_limitations(canonical),
             "answer_excerpt": canonical,
         }
     return records
+
+
+def _evidence_limitations(value: str) -> list[str]:
+    """根据材料类型给出保守、可执行的证明力边界。"""
+    limitations = ["真实性、完整性、取得方式和证明力尚未由系统核验"]
+    if any(marker in value for marker in ("报价", "估价", "维修单")):
+        limitations.append("报价材料通常只能反映项目和报价金额，不能单独证明损坏原因、责任主体或实际维修已经发生")
+    elif any(marker in value for marker in ("退房确认", "交接单", "验收单")):
+        limitations.append("需核对形成时间、具体记载以及双方签字或盖章，才能判断其证明范围")
+    elif any(marker in value for marker in ("截图", "聊天", "微信", "短信")):
+        limitations.append("应尽量保留原始载体、完整上下文、对方身份和形成时间")
+    elif any(marker in value for marker in ("录音", "录像", "视频")):
+        limitations.append("需保留原始文件和完整内容，并结合取得方式、说话人身份及其他材料判断")
+    else:
+        limitations.append("复制件或转述内容应尽量与原件、原始载体和形成时间相互核对")
+    return limitations
 
 
 def evidence_effective_count(evidence_items: list[str], assessments: dict[str, dict]) -> float:
@@ -276,6 +291,7 @@ _FACT_STATUS_LABELS = {
     "corrected": "用户已更正，需以新陈述为准",
     "conflicted": "与前述信息不一致，需谨慎使用",
     "unknown": "用户暂不清楚",
+    "ambiguous": "回答仍像疑问或含义不明确，需要再次确认",
 }
 
 _EVIDENCE_STATUS_LABELS = {
@@ -304,5 +320,10 @@ def format_evidence_assessments(records: dict[str, dict]) -> str:
     for record in list(records.values())[-8:]:
         label = _EVIDENCE_STATUS_LABELS.get(record.get("availability"), "状态待确认")
         purpose = record.get("purpose") or "证明目的待结合案情判断"
-        lines.append(f"- {record.get('canonical_item')}：{label}；可能用途：{purpose}；法律上的可采性尚未确定")
+        limitations = "；".join(record.get("limitations") or [])
+        suffix = f"；局限：{limitations}" if limitations else ""
+        lines.append(
+            f"- {record.get('canonical_item')}：{label}；可能用途：{purpose}；"
+            f"法律上的可采性尚未确定{suffix}"
+        )
     return "\n".join(lines)

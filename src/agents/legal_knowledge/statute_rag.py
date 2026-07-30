@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from pathlib import Path
 from src.agents.legal_knowledge.prompts import STATUTE_QA_PROMPT
+from src.agents.legal_guide.retrieval_query import lexical_terms
 
 COLLECTION_NAME = "statute_index"
 CIVIL_CODE_LAW_ID = "75"  # 中华人民共和国民法典（基础私法，跨领域通用）
@@ -174,7 +175,7 @@ def format_statute_context(
         return article
 
     def _fmt(hit: dict, idx: int) -> str:
-        title = law_titles.get(hit["law_id"], f"法律ID:{hit['law_id']}")
+        title = law_titles.get(str(hit["law_id"]), f"法律ID:{hit['law_id']}")
         return f"法条{idx}【{title} {_display_article_no(hit['article_no'])}】\n{hit['text']}"
 
     primary = hits[:primary_count]
@@ -301,6 +302,7 @@ def _expand_pg_keywords(issues: list[str]) -> list[str]:
             if issue.endswith(suffix) and len(issue) > len(suffix) + 1:
                 candidates.append(issue[:-len(suffix)])
         candidates.extend(part for part in re.split(r"[/、，,\s]+", issue) if len(part) >= 2)
+    candidates.extend(lexical_terms(issues, limit=24))
 
     seen: set[str] = set()
     return [item for item in candidates if len(item) >= 2 and not (item in seen or seen.add(item))]

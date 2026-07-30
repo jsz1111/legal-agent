@@ -51,6 +51,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.pytest-tmp-*/
+.codex-runtime/
 cover/
 
 # Translations
@@ -167,5 +169,10 @@ test_output_*.txt
 /test_image_analysis_only.py
 /test_multimodal_food_safety.py
 /legal-consultation-vibeapi-4k.jpg
+test_comprehensive_*.log
+test_regression_*.log
+test_ux_output.log
+gradio.log
+uvicorn.log
 乱文件,智能体暂时不能读取/测试结果_*.json
 resources/legal_document_templates/sources/spc_2025/parsed_*/

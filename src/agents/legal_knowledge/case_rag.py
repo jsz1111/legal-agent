@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from loguru import logger
 from langchain_core.messages import SystemMessage
 from langchain_core.language_models import BaseChatModel
@@ -13,6 +14,7 @@ from sqlalchemy import or_, select
 
 from pathlib import Path
 from src.agents.legal_knowledge.prompts import CASE_QA_PROMPT
+from src.agents.legal_guide.retrieval_query import lexical_terms
 
 COLLECTION_NAME = "case_index"
 GENERIC_CIVIL_DOMAIN = "civil_case"
@@ -23,14 +25,29 @@ _CASE_DOMAIN_MAP: dict[str, tuple[str, ...]] = {
     "family_vulnerable_groups": ("family_marriage",),
 }
 
-_FOOD_TOPIC_TRIGGERS = ("食品", "玻璃渣", "玻璃", "异物", "饭菜", "饭馆", "吃出")
-_FOOD_CASE_TERMS = ("食品", "玻璃", "异物", "饭菜", "食物", "菜品")
-_FOOD_GENERIC_CAUSE_MARKERS = (
-    "网络购物合同纠纷",
-    "产品责任纠纷",
-    "产品销售者责任纠纷",
-    "消费者权益",
-)
+_GENERIC_DOMAIN_MARKERS: dict[str, tuple[str, ...]] = {
+    "labor_social_security": (
+        "劳动争议", "劳动合同", "劳动报酬", "确认劳动关系",
+        "工伤保险", "社会保险", "职工破产债权",
+    ),
+    "consumer_market": (
+        "消费者", "网络购物", "信息网络买卖", "产品责任", "产品销售者责任",
+        "服务合同", "买卖合同",
+    ),
+    "contracts_property_housing": (
+        "房屋租赁", "商品房", "物业服务", "建设工程", "装饰装修", "不动产",
+        "租赁合同",
+    ),
+    "family_vulnerable_groups": (
+        "离婚", "婚姻", "抚养", "赡养", "继承", "监护", "收养",
+    ),
+    "traffic_personal_injury": (
+        "机动车交通事故", "道路交通事故", "交通肇事", "人身损害",
+    ),
+    "contract_commercial": (
+        "合同", "买卖", "借款", "民间借贷", "承揽", "服务",
+    ),
+}
 
 
 def _case_domains_for(domain: str, *, include_generic: bool = False) -> tuple[str, ...]:
@@ -41,15 +58,36 @@ def _case_domains_for(domain: str, *, include_generic: bool = False) -> tuple[st
 
 
 def _topic_case_terms(question: str) -> tuple[str, ...]:
-    if any(trigger in question for trigger in _FOOD_TOPIC_TRIGGERS):
-        return _FOOD_CASE_TERMS
-    return ()
+    return tuple(lexical_terms([question], limit=16))
 
 
-def _generic_case_matches_topic(domain: str, cause: str, terms: tuple[str, ...]) -> bool:
-    if domain != GENERIC_CIVIL_DOMAIN or terms != _FOOD_CASE_TERMS:
+def _case_detail_matches_topic(detail: dict, terms: tuple[str, ...]) -> bool:
+    """Reject semantically broad consumer cases when the user supplied an explicit topic."""
+    if not terms:
         return True
-    return any(marker in (cause or "") for marker in _FOOD_GENERIC_CAUSE_MARKERS)
+    text = " ".join(
+        str(detail.get(field) or "")
+        for field in ("title", "cause", "gist", "retrieval_text")
+    )
+    overlap = sum(1 for term in terms if term in text)
+    return overlap >= (2 if len(terms) >= 4 else 1)
+
+
+def _generic_case_matches_domain(requested_domain: str, detail: dict) -> bool:
+    """Query-time filtering for unlabelled real judgments; never rewrites metadata."""
+    if not requested_domain or requested_domain == GENERIC_CIVIL_DOMAIN:
+        return True
+    markers = _GENERIC_DOMAIN_MARKERS.get(requested_domain)
+    if not markers:
+        return False
+    # 年鉴裁判文书均保留案由；优先按案由过滤，避免“承揽合同中提到工资”
+    # 这类字面相关但法律关系不同的案件混入劳动争议。
+    cause = str(detail.get("cause") or "").strip()
+    text = cause or " ".join(
+        str(detail.get(field) or "")
+        for field in ("title", "retrieval_text")
+    )
+    return any(marker in text for marker in markers)
 
 
 async def search_cases_raw(
@@ -63,11 +101,12 @@ async def search_cases_raw(
     sparse_query: str = "",  # BM25 专用查询，为空时退化为 question
     llm: BaseChatModel | None = None,
     use_hyde: bool = False,
+    include_generic: bool = False,
 ) -> list[dict]:
     """类案向量检索（含 rerank + RRF），返回精排后的结果列表。"""
     filter_expr = None
     if domain:
-        case_domains = _case_domains_for(domain)
+        case_domains = _case_domains_for(domain, include_generic=include_generic)
         encoded_domains = [json.dumps(item, ensure_ascii=False) for item in case_domains]
         if len(encoded_domains) == 1:
             filter_expr = f"domain == {encoded_domains[0]}"
@@ -291,7 +330,15 @@ async def _search_topic_cases_pg(
     rows = (await db_session.execute(statement)).all()
     ranked: list[tuple[int, dict]] = []
     for row in rows:
-        if not _generic_case_matches_topic(row.domain, row.cause or "", terms):
+        detail = {
+            "cause": row.cause or "",
+            "title": row.title or "",
+            "gist": row.gist or "",
+            "retrieval_text": row.retrieval_text or "",
+        }
+        if row.domain == GENERIC_CIVIL_DOMAIN and not _generic_case_matches_domain(domain, detail):
+            continue
+        if not _case_detail_matches_topic(detail, terms):
             continue
         text = " ".join(
             str(value or "")
@@ -321,6 +368,7 @@ def format_case_context(hits: list[dict], details: dict[int, dict]) -> str:
         title = detail.get("title") or f"案例{i}"
         gist = detail.get("gist") or ""
         facts_snippet = detail.get("retrieval_text") or hit["text"]
+        facts_snippet = re.sub(r"\s+", " ", str(facts_snippet or "")).strip()[:1200]
 
         lines = [f"案例{i}【{title}】"]
         metadata = [
@@ -336,7 +384,8 @@ def format_case_context(hits: list[dict], details: dict[int, dict]) -> str:
             lines.append("基本信息：" + "｜".join(metadata))
         lines.append(f"案情摘要：{facts_snippet}")
         if gist:
-            lines.append(f"裁判要旨：{gist}")
+            compact_gist = re.sub(r"\s+", " ", str(gist)).strip()[:500]
+            lines.append(f"裁判要旨：{compact_gist}")
         if detail.get("legal_basis"):
             lines.append(f"法律依据：{detail['legal_basis']}")
         if detail.get("original_url"):
@@ -361,7 +410,12 @@ async def search_cases_context(
         if topic_hits:
             topic_details = await _fetch_case_details(topic_hits, db_session)
             valid_topic_hits = [
-                hit for hit in topic_hits if int(hit["id"]) in topic_details
+                hit for hit in topic_hits
+                if int(hit["id"]) in topic_details
+                and _case_detail_matches_topic(
+                    topic_details[int(hit["id"])],
+                    _topic_case_terms(question),
+                )
             ]
             if valid_topic_hits:
                 logger.info(
@@ -398,15 +452,29 @@ async def search_cases_context(
         sparse_query=sparse_query,
         llm=llm,
         use_hyde=use_hyde,
+        include_generic=bool(domain and db_session is not None),
+        top_k=30,
+        rerank_top_k=8,
     )
     details: dict[int, dict] = {}
     if hits and db_session is not None:
         details = await _fetch_case_details(hits, db_session)
 
     valid_hits = hits if db_session is None else [
-        hit for hit in hits if int(hit["id"]) in details
+        hit
+        for hit in hits
+        if int(hit["id"]) in details
+        and (
+            hit.get("domain") != GENERIC_CIVIL_DOMAIN
+            or _generic_case_matches_domain(domain, details[int(hit["id"])])
+        )
+        and _case_detail_matches_topic(
+            details[int(hit["id"])],
+            _topic_case_terms(question),
+        )
     ]
     if valid_hits:
+        valid_hits = valid_hits[:3]
         cases = []
         for hit in valid_hits:
             detail = details.get(int(hit["id"]), {})

@@ -82,3 +82,26 @@ def is_doc_request(msg: str) -> bool:
     if len(msg) <= 10 and msg in _DOC_AFFIRMATIVES:
         return True
     return False
+
+
+def requested_doc_type(msg: str, default: str) -> str:
+    """从用户原话识别明确指定的文书类型；普通“生成文书”沿用阶段默认值。"""
+    text = str(msg or "").strip()
+    mappings = (
+        (("劳动仲裁申请书",), "劳动仲裁申请书"),
+        (("民事起诉状", "起诉状", "起诉书"), "民事起诉状"),
+        (("催告函", "催款函"), "催告函"),
+        (("律师函",), "律师函参考稿"),
+        (("消费者投诉信", "投诉信"), "消费者投诉信"),
+        (("行政复议申请书", "行政复议"), "行政复议申请书"),
+        (("报案材料", "报案书"), "报案材料"),
+        (("离婚协议书",), "离婚协议书（草稿）"),
+        (("侵权警告函", "警告函"), "侵权警告函"),
+    )
+    for keywords, doc_type in mappings:
+        if any(keyword in text for keyword in keywords):
+            return doc_type
+    if "仲裁申请书" in text:
+        # “仲裁申请书”既可能指劳动仲裁，也可能指商事仲裁；由当前领域默认值消歧。
+        return default if "仲裁申请书" in default else "仲裁申请书"
+    return default

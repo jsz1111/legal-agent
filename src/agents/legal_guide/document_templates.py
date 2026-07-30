@@ -130,6 +130,37 @@ def select_official_template(
     return best
 
 
+def select_related_official_template(
+    legal_domain: str,
+    *context_parts: str | list[str],
+) -> OfficialDocumentTemplate | None:
+    """选择同领域最相关的官方模板，不把程序阶段差异伪装成精确匹配。"""
+    flattened: list[str] = []
+    for part in context_parts:
+        if isinstance(part, list):
+            flattened.extend(str(item) for item in part)
+        elif part:
+            flattened.append(str(part))
+    context = "".join("".join(flattened).split())
+
+    ranked: list[tuple[int, OfficialDocumentTemplate]] = []
+    for template in list_official_templates():
+        if legal_domain not in template.domains:
+            continue
+        keyword_hits = sum(1 for keyword in template.keywords if keyword in context)
+        if template.requires_keyword and keyword_hits == 0:
+            continue
+        ranked.append((keyword_hits, template))
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1].template_id), reverse=True)
+    best_score, best = ranked[0]
+    if len(ranked) > 1 and best_score == 0:
+        return None
+    return best
+
+
 def format_official_framework(template: OfficialDocumentTemplate) -> str:
     claims = "\n".join(
         f"{index}. {item}：【请按案情填写或填写无】"

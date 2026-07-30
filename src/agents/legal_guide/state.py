@@ -35,11 +35,15 @@ class GuideState(BaseModel):
     unmatched_issues: list[str] = Field(default_factory=list)   # 无法标准化的口语描述
     term_map: dict[str, str] = Field(default_factory=dict)      # {口语原词: 标准术语}，调试面板展示
     collected_facts: list[str] = Field(default_factory=list)    # 跨轮累积的金额、时间、关系、行为等案情事实
+    draftable_facts: list[str] = Field(default_factory=list)    # 用户清晰陈述、可安全用于文书的事实；疑问/冲突/推测不得进入
+    case_facts: list[dict] = Field(default_factory=list)        # 通用原子案情：语义键、原文、确定性、轮次和修订状态
     asked_details: list[str] = Field(default_factory=list)      # 已追问过的细节（防重复）
     pending_ask_details: list[str] = Field(default_factory=list) # 本轮追问内容，供 parse_details 解析
     pending_ask_type: str = ""                                  # facts / evidence，避免跨轮追问类型串线
     asked_followup_ids: list[str] = Field(default_factory=list)  # 结构化题库 ID，跨文案稳定防重复
     pending_followup_ids: list[str] = Field(default_factory=list) # 当前待答题库 ID（通常仅1项）
+    followup_plan: dict = Field(default_factory=dict)             # assess_retrieve 动态生成，ask_followup 负责展示
+    asked_decision_keys: list[str] = Field(default_factory=list)  # 已追问的法律决策点，跨问法去重
     fact_records: dict[str, dict] = Field(default_factory=dict)   # 用户陈述的清晰度/冲突状态，不代表已查证
     evidence_assessments: dict[str, dict] = Field(default_factory=dict) # 存在性、相关性、真实性和可采性分层
     evidence_unavailable: list[str] = Field(default_factory=list) # 用户明确表示没有的证据
@@ -50,6 +54,7 @@ class GuideState(BaseModel):
 
     # 检索结果（issue_search节点写入，conclude节点读取）
     candidate_laws: list[dict] = Field(default_factory=list)      # graph查询到的适用法律元信息
+    retrieved_law_refs: list[dict] = Field(default_factory=list)  # 本轮RAG真实法条，供动态追问依据引用
     similar_cases: list[dict] = Field(default_factory=list)       # graph查询到的类案列表
     relevant_channels: list[dict] = Field(default_factory=list)   # channels 查询结果
     law_context_str: str = ""    # statute_rag 格式化文本（直接传入 CONCLUDE_PROMPT）
@@ -65,7 +70,14 @@ class GuideState(BaseModel):
     # 控制字段
     force_conclude: bool = False       # True = 达到轮次上限，强制收敛
     wants_conclude: bool = False       # 用户明确要求停止追问并按现有信息给方案
+    awaiting_supplement_choice: bool = False  # 兼容旧会话；新流程不再展示二次选择菜单
+    supplement_choice_offered: bool = False   # 兼容旧会话持久化字段
+    supplement_choice: str = ""              # 兼容旧会话中的 continue / conclude
+    supplement_has_details: bool = False      # 选择语句中是否同时包含需要先入库的新案情或材料
+    allow_extra_followups: bool = False       # 兼容旧会话；新流程由信息增益直接决定追问或收敛
     urgency_level: str = "normal"      # critical / time / normal
+    safety_relevant: bool = False        # 当前纠纷是否涉及用户或他人的人身安全
+    current_safety_status: str = "not_applicable"  # danger / safe / unknown / not_applicable
     time_warning: str = ""             # 时效提醒文案（由 check_urgency 生成）
     clarify_rounds: int = 0            # 澄清轮数（上限 2 轮）
     ask_rounds: int = 0                # 事实+证据追问总轮数
@@ -89,3 +101,4 @@ class GuideState(BaseModel):
 
     # 文书生成
     doc_draft: str = ""  # API 文书生成入口写入，供前端展示或下载
+    requested_doc_type: str = ""  # 用户明确指定的文书类型；为空时按当前维权阶段选择默认类型

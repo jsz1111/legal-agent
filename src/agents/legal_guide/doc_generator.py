@@ -16,9 +16,10 @@ from src.agents.legal_guide.document_templates import (
     OfficialDocumentTemplate,
     format_official_framework,
     select_official_template,
+    select_related_official_template,
 )
 from src.agents.legal_guide.prompts import (
-    DOC_GEN_PROMPT, DOC_TYPE_MAP, DOC_TEMPLATES, DOMAIN_LABELS,
+    DOC_AUDIT_PROMPT, DOC_GEN_PROMPT, DOC_TYPE_MAP, DOC_TEMPLATES, DOMAIN_LABELS,
 )
 
 
@@ -30,14 +31,66 @@ class GeneratedLegalDocument:
     filename: str
     missing_fields: list[str]
     official_template: OfficialDocumentTemplate | None = None
+    related_official_template: OfficialDocumentTemplate | None = None
 
 
 def _extract_missing_fields(text: str) -> list[str]:
     fields = {
         value.strip() or "未填写内容"
-        for value in re.findall(r"【请填写([^】]*)】", text)
+        for value in re.findall(r"【请填写(?:或核实)?([^】]*)】", text)
     }
     return sorted(fields)
+
+
+_UNSUPPORTED_FACT_PHRASES = (
+    "提前一个月通知",
+    "双方共同签署",
+    "已按约履行全部义务",
+    "已经按约履行全部义务",
+    "无拖欠租金",
+    "没有拖欠租金",
+    "多次催告",
+    "协商未果",
+    "交付时状态良好",
+    "维修已经发生",
+    "已经完成维修",
+    "证明损坏原因",
+    "证明责任归属",
+)
+
+
+def _deterministic_fact_guard(text: str, allowed_facts: list[str]) -> str:
+    """在 LLM 审校之外再做一次保守规则兜底，避免常见套话进入文书。"""
+    allowed = "；".join(allowed_facts)
+    guarded = text
+    for phrase in _UNSUPPORTED_FACT_PHRASES:
+        if phrase not in allowed:
+            guarded = guarded.replace(phrase, "【请填写或核实相关事实】")
+    return guarded
+
+
+def _deterministic_legal_guard(text: str, legal_domain: str, doc_type: str) -> str:
+    """Remove legally incompatible boilerplate that an LLM may reintroduce."""
+    if legal_domain != "labor_social_security" or "劳动仲裁" not in doc_type:
+        return text
+    lines = []
+    for line in text.splitlines():
+        if re.search(r"仲裁费[^。；\n]*(?:承担|负担|缴纳|收取)", line):
+            continue
+        # 第八十五条加付赔偿属于劳动行政部门责令限期支付后仍逾期不付的
+        # 行政执法后果，不应直接列为劳动仲裁申请事项。
+        if re.search(r"(?:裁决|请求|申请)[^。；\n]{0,100}加付赔偿金", line):
+            continue
+        lines.append(line)
+    guarded = "\n".join(lines).strip()
+    guarded = re.sub(
+        r"依据《中华人民共和国劳动合同法》第八十五条[^。\n]*加付赔偿金[。；]?",
+        "",
+        guarded,
+    )
+    guarded = guarded.replace("无正当理由无故拖欠", "未按约定支付")
+    guarded = guarded.replace("无故拖欠申请人工资", "拖欠申请人工资")
+    return guarded
 
 
 def _clean_line(line: str) -> str:
@@ -142,10 +195,27 @@ async def generate_legal_document(
     evidence_confirmed: list[str],
     law_context_str: str,
     llm: BaseChatModel,
+    requested_doc_type: str = "",
 ) -> GeneratedLegalDocument:
     """Generate a source-grounded draft plus an editable DOCX artifact."""
     collected_facts = collected_facts or []
-    official_template = select_official_template(
+    desired_doc_type = requested_doc_type or DOC_TYPE_MAP.get(legal_domain, "投诉信")
+    context = "".join([*confirmed_issues, *collected_facts])
+    litigation_requested = (
+        "起诉状" in desired_doc_type
+        or any(term in context for term in ("向法院", "法院起诉", "提起诉讼", "准备起诉", "诉讼阶段"))
+    )
+    official_template = (
+        select_official_template(
+            legal_domain,
+            confirmed_issues,
+            collected_facts,
+            desired_doc_type,
+        )
+        if litigation_requested
+        else None
+    )
+    related_official_template = official_template or select_related_official_template(
         legal_domain,
         confirmed_issues,
         collected_facts,
@@ -153,7 +223,7 @@ async def generate_legal_document(
     doc_type = (
         official_template.title
         if official_template
-        else DOC_TYPE_MAP.get(legal_domain, "投诉信")
+        else desired_doc_type
     )
 
     template = (
@@ -189,7 +259,20 @@ async def generate_legal_document(
     )
 
     response = await llm.ainvoke([SystemMessage(content=prompt)])
-    doc_text = str(response.content).strip()
+    draft_text = str(response.content).strip()
+    audit_prompt = DOC_AUDIT_PROMPT.format(
+        draftable_facts="\n".join(f"- {item}" for item in collected_facts) or "（无；所有个案事实均须保留占位符）",
+        evidence_confirmed="、".join(evidence_confirmed) or "（无）",
+        draft_text=draft_text,
+    )
+    try:
+        audited = await llm.ainvoke([SystemMessage(content=audit_prompt)])
+        doc_text = str(audited.content).strip() or draft_text
+    except Exception:
+        # 审校失败不能阻断已经生成的参考稿；下方仍会执行规则式事实兜底。
+        doc_text = draft_text
+    doc_text = _deterministic_fact_guard(doc_text, collected_facts)
+    doc_text = _deterministic_legal_guard(doc_text, legal_domain, doc_type)
     filename_base = official_template.template_id if official_template else doc_type
     filename_base = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]+", "_", filename_base)
     return GeneratedLegalDocument(
@@ -199,6 +282,7 @@ async def generate_legal_document(
         filename=f"{filename_base}_智能填写参考稿.docx",
         missing_fields=_extract_missing_fields(doc_text),
         official_template=official_template,
+        related_official_template=related_official_template,
     )
 
 
