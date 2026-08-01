@@ -166,9 +166,12 @@ def test_uncertain_relation_pauses_before_mutating_case_state():
     assert waiting_state.case_id == "case-old"
     assert waiting_state.awaiting_case_boundary is True
     assert waiting_state.pending_case_message == "有另一件事想问"
-    assert "继续" in reply and "新建" in reply
-    restored = GuideState.model_validate_json(redis.data["guide_state:u:s"])
-    assert restored.case_facts == state.case_facts
+    assert reply is None
+    assert waiting_state.case_boundary_read_only is True
+    assert waiting_state.pause_state is None
+    assert route_after_urgency(waiting_state) == "pause_case_boundary"
+    assert waiting_state.case_facts == state.case_facts
+    assert "guide_state:u:s" not in redis.data
 
 
 def test_pending_message_is_recovered_after_semantic_confirmation():

@@ -779,15 +779,20 @@ def test_parse_details_records_blacklist_through_generic_case_updates_only():
     assert updates["confirmed_issues"] == ["预付式消费纠纷"]
 
 
-def test_graph_still_has_exactly_nine_business_nodes():
+def test_graph_uses_prepare_case_as_the_entry_node():
     compiled = build_guide_graph(MagicMock())
     nodes = set(compiled.get_graph().nodes) - {"__start__", "__end__"}
 
     assert nodes == {
-        "prepare_turn", "check_urgency", "extract_issues", "clarify",
-        "assess_retrieve", "ask_followup", "parse_details", "conclude",
-        "save_record",
-    }
+        "prepare_case", "pause_case_boundary", "handoff_document",
+            "guard_case", "update_facts", "clarify",
+            "decide_facts", "plan_evidence",
+            "assess_evidence",
+            "generate_solution",
+            "audit_and_save",
+            "assess_retrieve", "ask_followup", "parse_details", "conclude",
+            "save_record",
+        }
 
 
 def test_catalog_exhaustion_converges_without_an_open_ended_question():

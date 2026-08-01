@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -238,14 +240,26 @@ def boundary_audit_entry(
 ) -> dict[str, Any]:
     """Build a compact, state-persisted explanation of a boundary decision."""
 
+    excerpt = " ".join(message.split())[:200]
+    # 审计只需要辨认消息，不应保存完整手机号、身份证号或银行卡号。
+    excerpt = re.sub(r"(?<!\d)1\d{10}(?!\d)", "1**********", excerpt)
+    excerpt = re.sub(
+        r"(?<!\d)\d{6}(?:18|19|20)\d{2}\d{7}[\dXx](?!\d)",
+        "证件号码已脱敏",
+        excerpt,
+    )
+    excerpt = re.sub(r"(?<!\d)\d{16,19}(?!\d)", "账号已脱敏", excerpt)
     return {
         "case_id": state.case_id,
-        "message_excerpt": " ".join(message.split())[:200],
+        "message_id": state.current_message_id,
+        "message_excerpt": excerpt,
         "relation": decision.relation.value,
         "confidence": round(decision.confidence, 4),
         "reason": decision.reason,
         "control_intent": decision.control_intent.value,
         "decision_source": decision.decision_source,
+        "event_sequence": state.event_sequence + 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "at_round": state.round,
     }
 
@@ -269,6 +283,7 @@ def start_isolated_case(
         case_id=uuid.uuid4().hex,
         case_generation=previous.case_generation + 1,
         session_id=thread_id,
+        workflow_stage="case_intake",
         user_context=user_context,
         case_boundary_audit=[transition],
         phase=GuidePhase.CLARIFY,

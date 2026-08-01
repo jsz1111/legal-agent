@@ -51,6 +51,351 @@ _INTAKE_SECTIONS = (
     ("已经沟通或处理的情况", "procedure.current_status", "procedure"),
 )
 
+_DATE_PATTERN = re.compile(
+    r"(?:20\d{2}年)?(?:1[0-2]|0?[1-9])月(?:3[01]|[12]\d|0?[1-9])日"
+    r"|20\d{2}[-/.](?:1[0-2]|0?[1-9])[-/.](?:3[01]|[12]\d|0?[1-9])"
+)
+_AMOUNT_PATTERN = re.compile(
+    r"(?:人民币\s*)?\d+(?:\.\d{1,2})?\s*(?:元|万元|块钱|块)"
+)
+_EVIDENCE_PATTERN = re.compile(
+    r"订单(?:截图|记录|详情)?|付款(?:记录|凭证|截图)|支付(?:记录|凭证|截图)|"
+    r"聊天(?:记录|截图)|投诉(?:记录|工单)|平台工单|物流记录|银行流水|"
+    r"交易记录|合同|协议|发票|收据|录音|录像|照片|视频|回执|通知"
+)
+_RELATION_PATTERN = re.compile(
+    r"(?:对方是|对方为|双方是|我们是|我和对方是)"
+    r"([^，。；;\n]{2,36})"
+)
+_CLAIM_PATTERN = re.compile(
+    r"(?:我)?(?:希望|要求|请求|想要|诉求是)"
+    r"([^，。；;\n]{2,80})"
+)
+_PROCEDURE_PATTERN = re.compile(
+    r"[^，。；;\n]{0,24}(?:投诉|举报|报警|仲裁|起诉|联系|沟通|协商|"
+    r"申请|反馈|工单|处理)[^，。；;\n]{0,48}"
+)
+_PLATFORM_PATTERN = re.compile(
+    r"(?:在|通过)(闲鱼|淘宝|天猫|京东|拼多多|抖音|快手|微信|支付宝|"
+    r"小红书|美团|饿了么|携程|滴滴)(?:平台)?"
+)
+_EVENT_MARKERS = (
+    "未发", "没有发", "拒绝", "不退", "拖欠", "拉黑", "扣押", "扣款",
+    "损坏", "泄露", "解除", "辞退", "受伤", "碰撞", "逾期", "违约",
+    "约定", "支付", "付款", "转账", "签订", "交付", "维修", "拒收",
+)
+_UNKNOWN_MARKERS = ("不知道", "不清楚", "不能确定", "无法确认", "记不清")
+_DENIAL_MARKERS = (
+    "没有", "没留", "没保存", "未保存", "无此", "不存在", "找不到", "丢了",
+)
+
+
+def _stable_suffix(value: str, length: int = 10) -> str:
+    import hashlib
+
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
+
+
+def _update_identity(update: CaseFactUpdate) -> tuple[str, str]:
+    return update.key, " ".join(update.source_text.split())
+
+
+def _merge_case_updates(
+    values: list[CaseFactUpdate],
+) -> list[CaseFactUpdate]:
+    result: list[CaseFactUpdate] = []
+    seen: set[tuple[str, str]] = set()
+    for item in values:
+        identity = _update_identity(item)
+        if not item.source_text or identity in seen:
+            continue
+        seen.add(identity)
+        result.append(item)
+    return result[:40]
+
+
+def _update_dimension(update: CaseFactUpdate) -> str:
+    category = str(update.category or "").lower()
+    key = str(update.key or "").lower()
+    if category in {"actor", "relationship"}:
+        return "relationship"
+    for dimension in (
+        "evidence",
+        "procedure",
+        "claim",
+        "amount",
+        "time",
+        "location",
+        "harm",
+        "event",
+    ):
+        if category == dimension:
+            return dimension
+    if any(token in key for token in ("actor", "counterparty", "relationship")):
+        return "relationship"
+    if ".date" in key or "timeline" in key:
+        return "time"
+    return category or "event"
+
+
+def _compact_compare(value: str) -> str:
+    return re.sub(r"[\s，。；;、,:：()（）【】\[\]\"'“”‘’]+", "", value or "").lower()
+
+
+def _same_grounded_atom(
+    model_update: CaseFactUpdate,
+    fallback_update: CaseFactUpdate,
+) -> bool:
+    if model_update.key == fallback_update.key:
+        return True
+    if _update_dimension(model_update) != _update_dimension(fallback_update):
+        return False
+    model_values = {
+        _compact_compare(model_update.value),
+        _compact_compare(model_update.source_text),
+    } - {""}
+    fallback_values = {
+        _compact_compare(fallback_update.value),
+        _compact_compare(fallback_update.source_text),
+    } - {""}
+    return any(
+        left == right or left in right or right in left
+        for left in model_values
+        for right in fallback_values
+    )
+
+
+def _merge_model_and_fallback_updates(
+    model_updates: list[CaseFactUpdate],
+    fallback_updates: list[CaseFactUpdate],
+) -> list[CaseFactUpdate]:
+    """Let deterministic atoms fill extraction gaps without creating conflicts."""
+
+    merged = _merge_case_updates(model_updates)
+    for fallback in fallback_updates:
+        if any(_same_grounded_atom(item, fallback) for item in merged):
+            continue
+        if (
+            fallback.category == "event"
+            and any(
+                marker in fallback.source_text
+                for marker in ("付款", "支付", "转账")
+            )
+            and not any(
+                marker in fallback.source_text
+                for marker in (
+                    "未发", "没有发", "拒绝", "不退", "拖欠", "拉黑",
+                    "扣押", "扣款", "损坏", "泄露", "解除", "辞退",
+                    "受伤", "碰撞", "逾期", "违约", "拒收",
+                )
+            )
+            and any(
+                item.source_text
+                and item.source_text in fallback.source_text
+                and _update_dimension(item) in {"amount", "time", "location"}
+                for item in merged
+            )
+        ):
+            continue
+        merged.append(fallback)
+    return _merge_case_updates(merged)
+
+
+def _certainty_for_context(value: str) -> str:
+    if any(marker in value for marker in _UNKNOWN_MARKERS):
+        return "unknown"
+    if any(marker in value for marker in _DENIAL_MARKERS):
+        return "denied"
+    return "asserted"
+
+
+def _context_window(text: str, start: int, end: int, radius: int = 28) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    return " ".join(text[left:right].strip("，。；;\n ").split())
+
+
+def _evidence_context(text: str, start: int, end: int) -> str:
+    """Return the smallest exact clause that carries evidence availability."""
+
+    left = 0
+    right = len(text)
+    for marker in ("，", "。", "；", ";", "\n", "但是", "但", "不过", "然而"):
+        before = text.rfind(marker, 0, start)
+        if before >= 0:
+            left = max(left, before + len(marker))
+        after = text.find(marker, end)
+        if after >= 0:
+            right = min(right, after)
+    return " ".join(text[left:right].strip("，。；;\n ").split())
+
+
+def _deterministic_domain_and_issue(text: str) -> tuple[str, list[str]]:
+    compact = "".join((text or "").split())
+    profiles = (
+        (
+            "labor_social_security",
+            ("工资", "劳动合同", "公司辞退", "社保", "工伤", "加班费"),
+            "劳动关系及报酬争议",
+        ),
+        (
+            "consumer_market",
+            ("购买", "卖家", "商家", "退款", "订单", "商品", "消费者"),
+            "消费或网络交易履行争议",
+        ),
+        (
+            "contracts_property_housing",
+            ("租房", "房东", "押金", "借款", "欠款", "合同", "租赁"),
+            "合同、借贷或住房履行争议",
+        ),
+        (
+            "traffic_personal_injury",
+            ("交通事故", "撞车", "交警", "事故认定", "人身损害"),
+            "交通事故或人身损害争议",
+        ),
+        (
+            "family_vulnerable_groups",
+            ("离婚", "抚养", "赡养", "家暴", "监护", "夫妻"),
+            "婚姻家庭或弱势群体权益争议",
+        ),
+        (
+            "cyber_data_fraud",
+            ("诈骗", "盗号", "个人信息", "网络账户", "电信"),
+            "网络、数据或欺诈风险争议",
+        ),
+    )
+    for domain, markers, issue in profiles:
+        if any(marker in compact for marker in markers):
+            return domain, [issue]
+    return "other", []
+
+
+def _deterministic_case_updates(text: str) -> list[CaseFactUpdate]:
+    """Extract only high-precision, source-grounded atoms when the model is slow.
+
+    This is a reliability layer, not a second legal classifier. Every atom uses
+    a literal substring from the current message and remains a user statement.
+    """
+
+    source = " ".join(str(text or "").split()).strip()
+    if not source:
+        return []
+    updates: list[CaseFactUpdate] = []
+
+    for index, match in enumerate(_DATE_PATTERN.finditer(source), 1):
+        context = _context_window(source, match.start(), match.end())
+        payment = any(marker in context for marker in ("付款", "支付", "转账"))
+        key = (
+            f"transaction.payment.pay_{index:02d}.date"
+            if payment
+            else f"event.timeline.time_{index:02d}"
+        )
+        updates.append(CaseFactUpdate(
+            key=key,
+            category="time",
+            statement=f"关键时间为{match.group(0)}",
+            value=match.group(0),
+            certainty="asserted",
+            source_text=match.group(0),
+        ))
+
+    for index, match in enumerate(_AMOUNT_PATTERN.finditer(source), 1):
+        context = _context_window(source, match.start(), match.end())
+        payment = any(marker in context for marker in ("付款", "支付", "转账", "购买"))
+        loss = any(marker in context for marker in ("损失", "赔偿", "医疗费", "维修费"))
+        key = (
+            f"transaction.payment.pay_{index:02d}.amount"
+            if payment
+            else f"harm.loss.loss_{index:02d}.amount"
+            if loss
+            else f"transaction.amount.amount_{index:02d}"
+        )
+        updates.append(CaseFactUpdate(
+            key=key,
+            category="amount",
+            statement=f"涉及金额为{match.group(0)}",
+            value=match.group(0),
+            certainty="asserted",
+            source_text=match.group(0),
+        ))
+
+    for match in _PLATFORM_PATTERN.finditer(source):
+        platform = match.group(1)
+        updates.append(CaseFactUpdate(
+            key="location.platform",
+            category="location",
+            statement=f"事项通过{platform}平台发生或办理",
+            value=platform,
+            certainty="asserted",
+            source_text=match.group(0),
+        ))
+
+    for match in _RELATION_PATTERN.finditer(source):
+        relation = match.group(1).strip()
+        updates.append(CaseFactUpdate(
+            key="relationship.counterparty",
+            category="relationship",
+            statement=f"用户称双方关系或对方身份为{relation}",
+            value=relation,
+            certainty=_certainty_for_context(match.group(0)),
+            source_text=match.group(0),
+        ))
+
+    for match in _CLAIM_PATTERN.finditer(source):
+        claim = match.group(1).strip()
+        updates.append(CaseFactUpdate(
+            key="claim.primary_request",
+            category="claim",
+            statement=f"用户希望{claim}",
+            value=claim,
+            certainty=_certainty_for_context(match.group(0)),
+            source_text=match.group(0),
+        ))
+
+    for match in _PROCEDURE_PATTERN.finditer(source):
+        value = match.group(0).strip()
+        if not value:
+            continue
+        updates.append(CaseFactUpdate(
+            key=f"procedure.history.{_stable_suffix(value)}",
+            category="procedure",
+            statement=value,
+            value=value,
+            certainty=_certainty_for_context(value),
+            source_text=value,
+        ))
+
+    for match in _EVIDENCE_PATTERN.finditer(source):
+        name = match.group(0)
+        context = _evidence_context(source, match.start(), match.end())
+        updates.append(CaseFactUpdate(
+            key=f"evidence.{_stable_suffix(name)}",
+            category="evidence",
+            statement=f"用户提到{name}",
+            value=name,
+            certainty=_certainty_for_context(context),
+            source_text=context,
+        ))
+
+    clauses = [
+        value.strip()
+        for value in re.split(r"[，。；;\n]+", source)
+        if value.strip()
+    ]
+    for clause in clauses:
+        if not any(marker in clause for marker in _EVENT_MARKERS):
+            continue
+        updates.append(CaseFactUpdate(
+            key=f"event.core.{_stable_suffix(clause)}",
+            category="event",
+            statement=clause,
+            value=clause,
+            certainty=_certainty_for_context(clause),
+            source_text=clause,
+        ))
+
+    return _merge_case_updates(updates)
+
 
 def _parse_intake_sections(user_input: str) -> dict[str, str]:
     """Parse only the application-owned first-turn form contract."""
@@ -84,7 +429,8 @@ def _intake_case_updates(sections: dict[str, str]) -> list[CaseFactUpdate]:
             operation="add",
             source_text=value,
         ))
-    return updates
+    atoms = _deterministic_case_updates("\n".join(sections.values()))
+    return _merge_case_updates([*updates, *atoms])
 
 
 async def _extract_structured_intake(
@@ -139,13 +485,14 @@ async def _extract_structured_intake(
         )
         narrative = sections.get("事情经过", "")
         fallback = _deterministic_issue_fallback(narrative)
+        domain, issues = _deterministic_domain_and_issue(case_summary)
         return IssuesOutput(
             issues=(
                 list(fallback.issues)
                 if fallback
-                else ([narrative] if narrative else [])
+                else issues or ([narrative] if narrative else [])
             ),
-            domain=fallback.domain if fallback else "other",
+            domain=fallback.domain if fallback else domain,
             facts=facts,
             case_updates=updates,
             evidence_details=[],
@@ -227,6 +574,75 @@ async def extract_legal_issues(
                 degraded=True,
             )
         return IssuesOutput(issues=[], domain="other", degraded=True)
+
+
+async def extract_case_facts(
+    user_input: str,
+    llm: BaseChatModel,
+    *,
+    fallback_text: str = "",
+) -> IssuesOutput:
+    """Extract grounded case candidates without legal retrieval.
+
+    ``update_facts`` must not call the legacy three-layer issue normalizer:
+    Neo4j/Milvus matching belongs to later legal modelling. This helper keeps
+    the same structured schema for compatibility, but returns only candidates
+    grounded in the current user input.
+    """
+
+    structured_intake = await _extract_structured_intake(user_input, llm)
+    if structured_intake is not None:
+        return structured_intake
+    try:
+        prompt = _ISSUE_EXTRACT_FALLBACK_PROMPT.format(user_input=user_input)
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=1400),
+            [SystemMessage(content=prompt)],
+            timeout=get_settings().GUIDE_LLM_TIMEOUT_EXTRACT,
+            stage="case_fact_extraction",
+        )
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        data = json.loads(content)
+        deterministic = _deterministic_case_updates(
+            str(fallback_text or user_input or "")
+        )
+        model_updates = [
+            CaseFactUpdate.model_validate(item)
+            for item in data.get("case_updates", [])
+            if isinstance(item, dict)
+        ]
+        return IssuesOutput(
+            issues=[str(item).strip() for item in data.get("issues", []) if str(item).strip()],
+            domain=str(data.get("domain") or "other"),
+            facts=[str(item).strip() for item in data.get("facts", []) if str(item).strip()],
+            case_updates=_merge_model_and_fallback_updates(
+                model_updates,
+                deterministic,
+            ),
+            evidence_details=[
+                item for item in data.get("evidence_details", [])
+                if isinstance(item, dict)
+            ],
+            region=str(data.get("region") or "").strip(),
+            time_info=str(data.get("time_info") or "").strip(),
+        )
+    except Exception as exc:
+        logger.warning("事实候选提取失败，保留原文降级: {}", exc)
+        semantic_seed = " ".join(str(fallback_text or user_input or "").split()).strip()
+        domain, issues = _deterministic_domain_and_issue(semantic_seed)
+        updates = _deterministic_case_updates(semantic_seed)
+        return IssuesOutput(
+            issues=issues,
+            domain=domain,
+            facts=[
+                item.statement for item in updates
+            ] or ([semantic_seed] if semantic_seed else []),
+            case_updates=updates,
+            evidence_details=[],
+            degraded=True,
+        )
 
 
 # ── 第二层：Neo4j LegalConcept 精确匹配 ──────────────────────────────────────

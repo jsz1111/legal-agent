@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 import src.agents.legal_guide.graph as g
 from src.agents.legal_guide.state import GuideState, GuidePhase
 from src.agents.legal_guide.graph import (
-    node_check_urgency, node_extract_issues, node_prepare_turn, route_after_urgency,
+    node_check_urgency, node_update_facts, node_prepare_turn, route_after_urgency,
     URGENCY_CRITICAL_RESPONSE, GuideDeps,
 )
 from langgraph.graph import END
@@ -41,10 +41,12 @@ def test_check_urgency_runs_on_later_rounds():
     result = asyncio.run(node_check_urgency(state, deps))
     assert deps.llm.ainvoke.await_count == 1, "非首轮必须实际执行高危检测"
     assert result["urgency_level"] == "critical"
-    assert result["phase"] == GuidePhase.END
+    assert result["guard_status"] == "critical"
+    assert result["guard_pause_required"] is True
+    assert result["workflow_stage"] == "paused_for_safety"
     assert result["safety_pause_active"] is True
     assert result["safety_pause_case_message"] == "对方今天上门把我打伤了"
-    assert result["messages"][0].content == URGENCY_CRITICAL_RESPONSE
+    assert "110" in result["messages"][0].content
 
 
 def test_past_domestic_violence_with_explicit_current_safety_continues_guidance():
@@ -69,7 +71,8 @@ def test_current_danger_overrides_safety_phrase():
     result = asyncio.run(node_check_urgency(state, deps))
 
     assert result["urgency_level"] == "critical"
-    assert result["phase"] == GuidePhase.END
+    assert result["guard_pause_required"] is True
+    assert result["workflow_stage"] == "paused_for_safety"
 
 
 def test_later_evidence_detail_inherits_recent_explicit_safety():
@@ -157,7 +160,8 @@ def test_safety_pause_waits_for_clear_status_and_then_resumes_same_case():
         "safety_status": "unknown",
         "time_clue": "",
     })))
-    assert unknown["phase"] == GuidePhase.END
+    assert unknown["guard_status"] == "unknown"
+    assert unknown["guard_pause_required"] is True
     assert unknown["safety_pause_active"] is True
     assert "是否已经脱离现场" in unknown["messages"][0].content
 
@@ -172,10 +176,10 @@ def test_safety_pause_waits_for_clear_status_and_then_resumes_same_case():
     })))
     assert resumed["safety_pause_active"] is False
     assert resumed["current_safety_status"] == "safe"
-    assert resumed.get("phase") != GuidePhase.END
+    assert resumed["guard_pause_required"] is False
 
 
-def test_resumed_safety_case_extracts_the_original_event_and_clears_pause_message():
+def test_resumed_safety_case_keeps_the_original_event_and_clears_pause_message():
     state = GuideState(
         round=2,
         safety_pause_active=False,
@@ -183,25 +187,31 @@ def test_resumed_safety_case_extracts_the_original_event_and_clears_pause_messag
         current_safety_status="safe",
         messages=[HumanMessage(content="我已经到朋友家，现在安全了")],
     )
-    normalizer = AsyncMock(return_value={
-        "standard": ["人身安全威胁"],
-        "colloquial": [],
-        "domain": "criminal_public_security",
-        "term_map": {},
-        "collected_facts": ["对方拿刀堵在门外", "用户现在安全"],
-        "case_updates": [],
-        "region": "",
-        "time_info": "",
-    })
+    from src.agents.legal_guide.issue_normalizer import IssuesOutput
+    extractor = AsyncMock(return_value=IssuesOutput(
+        issues=["人身安全威胁"],
+        domain="criminal_public_security",
+        facts=["对方拿刀堵在门外", "用户现在安全"],
+        case_updates=[{
+            "key": "safety.current_status",
+            "category": "event",
+            "statement": "用户现在安全",
+            "value": "安全",
+            "source_text": "我已经到朋友家，现在安全了",
+        }],
+        evidence_details=[],
+        region="",
+        time_info="",
+    ))
     deps = MagicMock()
 
     with patch(
-        "src.agents.legal_guide.graph.normalize_legal_issues",
-        new=normalizer,
+        "src.agents.legal_guide.update_facts.extract_case_facts",
+        new=extractor,
     ):
-        updates = asyncio.run(node_extract_issues(state, deps))
+        updates = asyncio.run(node_update_facts(state, deps))
 
-    submitted = normalizer.await_args.kwargs["user_input"]
+    submitted = extractor.await_args.args[0]
     assert "对方拿刀堵在门外" in submitted
     assert "我已经到朋友家，现在安全了" in submitted
     assert updates["safety_pause_case_message"] == ""

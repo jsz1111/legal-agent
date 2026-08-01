@@ -132,6 +132,12 @@ async def _fake_parse(state: GuideState, deps: GuideDeps) -> dict:
     }
 
 
+async def _fake_update_facts(state: GuideState, deps: GuideDeps) -> dict:
+    if state.pending_ask_details:
+        return await _fake_parse(state, deps)
+    return await _fake_extract(state, deps)
+
+
 async def _fake_conclude(state: GuideState, deps: GuideDeps) -> dict:
     reply = (
         "**【法律依据】** RETRIEVED_LAW\n"
@@ -147,7 +153,11 @@ def _scripted_graph():
     patchers = [
         patch.object(guide_graph, "node_load_context", new=AsyncMock(return_value={})),
         patch.object(guide_graph, "node_check_urgency", new=AsyncMock(side_effect=_fake_urgency)),
-        patch.object(guide_graph, "node_extract_issues", new=AsyncMock(side_effect=_fake_extract)),
+        patch.object(
+            guide_graph,
+            "node_update_facts",
+            new=AsyncMock(side_effect=_fake_update_facts),
+        ),
         patch.object(guide_graph, "node_clarify", new=AsyncMock(side_effect=_fake_clarify)),
         patch.object(guide_graph, "node_assess_retrieve", new=AsyncMock(side_effect=_fake_assess)),
         patch.object(guide_graph, "node_ask_followup", new=AsyncMock(side_effect=_fake_ask)),

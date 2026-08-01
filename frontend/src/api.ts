@@ -4,7 +4,143 @@ export const API_BASE =
 
 export type DebugInfo = {
   case_id?: string
+  case_generation?: number
   case_boundary_status?: string
+  workflow_stage?: string
+  state_version?: number
+  event_sequence?: number
+  input_event_type?: string
+  requested_route?: string
+  guard_status?: 'clear' | 'warning' | 'urgent' | 'critical' | 'unknown' | string
+  guard_report?: {
+    guard_status?: string
+    guard_checked_at?: string
+    current_safety_status?: string
+    pause_required?: boolean
+    next_route?: string
+    user_notice_markdown?: string
+    risks?: Array<{
+      risk_id?: string
+      risk_type?: string
+      level?: string
+      status?: string
+      trigger?: string
+      missing_conditions?: string[]
+    }>
+    immediate_actions?: Array<{
+      action_id?: string
+      risk_id?: string
+      priority?: number
+      action?: string
+      time_window?: string
+    }>
+  } | null
+  fact_blackboard_version?: number
+  fact_snapshot_version?: number
+  fact_change_count?: number
+  fact_conflict_count?: number
+  evidence_name_inventory_version?: number
+  decision_status?: string
+  next_route?: string
+  fact_sufficiency?: Record<string, unknown>
+  question_batch?: {
+    batch_id?: string
+    fact_blackboard_version?: number
+    markdown?: string
+    questions?: Array<{
+      question_id?: string
+      decision_key?: string
+      question_type?: string
+      topic?: string
+      prompt?: string
+      answer_hint?: string
+      decision_effects?: string[]
+    }>
+  }
+  fact_snapshot_draft?: {
+    fact_snapshot_draft_id?: string
+    based_on_fact_blackboard_version?: number
+    status?: string
+    stale?: boolean
+    markdown?: string
+    unknown_fact_ids?: string[]
+    conflict_group_ids?: string[]
+  } | null
+  pause_state?: Record<string, unknown> | null
+  internal_evidence_requirements?: Array<Record<string, unknown>>
+  evidence_requirement_changes?: Array<Record<string, unknown>>
+  legal_model?: Record<string, unknown>
+  legal_model_version?: number
+  legal_model_status?: string
+  relation_candidates?: Array<Record<string, unknown>>
+  request_models?: Array<Record<string, unknown>>
+  plan_retrieval_trace?: Record<string, unknown>
+  plan_retrieval_gaps?: string[]
+  proof_targets?: Array<Record<string, unknown>>
+  formal_evidence_requirements?: Array<Record<string, unknown>>
+  evidence_name_links?: Array<Record<string, unknown>>
+  delivery_entries?: Array<Record<string, unknown>>
+  plan_basis_refs?: Array<Record<string, unknown>>
+  plan_basis_limitations?: string[]
+  plan_change_summary?: string
+  plan_audit_id?: string
+  evidence_plan_request_id?: string
+  previous_evidence_plan_version?: number
+  evidence_plan_status?: string
+  stale_dependencies?: string[]
+  evidence_plan_version?: number
+  evidence_collection_status?: string
+  evidence_batch_id?: string
+  evidence_batch_version?: number
+  evidence_review_version?: number
+  evidence_review_id?: string
+  evidence_review_status?: string
+  evidence_reviewed_at?: string
+  evidence_observations?: Array<Record<string, unknown>>
+  evidence_basis_refs?: Array<Record<string, unknown>>
+  evidence_basis_missing?: string[]
+  pending_evidence_verification?: Array<Record<string, unknown>>
+  verification_round_count?: number
+  new_fact_candidates_from_evidence?: Array<Record<string, unknown>>
+  content_conflicts?: Array<Record<string, unknown>>
+  quality_gaps?: string[]
+  unclassified_materials?: Array<Record<string, unknown>>
+  assessment_change_summary?: Record<string, unknown>
+  evidence_review_report?: Record<string, unknown>
+  solution_draft?: Record<string, unknown>
+  solution_draft_status?: string
+  solution_generation_id?: string
+  solution_generated_at?: string
+  plan_version_candidate?: string
+  solution_based_on_fact_snapshot_version?: number
+  solution_based_on_legal_model_version?: number
+  solution_based_on_evidence_plan_version?: number
+  solution_based_on_evidence_review_version?: number
+  likelihood_assessment?: Record<string, unknown>
+  likelihood_tier?: string
+  likelihood_change?: string
+  solution_change_summary?: Record<string, unknown>
+  recommended_routes?: Array<Record<string, unknown>>
+  alternative_routes?: Array<Record<string, unknown>>
+  immediate_actions?: Array<Record<string, unknown>>
+  case_tasks?: Array<Record<string, unknown>>
+  document_suggestions?: Array<Record<string, unknown>>
+  action_basis_refs?: Array<Record<string, unknown>>
+  action_basis_gaps?: string[]
+  conditional_plan?: boolean
+  pending_solution_audit?: boolean
+  solution_audit_status?: string
+  solution_audit_id?: string
+  solution_reviewed_at?: string
+  solution_audit_report?: Record<string, unknown>
+  published_solution?: Record<string, unknown>
+  plan_version?: number
+  previous_plan_version?: number
+  plan_published_at?: string
+  solution_version_summaries?: Array<Record<string, unknown>>
+  solution_persistence_status?: string
+  decision_trace_id?: string
+  retrieval_summary?: Record<string, unknown>
   domain?: string
   confidence_tier?: string
   statute_hits?: string
@@ -133,10 +269,31 @@ export type DeleteConversationResponse = {
   warnings?: string[]
 }
 
-type ChatRequest = {
+export type ChatRequest = {
   user_id: string
   session_id: string
   message: string
+  case_id?: string
+  request_id?: string
+  idempotency_key?: string
+  message_id?: string
+  base_case_generation?: number
+  base_state_version?: number
+  base_fact_snapshot_version?: number
+  base_evidence_plan_version?: number
+  frontend_mode?: 'case' | 'qa'
+  event_hint?: string
+  attachments?: Array<{
+    material_id?: string
+    file_name?: string
+    file_type?: string
+    sha256?: string
+    upload_status?: string
+    evidence_requirement_id?: string
+    evidence_batch_id?: string
+  }>
+  form_updates?: Array<Record<string, unknown>>
+  control_action?: string
 }
 
 export async function getHealth(): Promise<HealthResponse> {

@@ -1,6 +1,8 @@
 """法律指引 Agent 的 PostgreSQL 查询：用户上下文 + 咨询记录保存。"""
 from __future__ import annotations
 
+import json
+
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -162,4 +164,97 @@ async def save_guide_record(
         return None
     finally:
         if _own_session:
+            await db.close()
+
+
+async def save_solution_version(
+    user_id: str | None,
+    session_id: str,
+    domain: str,
+    issues: list[str],
+    version_record: dict,
+    version_history: list[dict],
+    db: AsyncSession | None = None,
+) -> dict:
+    """Upsert the formal plan bundle into the consultation index.
+
+    The complete, append-only version history remains part of the long-lived
+    GuideState.  For database-backed users this function mirrors the same
+    history into ``consultations.action_plan`` so the published output remains
+    queryable after a process restart.  Non-database public IDs still retain
+    the version through the permanent case-state store.
+    """
+
+    plan_version = int(version_record.get("plan_version") or 0)
+    if not user_id or not str(user_id).isdigit():
+        logger.debug(
+            "user_id '{}' 非数字型，正式方案仅保存到长期案件状态",
+            user_id,
+        )
+        return {
+            "status": "case_state_only",
+            "consultation_id": None,
+            "plan_version": plan_version,
+        }
+
+    from src.infra.database import AsyncSessionLocal
+    from src.modules.legal.model import Consultation
+
+    own_session = db is None
+    if own_session:
+        db = AsyncSessionLocal()
+    try:
+        result = await db.execute(
+            select(Consultation)
+            .where(
+                Consultation.user_id == int(user_id),
+                Consultation.session_id == session_id,
+            )
+            .order_by(desc(Consultation.id))
+            .limit(1)
+        )
+        record = result.scalars().first()
+        if record is None:
+            record = Consultation(
+                user_id=int(user_id),
+                session_id=session_id,
+                urgency_level="normal",
+            )
+            db.add(record)
+
+        solution = version_record.get("solution") or {}
+        record.issue_description = (
+            f"[{domain}] " + "；".join(str(item) for item in issues[:5])
+        )
+        record.legal_advice = str(
+            solution.get("published_markdown") or ""
+        )
+        record.action_plan = json.dumps(
+            {
+                "schema_version": "legal-guide-plan-history.v1",
+                "case_id": version_record.get("case_id"),
+                "case_generation": version_record.get("case_generation"),
+                "current_plan_version": plan_version,
+                "versions": version_history,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        await db.commit()
+        await db.refresh(record)
+        logger.info(
+            "正式方案版本保存成功 | consultation={} plan_version={}",
+            record.id,
+            plan_version,
+        )
+        return {
+            "status": "database_and_case_state",
+            "consultation_id": record.id,
+            "plan_version": plan_version,
+        }
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        if own_session:
             await db.close()

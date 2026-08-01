@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import re
+import uuid
 from difflib import SequenceMatcher
 from loguru import logger
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -16,6 +17,23 @@ from src.infra.milvus_client import get_milvus_client_alias
 from src.infra.neo4j_client import get_neo4j_driver
 from src.core.config import get_settings
 from src.agents.legal_guide.state import GuideState, GuidePhase
+from src.agents.legal_guide.case_lifecycle import boundary_confirmation_reply
+from src.agents.legal_guide.prepare_case import (
+    classify_input_events,
+    derive_workflow_stage,
+    determine_requested_route,
+    latest_user_input,
+    resolve_control_intent,
+    restore_pause_state,
+    split_mixed_payload,
+)
+from src.agents.legal_guide.guard_case import run_guard_case
+from src.agents.legal_guide.update_facts import run_update_facts
+from src.agents.legal_guide.decide_facts import run_decide_facts
+from src.agents.legal_guide.plan_evidence import run_plan_evidence
+from src.agents.legal_guide.assess_evidence import run_assess_evidence
+from src.agents.legal_guide.generate_solution import run_generate_solution
+from src.agents.legal_guide.audit_and_save import run_audit_and_save
 from src.agents.legal_guide.issue_normalizer import normalize_legal_issues
 from src.agents.legal_guide.neo4j_queries import query_laws_and_channels
 from src.agents.legal_guide.convergence import should_conclude
@@ -76,7 +94,7 @@ from src.agents.legal_guide.followup_catalog import (
     get_domain_followups,
 )
 from src.agents.legal_guide.prompts import (
-    URGENCY_CHECK_PROMPT, CLARIFY_PROMPT,
+    CLARIFY_PROMPT,
     PARSE_DETAILS_PROMPT, CONCLUDE_PROMPT, PLAN_AUDIT_PROMPT, SELF_REVIEW_PROMPT,
     COUNTER_QUESTION_RESPONSE_PROMPT,
     DOC_TYPE_MAP,
@@ -324,10 +342,14 @@ async def node_load_context(state: GuideState, deps: GuideDeps) -> dict:
     return {"user_context": merged_context, "region": region or state.region}
 
 
-async def node_prepare_turn(state: GuideState, deps: GuideDeps) -> dict:
-    """节点①：首轮加载历史上下文，并且只在这里推进用户轮次。"""
+async def node_prepare_case(state: GuideState, deps: GuideDeps) -> dict:
+    """节点①：恢复本轮入口状态、拆分输入事件，并且只在这里推进版本。
+
+    案件事实原子化、法律检索、证据评估和方案生成都不属于本节点。旧
+    ``node_prepare_turn`` 名称在模块末尾保留为兼容别名。
+    """
     context_updates = await node_load_context(state, deps)
-    last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
+    last_msg = latest_user_input(state)
     conclude_phrases = (
         "不要再问", "别再问", "不用再问", "给方案", "给我方案", "给出方案",
         "生成方案", "现在生成方案", "按现有信息", "按现在这些", "最终建议", "最终方案", "请收敛",
@@ -337,7 +359,11 @@ async def node_prepare_turn(state: GuideState, deps: GuideDeps) -> dict:
     supplement_has_details = _current_turn_contains_case_details(state, last_msg)
     awaiting_supplement_choice = state.awaiting_supplement_choice
     allow_extra_followups = state.allow_extra_followups
-    semantic_control = state.turn_control_intent
+    semantic_control = resolve_control_intent(
+        last_msg,
+        state.turn_control_intent,
+        str(state.control_payload.get("explicit_action") or ""),
+    )
     wants_conclude = (
         state.wants_conclude
         or semantic_control == "conclude_now"
@@ -366,11 +392,104 @@ async def node_prepare_turn(state: GuideState, deps: GuideDeps) -> dict:
         # 旧版本持久化过这个菜单状态。新流程收到下一条消息后立即退出该状态，
         # 再由动态规划器选择一个明确缺口或直接生成方案。
         awaiting_supplement_choice = False
+
+    payloads = split_mixed_payload(
+        last_msg,
+        attachments=state.current_attachments,
+        form_updates=state.current_form_updates,
+        control_intent=semantic_control,
+        message_id=state.current_message_id,
+    )
+    is_first_turn = state.round == 0 and state.event_sequence == 0
+    input_event_type, input_events = classify_input_events(
+        state,
+        last_msg,
+        payloads,
+        control_intent=semantic_control,
+        is_first_turn=is_first_turn,
+    )
+    if state.event_hint == "case_boundary_answered":
+        if not any(item.get("type") == "case_boundary_answered" for item in input_events):
+            input_events = [
+                {"type": "case_boundary_answered", "payload_ref": "control_payload"},
+                *input_events,
+            ]
+        if len(input_events) > 1:
+            input_event_type = "mixed_update"
+        else:
+            input_event_type = "case_boundary_answered"
+
+    pause_state = restore_pause_state(state)
+    workflow_stage = derive_workflow_stage(state, pause_state)
+    requested_route, route_after_guard = determine_requested_route(
+        state,
+        input_event_type,
+        input_events,
+    )
+    event_types = {item.get("type", "") for item in input_events}
+    snapshot_confirmation = "fact_snapshot_confirmed" in event_types
+    snapshot_draft = state.fact_snapshot_draft or {}
+    snapshot_version_valid = (
+        bool(snapshot_draft)
+        and int(snapshot_draft.get("based_on_fact_blackboard_version", -1))
+        == int(state.fact_blackboard_version or 0)
+    )
+    if snapshot_confirmation and not snapshot_version_valid:
+        # A stale snapshot cannot be confirmed. Re-enter node four so the
+        # current fact blackboard receives a fresh draft.
+        requested_route = "decide_facts"
+        route_after_guard = ["decide_facts"]
+    contains_case_details = bool(
+        event_types
+        & {
+            "fact_added",
+            "fact_corrected",
+            "fact_denied",
+            "fact_batch_answered",
+            "case_progress_updated",
+            "evidence_named",
+        }
+    )
     total_rounds = state.total_rounds + 1
     return {
         **context_updates,
         "round": state.round + 1,
         "total_rounds": total_rounds,
+        "state_version": state.state_version + 1,
+        "event_sequence": state.event_sequence + 1,
+        "workflow_stage": workflow_stage,
+        "input_event_type": input_event_type,
+        "input_events": input_events,
+        **payloads,
+        "pause_state": pause_state,
+        "requested_route": requested_route,
+        "route_after_guard": route_after_guard,
+        "fact_snapshot_confirmed": (
+            True if snapshot_confirmation and snapshot_version_valid
+            else state.fact_snapshot_confirmed
+        ),
+        "fact_snapshot_version": (
+            state.fact_snapshot_version + 1
+            if snapshot_confirmation and snapshot_version_valid
+            else state.fact_snapshot_version
+        ),
+        "document_request_ready": False,
+        "event_hint": "",
+        "last_processed_request_id": (
+            state.current_request_id or state.last_processed_request_id
+        ),
+        "last_processed_message_id": (
+            state.current_message_id or state.last_processed_message_id
+        ),
+        "last_processed_idempotency_key": (
+            state.current_idempotency_key or state.last_processed_idempotency_key
+        ),
+        "turn_control_intent": semantic_control,
+        "turn_contains_case_details": (
+            state.turn_contains_case_details
+            if state.turn_control_intent
+            else contains_case_details
+        ),
         "wants_conclude": wants_conclude,
         "force_conclude": state.force_conclude or total_rounds >= settings.GUIDE_MAX_TOTAL_ROUNDS,
         "awaiting_supplement_choice": awaiting_supplement_choice,
@@ -380,164 +499,130 @@ async def node_prepare_turn(state: GuideState, deps: GuideDeps) -> dict:
     }
 
 
-async def node_check_urgency(state: GuideState, deps: GuideDeps) -> dict:
-    """节点②：三级紧急分类（每一轮都执行）。CRITICAL → 立即给援助信息+END。
+# Backward-compatible public name for older imports and persisted integration tests.
+node_prepare_turn = node_prepare_case
 
-    关键安全设计：不能只在首轮检测。用户可能在多轮对话中途才追加高危案情
-    （例：先聊租房纠纷，几轮后才说"对方上门殴打我"），因此每轮都必须重跑。
-    """
-    last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
-    if not last_msg:
-        return {}
-    logger.info("节点②紧急检测 | session={} round={}", state.session_id, state.round)
-    recent_human_messages = [
-        str(message.content).strip()
-        for message in state.messages
-        if isinstance(message, HumanMessage) and str(message.content).strip()
-    ][-4:]
-    recent_dialogue = "\n".join(
-        f"- 第{index + 1}条：{message}"
-        for index, message in enumerate(recent_human_messages)
-    )
-    explicitly_safe = any(
-        marker in "\n".join(recent_human_messages)
-        for marker in (
-            "今天暂时安全", "现在暂时安全", "目前暂时安全", "现在安全",
-            "目前安全", "已经安全", "没有安全危险", "现在没有危险",
-            "目前没有危险", "已经离开现场", "现在不在现场",
-        )
-    )
-    deterministic_current_danger = any(
-        marker in last_msg
-        for marker in (
-            "现在有危险", "目前有危险", "正在打", "正在施暴", "正在追",
-            "拿刀", "持刀", "要杀", "赶过来", "马上过来", "被困",
-            "不让我走", "无法离开", "就在门外",
-        )
-    )
-    # 高精度现实危险信号先于模型处理，避免模型超时让安全熔断失效。
-    if deterministic_current_danger and not explicitly_safe:
-        logger.warning("节点②确定性检测到当前危险，立即触发安全中断")
-        return {
-            "urgency_level": "critical",
-            "safety_relevant": True,
-            "current_safety_status": "danger",
-            "safety_pause_active": True,
-            "safety_pause_case_message": state.safety_pause_case_message or last_msg,
-            "phase": GuidePhase.END,
-            "messages": [AIMessage(content=URGENCY_CRITICAL_RESPONSE)],
-        }
-    prompt = URGENCY_CHECK_PROMPT.format(
-        user_input=last_msg,
-        recent_dialogue=recent_dialogue or f"- {last_msg}",
-    )
-    try:
-        response = await ainvoke_bounded(
-            llm_for_stage(deps.llm, max_tokens=500),
-            [SystemMessage(content=prompt)],
-            timeout=settings.GUIDE_LLM_TIMEOUT_URGENCY,
-            stage="urgency_check",
-        )
-        content = response.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].lstrip("json").strip()
-        result = json.loads(content)
-        urgency = result.get("urgency", "NORMAL")
-        time_clue = result.get("time_clue", "")
-        allowed_safety_statuses = {"danger", "safe", "unknown", "not_applicable"}
-        model_safety_status = str(result.get("safety_status") or "").lower()
-        safety_relevant = bool(result.get("safety_relevant"))
-        safety_contract_present = (
-            "safety_relevant" in result or "safety_status" in result
-        )
-        if deterministic_current_danger:
-            urgency = "CRITICAL"
-            safety_relevant = True
-            safety_status = "danger"
-        elif explicitly_safe:
-            safety_relevant = True
-            safety_status = "safe"
-        elif urgency == "CRITICAL" and not safety_contract_present:
-            # Backward-compatible fail-safe for an older/malformed model reply.
-            safety_relevant = True
-            safety_status = "danger"
-        elif safety_relevant:
-            safety_status = (
-                model_safety_status
-                if model_safety_status in allowed_safety_statuses - {"not_applicable"}
-                and (model_safety_status != "safe" or state.safety_pause_active)
-                else "unknown"
-            )
-        else:
-            safety_status = "not_applicable"
-        current_danger = safety_status == "danger"
-        if state.safety_pause_active and safety_status == "safe":
-            logger.info("现实危险已经解除，恢复同一案件的普通法律梳理")
-            return {
-                "urgency_level": "normal",
-                "safety_relevant": True,
-                "current_safety_status": "safe",
-                "safety_pause_active": False,
-            }
-        if urgency == "CRITICAL" and not current_danger and explicitly_safe:
-            logger.info("近期已明确当前安全且没有新增危险，继续法律梳理而不触发紧急终止")
-            return {
-                "urgency_level": "normal",
-                "safety_relevant": safety_relevant,
-                "current_safety_status": safety_status,
-            }
-        if urgency == "CRITICAL" and not current_danger:
-            logger.info("涉及人身安全但当前危险未确认，转入单问题安全确认")
-            return {
-                "urgency_level": "normal",
-                "safety_relevant": safety_relevant,
-                "current_safety_status": safety_status,
-            }
-        if urgency == "CRITICAL" and current_danger:
-            logger.warning("节点②检测到CRITICAL紧急情形")
-            return {
-                "urgency_level": "critical",
-                "safety_relevant": True,
-                "current_safety_status": "danger",
-                "safety_pause_active": True,
-                "safety_pause_case_message": state.safety_pause_case_message or last_msg,
-                "phase": GuidePhase.END,
-                "messages": [AIMessage(content=URGENCY_CRITICAL_RESPONSE)],
-            }
-        if state.safety_pause_active:
-            logger.info("现实危险是否解除仍不明确，保持安全中断")
-            return {
-                "urgency_level": "critical",
-                "safety_relevant": True,
-                "current_safety_status": "unknown",
-                "safety_pause_active": True,
-                "phase": GuidePhase.END,
-                "messages": [AIMessage(content=URGENCY_SAFETY_CHECK_RESPONSE)],
-            }
-        if urgency == "TIME" and time_clue:
-            warning = f'\n⚠️ **时效提醒**：您提到"{time_clue}"，请注意维权时效（劳动仲裁1年、一般民事3年），建议尽快行动。'
-            logger.info("节点②检测到时效紧迫: {}", time_clue)
-            return {
-                "urgency_level": "time",
-                "safety_relevant": safety_relevant,
-                "current_safety_status": safety_status,
-                "time_warning": warning,
-            }
-        return {
-            "urgency_level": "normal",
-            "safety_relevant": safety_relevant,
-            "current_safety_status": safety_status,
-        }
-    except Exception as e:
-        logger.warning(f"紧急检测解析失败: {e}")
+
+async def node_pause_case_boundary(state: GuideState, deps: GuideDeps) -> dict:
+    """Pause after read-only risk review without writing the pending text as fact."""
+
     return {
-        "urgency_level": "normal",
-        "safety_relevant": state.safety_relevant,
-        "current_safety_status": state.current_safety_status,
+        "messages": [AIMessage(content=boundary_confirmation_reply(state))],
+        "workflow_stage": "case_boundary",
+        "pause_state": {"type": "awaiting_case_boundary"},
+        "requested_route": "await_case_boundary",
+        "route_after_guard": [],
+        "case_boundary_read_only": False,
+        "current_message_text": "",
     }
 
 
-async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
+async def node_handoff_document(state: GuideState, deps: GuideDeps) -> dict:
+    """Finish the guarded graph turn so the API document service can run."""
+
+    return {
+        "document_request_ready": True,
+        "workflow_stage": "document_generation",
+        "pause_state": None,
+        "current_message_text": "",
+    }
+
+
+async def node_guard_case(state: GuideState, deps: GuideDeps) -> dict:
+    """节点②：每轮统一检查安全、期限、证据、财产和不当行为风险。"""
+
+    logger.info(
+        "节点②风险闸门 | session={} round={} event={}",
+        state.session_id,
+        state.round,
+        state.input_event_type,
+    )
+    return await run_guard_case(state, deps)
+
+
+# Backward-compatible import name. The compiled graph uses ``guard_case``.
+node_check_urgency = node_guard_case
+
+
+async def node_update_facts(state: GuideState, deps: GuideDeps) -> dict:
+    """节点③：归约本轮事实并输出可持久化的动态事实黑板。"""
+
+    logger.info(
+        "节点③动态事实更新 | case={} round={} event={}",
+        state.case_id,
+        state.round,
+        state.input_event_type,
+    )
+    return await run_update_facts(state, deps)
+
+
+async def node_decide_facts(state: GuideState, deps: GuideDeps) -> dict:
+    """节点④：读取事实黑板，批量追问或生成事实快照。"""
+
+    logger.info(
+        "节点④事实决策 | case={} round={} fact_version={}",
+        state.case_id,
+        state.round,
+        state.fact_blackboard_version,
+    )
+    return await run_decide_facts(state, deps)
+
+
+async def node_plan_evidence(state: GuideState, deps: GuideDeps) -> dict:
+    """节点⑤：基于事实快照建立法律模型和正式证据清单。"""
+
+    logger.info(
+        "节点⑤证据规划 | case={} snapshot={} fact_version={}",
+        state.case_id,
+        state.fact_snapshot_version,
+        state.fact_blackboard_version,
+    )
+    return await run_plan_evidence(state, deps)
+
+
+async def node_assess_evidence(state: GuideState, deps: GuideDeps) -> dict:
+    """节点⑥：评估本批材料并汇总证明目标覆盖。"""
+
+    logger.info(
+        "节点⑥证据评估 | case={} plan={} batch={} complete={}",
+        state.case_id,
+        state.evidence_plan_version,
+        state.evidence_batch_id,
+        state.evidence_batch_completed,
+    )
+    return await run_assess_evidence(state, deps)
+
+
+async def node_generate_solution(state: GuideState, deps: GuideDeps) -> dict:
+    """节点⑦：生成绑定事实、法律和证据版本的行动方案草稿。"""
+
+    logger.info(
+        "节点⑦方案生成 | case={} facts={} legal={} evidence_plan={} review={}",
+        state.case_id,
+        state.fact_snapshot_version,
+        state.legal_model_version,
+        state.evidence_plan_version,
+        state.evidence_review_version,
+    )
+    return await run_generate_solution(state, deps)
+
+
+async def node_audit_and_save(state: GuideState, deps: GuideDeps) -> dict:
+    """节点⑧：审校、发布并保存绑定上游版本的正式行动方案。"""
+
+    logger.info(
+        "节点⑧审校保存 | case={} candidate={} facts={} legal={} plan={} review={}",
+        state.case_id,
+        state.plan_version_candidate,
+        state.solution_based_on_fact_snapshot_version,
+        state.solution_based_on_legal_model_version,
+        state.solution_based_on_evidence_plan_version,
+        state.solution_based_on_evidence_review_version,
+    )
+    return await run_audit_and_save(state, deps)
+
+
+async def _legacy_node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
     """节点③：标准化法律问题，并把当前消息归入通用原子案情。"""
     human_msgs = [m.content for m in state.messages if isinstance(m, HumanMessage)]
     if not human_msgs:
@@ -759,6 +844,11 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
         updates["phase"] = GuidePhase.CLARIFY
 
     return updates
+
+
+# 渐进迁移兼容入口：旧节点实现先保留用于历史案件、测试和行为对照；
+# 正式 GuideGraph 已切换到 ``update_facts``，待新节点完全覆盖后再删除。
+node_extract_issues = _legacy_node_extract_issues
 
 
 async def node_clarify(state: GuideState, deps: GuideDeps) -> dict:
@@ -2810,6 +2900,46 @@ def _deterministic_conclusion_draft(state: GuideState) -> str:
 async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
     """节点⑧：生成五段式行动方案（理解+法条+类案+路径+行动清单）。"""
     logger.info("节点⑧生成结论 | domain={} tier={}", state.legal_domain, state.confidence_tier)
+    # 正式节点七已经生成结构化草稿时，旧 conclude 只承担兼容呈现。
+    # 正式事实/法律/证据审校和原子保存仍留给后续 audit_and_save 迁移。
+    formal_draft = str(getattr(state, "solution_draft_markdown", "") or "").strip()
+    if (
+        formal_draft
+        and str(getattr(state, "solution_draft_status", "") or "")
+        in {"awaiting_audit", "compatibility_presented"}
+    ):
+        final_reply = _sanitize_statute_citations(
+            formal_draft,
+            state.law_context_str,
+        )
+        final_reply = _sanitize_unverified_evidence_assertions(
+            final_reply,
+            state.evidence_unverified,
+        )
+        final_reply = _sanitize_forced_followups(final_reply)
+        if state.retrieval_error_note:
+            final_reply += state.retrieval_error_note
+        if (
+            state.confirmed_issues
+            or (state.legal_domain and state.legal_domain != "other")
+        ) and "需要参考文书？" not in final_reply:
+            doc_type = DOC_TYPE_MAP.get(
+                state.legal_domain,
+                "投诉信/申请书",
+            )
+            final_reply += (
+                "\n\n---\n📄 **需要生成参考文书？** "
+                f"如需生成{doc_type}草稿，请回复「生成文书」。"
+            )
+        final_reply = _ensure_post_conclusion_options(final_reply, state)
+        return {
+            "phase": GuidePhase.CONCLUDE,
+            "workflow_stage": "solution_ready",
+            "decision_status": "solution_draft_compatibility_presented",
+            "solution_draft_status": "compatibility_presented",
+            "pending_solution_audit": True,
+            "messages": [AIMessage(content=final_reply)],
+        }
     domain = state.legal_domain
     accessible_mode = _uses_accessible_language(state)
     compact_mode = accessible_mode or state.force_conclude or state.wants_conclude
@@ -3090,17 +3220,34 @@ def _needs_clarify(state: GuideState) -> bool:
     return state.clarify_rounds < settings.GUIDE_MAX_CLARIFY_ROUNDS
 
 
-def route_after_urgency(state: GuideState) -> str:
-    """高危直接熔断；等待追问回答时先解析，否则提取法律问题。"""
+def route_after_guard(state: GuideState) -> str:
+    """暂停类风险结束本轮；其余事件继续节点一确定的处理路径。"""
+    if state.guard_pause_required or state.safety_pause_active:
+        return END
+    if state.awaiting_case_boundary:
+        return "pause_case_boundary"
+    if state.requested_route == "document_service":
+        return "handoff_document"
     if state.phase == GuidePhase.END:
         return END
     if state.awaiting_supplement_choice and not state.supplement_choice:
         return "ask_followup"
     if state.supplement_choice in {"continue", "conclude"}:
         if state.supplement_has_details:
-            return "parse_details" if state.pending_ask_details else "extract_issues"
+            return "update_facts"
         return "assess_retrieve"
-    if state.pending_ask_details:
+    # A factual answer must always be reduced before any legacy follow-up,
+    # retrieval, or conclusion route is considered. A pure counter-question is
+    # intentionally left on the compatibility path so it cannot become a fact.
+    if (
+        state.pending_ask_details
+        and not state.turn_contains_case_details
+        and state.requested_route not in {"update_facts", ""}
+    ):
+        return "parse_details"
+    if state.requested_route == "update_facts":
+        return "update_facts"
+    if state.pending_ask_details and not state.turn_contains_case_details:
         return "parse_details"
     if (
         state.wants_conclude
@@ -3116,14 +3263,49 @@ def route_after_urgency(state: GuideState) -> str:
         )
     ):
         return "assess_retrieve"
-    return "extract_issues"
+    return "update_facts"
 
 
-def route_after_extract(state: GuideState) -> str:
-    """完全无法识别时澄清；其余情况均进入评分与检索。"""
+def route_after_urgency(state: GuideState) -> str:
+    """Legacy route spelling; the compiled graph uses ``route_after_guard``."""
+
+    target = route_after_guard(state)
+    return "extract_issues" if target == "update_facts" else target
+
+
+def route_after_update_facts(state: GuideState) -> str:
+    """节点三只更新事实；节点四兼容入口随后决定追问或检索。"""
     if _needs_clarify(state):
         return "clarify"
     return "assess_retrieve"
+
+
+def route_after_update_facts_v2(state: GuideState) -> str:
+    """正式迁移路由：节点三完成事实归约后统一进入节点四。
+
+    ``route_after_update_facts`` 保留给旧集成调用，避免一次性删除旧节点；
+    编译后的正式图使用此路由。
+    """
+
+    # A few legacy integrations stub node three with only the old issue fields.
+    # Let those calls keep using the old planner; real ``run_update_facts``
+    # always emits a fact audit id and therefore takes the formal route.
+    if (
+        not getattr(state, "fact_update_audit_id", "")
+        and not getattr(state, "fact_blackboard", [])
+        and not getattr(state, "case_facts", [])
+    ):
+        if not (
+            getattr(state, "confirmed_issues", [])
+            or getattr(state, "unmatched_issues", [])
+            or (
+                getattr(state, "legal_domain", "")
+                and getattr(state, "legal_domain", "") != "other"
+            )
+        ):
+            return "clarify"
+        return "assess_retrieve"
+    return "decide_facts"
 
 
 def route_after_parse(state: GuideState) -> str:
@@ -3131,20 +3313,32 @@ def route_after_parse(state: GuideState) -> str:
     if state.pending_ask_details:
         return END
     if state.issue_refresh_needed:
-        logger.info("路由：用户补充超出原追问范围，重新识别法律问题和领域")
-        return "extract_issues"
+        logger.info("路由：用户补充超出原追问范围，先更新动态事实黑板")
+        return "update_facts"
     if len(state.confirmed_issues) > state.last_confirmed_count:
         logger.info("路由：检测到新法律问题（{}→{}），重新标准化+检索",
                     state.last_confirmed_count, len(state.confirmed_issues))
-        return "extract_issues"
+        return "update_facts"
     if (
         not state.confirmed_issues
         and not state.unmatched_issues
         and (not state.legal_domain or state.legal_domain == "other")
     ):
         logger.info("路由：澄清答案已结构化但法律问题仍未识别，重新执行语义标准化")
-        return "extract_issues"
+        return "update_facts"
     return "assess_retrieve"
+
+
+def route_after_parse_v2(state: GuideState) -> str:
+    """旧 ``parse_details`` 的兼容出口，回答完成后回到正式节点四。"""
+
+    if state.pending_ask_details:
+        return END
+    if state.issue_refresh_needed:
+        return "update_facts"
+    if len(state.confirmed_issues) > state.last_confirmed_count:
+        return "update_facts"
+    return "decide_facts"
 
 
 def route_after_assess_retrieve(state: GuideState) -> str:
@@ -3156,15 +3350,156 @@ def route_after_assess_retrieve(state: GuideState) -> str:
     return "conclude"
 
 
+def route_after_guard_v2(state: GuideState) -> str:
+    """正式图的节点二出口，保留旧节点作为兼容分支。"""
+
+    if state.guard_pause_required or state.safety_pause_active:
+        return END
+    if state.awaiting_case_boundary:
+        return "pause_case_boundary"
+    if state.requested_route == "document_service":
+        return "handoff_document"
+    if state.phase == GuidePhase.END:
+        return END
+    # 节点五至七已经成为正式节点；旧 assess_retrieve/conclude 继续作为兼容桥接。
+    if state.requested_route == "plan_evidence":
+        return "plan_evidence"
+    if state.requested_route == "assess_evidence":
+        return "assess_evidence"
+    if state.requested_route == "generate_solution":
+        if (
+            getattr(state, "fact_update_audit_id", "")
+            or getattr(state, "fact_blackboard", [])
+            or getattr(state, "fact_snapshot_version", 0)
+        ):
+            return "generate_solution"
+        return "assess_retrieve"
+    if state.requested_route == "assess_retrieve":
+        return "assess_retrieve"
+    if state.requested_route == "decide_facts":
+        if (
+            not getattr(state, "fact_update_audit_id", "")
+            and not getattr(state, "fact_blackboard", [])
+            and not getattr(state, "case_facts", [])
+        ):
+            return "assess_retrieve"
+        return "decide_facts"
+    if state.requested_route == "update_facts":
+        return "update_facts"
+    if (
+        state.pending_ask_details
+        and not state.turn_contains_case_details
+        and state.requested_route not in {"update_facts", "decide_facts", ""}
+    ):
+        return "parse_details"
+    if state.pending_ask_details and not state.turn_contains_case_details:
+        return "parse_details"
+    if state.wants_conclude:
+        return "decide_facts"
+    return "update_facts"
+
+
+def route_after_decide_facts(state: GuideState) -> str:
+    """Only a converged fact snapshot can leave the formal node four."""
+
+    status = str(getattr(state, "decision_status", "") or "")
+    if status == "proceed_to_evidence_planning":
+        return "plan_evidence"
+    if status in {"ask_batch", "await_snapshot_confirmation", "paused_by_guard", "unable_to_decide"}:
+        return END
+    if getattr(state, "next_route", "") in {"plan_evidence", "assess_retrieve"}:
+        return (
+            "plan_evidence"
+            if getattr(state, "next_route", "") == "plan_evidence"
+            else "assess_retrieve"
+        )
+    return END
+
+
+def route_after_plan_evidence(state: GuideState) -> str:
+    """Pause after a stable evidence plan; bridge only explicit recovery paths."""
+
+    next_route = str(getattr(state, "next_route", "") or "")
+    if next_route == "decide_facts" or str(getattr(state, "evidence_plan_status", "")) == "needs_fact_update":
+        return "decide_facts"
+    if (
+        getattr(state, "wants_conclude", False)
+        or getattr(state, "force_conclude", False)
+        or str(getattr(state, "turn_control_intent", "") or "")
+        == "conclude_now"
+    ):
+        return "generate_solution"
+    # Evidence collection is a user-facing pause.  The next request enters
+    # node six, which distinguishes staged uploads from a completed batch.
+    return END
+
+
+def route_after_assess_evidence(state: GuideState) -> str:
+    """Route a completed material review without losing safety boundaries."""
+
+    next_route = str(getattr(state, "next_route", "") or "")
+    if next_route == "update_facts" or getattr(
+        state, "new_fact_candidates_from_evidence", []
+    ):
+        return "update_facts"
+    if next_route == "assess_evidence" or getattr(
+        state, "evidence_verification_pending", False
+    ):
+        return END
+    if next_route in {"await_evidence_batch", "plan_evidence"}:
+        return END
+    return "generate_solution"
+
+
+def route_after_generate_solution(state: GuideState) -> str:
+    """Send a valid node-seven draft to formal node eight or upstream."""
+
+    next_route = str(getattr(state, "next_route", "") or "")
+    if next_route in {"update_facts", "decide_facts", "plan_evidence", "assess_evidence"}:
+        return next_route
+    if next_route in {"audit_and_save", "conclude"} and getattr(
+        state, "solution_draft", {}
+    ):
+        return (
+            "audit_and_save"
+            if next_route == "audit_and_save"
+            else "conclude"
+        )
+    return END
+
+
+def route_after_audit_and_save(state: GuideState) -> str:
+    """Only fatal stale-input failures may return node eight upstream."""
+
+    next_route = str(getattr(state, "next_route", "") or "")
+    if str(getattr(state, "solution_audit_status", "") or "") == "blocked":
+        if next_route in {
+            "update_facts",
+            "decide_facts",
+            "plan_evidence",
+            "assess_evidence",
+            "generate_solution",
+        }:
+            return next_route
+    return END
+
+
 # ════════════════════════════════════════════════════════════════════════
 # 图的组装
 # ════════════════════════════════════════════════════════════════════════
 
 def build_guide_graph(deps: GuideDeps):
-    """构建九节点法律指引状态图，deps 通过闭包注入。"""
-    async def _prepare_turn(s):    return await node_prepare_turn(s, deps)
-    async def _check_urgency(s):   return await node_check_urgency(s, deps)
-    async def _extract_issues(s):  return await node_extract_issues(s, deps)
+    """构建法律指引状态图，deps 通过闭包注入。"""
+    async def _prepare_case(s):    return await node_prepare_case(s, deps)
+    async def _pause_boundary(s):  return await node_pause_case_boundary(s, deps)
+    async def _handoff_document(s): return await node_handoff_document(s, deps)
+    async def _guard_case(s):      return await node_check_urgency(s, deps)
+    async def _update_facts(s):    return await node_update_facts(s, deps)
+    async def _decide_facts(s):    return await node_decide_facts(s, deps)
+    async def _plan_evidence(s):   return await node_plan_evidence(s, deps)
+    async def _assess_evidence(s): return await node_assess_evidence(s, deps)
+    async def _generate_solution(s): return await node_generate_solution(s, deps)
+    async def _audit_and_save(s): return await node_audit_and_save(s, deps)
     async def _clarify(s):         return await node_clarify(s, deps)
     async def _assess_retrieve(s): return await node_assess_retrieve(s, deps)
     async def _ask_followup(s):    return await node_ask_followup(s, deps)
@@ -3173,9 +3508,16 @@ def build_guide_graph(deps: GuideDeps):
     async def _save_record(s):     return await node_save_record(s, deps)
 
     graph = StateGraph(GuideState)
-    graph.add_node("prepare_turn",    _prepare_turn)
-    graph.add_node("check_urgency",  _check_urgency)
-    graph.add_node("extract_issues", _extract_issues)
+    graph.add_node("prepare_case",    _prepare_case)
+    graph.add_node("pause_case_boundary", _pause_boundary)
+    graph.add_node("handoff_document", _handoff_document)
+    graph.add_node("guard_case",    _guard_case)
+    graph.add_node("update_facts",   _update_facts)
+    graph.add_node("decide_facts",  _decide_facts)
+    graph.add_node("plan_evidence", _plan_evidence)
+    graph.add_node("assess_evidence", _assess_evidence)
+    graph.add_node("generate_solution", _generate_solution)
+    graph.add_node("audit_and_save", _audit_and_save)
     graph.add_node("clarify",        _clarify)
     graph.add_node("assess_retrieve", _assess_retrieve)
     graph.add_node("ask_followup",    _ask_followup)
@@ -3183,25 +3525,87 @@ def build_guide_graph(deps: GuideDeps):
     graph.add_node("conclude",       _conclude)
     graph.add_node("save_record",    _save_record)
 
-    graph.set_entry_point("prepare_turn")
-    graph.add_edge("prepare_turn", "check_urgency")
+    graph.set_entry_point("prepare_case")
+    graph.add_edge("prepare_case", "guard_case")
+    graph.add_edge("pause_case_boundary", END)
+    graph.add_edge("handoff_document", END)
     graph.add_edge("clarify",      END)
     graph.add_edge("ask_followup", END)
     graph.add_edge("conclude",     "save_record")
     graph.add_edge("save_record",  END)
 
-    graph.add_conditional_edges("check_urgency",  route_after_urgency,
+    graph.add_conditional_edges("guard_case", route_after_guard_v2,
         {
             "parse_details": "parse_details",
-            "extract_issues": "extract_issues",
+            "update_facts": "update_facts",
+            "decide_facts": "decide_facts",
+            "plan_evidence": "plan_evidence",
+            "assess_evidence": "assess_evidence",
+            "audit_and_save": "audit_and_save",
+            "generate_solution": "generate_solution",
+            "clarify": "clarify",
             "assess_retrieve": "assess_retrieve",
             "ask_followup": "ask_followup",
+            "pause_case_boundary": "pause_case_boundary",
+            "handoff_document": "handoff_document",
             END: END,
         })
-    graph.add_conditional_edges("extract_issues", route_after_extract,
-        {"clarify": "clarify", "assess_retrieve": "assess_retrieve"})
-    graph.add_conditional_edges("parse_details",  route_after_parse,
-        {"extract_issues": "extract_issues", "assess_retrieve": "assess_retrieve", END: END})
+    graph.add_conditional_edges(
+        "update_facts",
+        route_after_update_facts_v2,
+        {
+            "decide_facts": "decide_facts",
+            "assess_retrieve": "assess_retrieve",
+            "clarify": "clarify",
+        },
+    )
+    graph.add_conditional_edges("parse_details",  route_after_parse_v2,
+        {"update_facts": "update_facts", "decide_facts": "decide_facts", END: END})
+    graph.add_conditional_edges("decide_facts", route_after_decide_facts,
+        {"plan_evidence": "plan_evidence", "assess_retrieve": "assess_retrieve", END: END})
+    graph.add_conditional_edges(
+        "plan_evidence",
+        route_after_plan_evidence,
+        {
+            "decide_facts": "decide_facts",
+            "generate_solution": "generate_solution",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "assess_evidence",
+        route_after_assess_evidence,
+        {
+            "update_facts": "update_facts",
+            "generate_solution": "generate_solution",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "generate_solution",
+        route_after_generate_solution,
+        {
+            "update_facts": "update_facts",
+            "decide_facts": "decide_facts",
+            "plan_evidence": "plan_evidence",
+            "assess_evidence": "assess_evidence",
+            "audit_and_save": "audit_and_save",
+            "conclude": "conclude",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "audit_and_save",
+        route_after_audit_and_save,
+        {
+            "update_facts": "update_facts",
+            "decide_facts": "decide_facts",
+            "plan_evidence": "plan_evidence",
+            "assess_evidence": "assess_evidence",
+            "generate_solution": "generate_solution",
+            END: END,
+        },
+    )
     graph.add_conditional_edges("assess_retrieve", route_after_assess_retrieve,
         {"ask_followup": "ask_followup", "conclude": "conclude"})
     return graph.compile()
@@ -3218,6 +3622,7 @@ async def run_guide(
     existing_state: GuideState | None = None,
     user_id: str | None = None,
     long_term_memories: list[str] | None = None,
+    request_context: dict | None = None,
 ) -> tuple[str, GuideState]:
     """
     执行一轮法律指引对话。
@@ -3229,6 +3634,7 @@ async def run_guide(
         existing_state    : 上一轮状态（多轮对话时传入）
         user_id           : 用户ID，贯穿整个流程
         long_term_memories: Supervisor检索到的长期记忆摘要
+        request_context   : 节点一请求信封及附件引用（兼容旧调用可为空）
 
     Returns:
         (assistant_reply, new_state)
@@ -3243,7 +3649,56 @@ async def run_guide(
     else:
         state = existing_state
 
-    state.messages.append(HumanMessage(content=user_message))
+    envelope = dict(request_context or {})
+    request_id = str(envelope.get("request_id") or uuid.uuid4().hex)
+    if (
+        existing_state is not None
+        and request_id
+        and request_id == state.last_processed_request_id
+    ):
+        reply = state.last_response_text or next(
+            (
+                str(message.content)
+                for message in reversed(state.messages)
+                if isinstance(message, AIMessage)
+            ),
+            "",
+        )
+        logger.info(
+            "run_guide idempotent replay | case={} request={}",
+            state.case_id,
+            request_id,
+        )
+        return reply, state
+
+    state.current_request_id = request_id
+    state.current_idempotency_key = str(
+        envelope.get("idempotency_key")
+        or request_id
+    )
+    state.current_message_id = str(
+        envelope.get("message_id")
+        or request_id
+    )
+    state.current_message_text = user_message
+    state.base_case_generation = envelope.get("base_case_generation")
+    state.base_state_version = envelope.get("base_state_version")
+    state.base_fact_snapshot_version = envelope.get("base_fact_snapshot_version")
+    state.base_evidence_plan_version = envelope.get("base_evidence_plan_version")
+    state.frontend_mode = str(envelope.get("frontend_mode") or "case")
+    state.event_hint = str(envelope.get("event_hint") or state.event_hint or "")
+    state.current_attachments = list(envelope.get("attachments") or [])
+    state.current_form_updates = list(envelope.get("form_updates") or [])
+    if envelope.get("control_action"):
+        state.control_payload = {
+            **state.control_payload,
+            "explicit_action": str(envelope["control_action"]),
+        }
+
+    # 边界不明确的原始文本只供 guard_case 做只读风险检查。它保存在
+    # pending_case_message 中，用户确认归属前不得进入当前案件消息历史。
+    if not state.case_boundary_read_only:
+        state.messages.append(HumanMessage(content=user_message))
 
     logger.info("run_guide start | session={} round={} user_id={}", thread_id, state.round, user_id)
 
@@ -3259,6 +3714,16 @@ async def run_guide(
             break
 
     reply = _with_memory_recall_preface(new_state, user_message, reply)
+    if (
+        new_state.guard_notice_pending
+        and new_state.guard_notice_markdown
+        and new_state.guard_notice_markdown not in reply
+    ):
+        reply = f"{new_state.guard_notice_markdown}\n\n{reply}".strip()
+        new_state.guard_notice_pending = False
+    new_state.last_response_text = reply
+    if not new_state.document_request_ready:
+        new_state.last_document_artifact = None
 
     logger.info("run_guide complete | session={} phase={} round={} reply_len={}",
                 thread_id, new_state.phase, new_state.round, len(reply))

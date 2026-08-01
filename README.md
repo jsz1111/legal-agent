@@ -43,37 +43,39 @@ Gradio Web UI / API Client
 
 每个会话以 `GuideState` 保存案情状态，包括法律领域、已确认问题、原子事实、证据状况、时间和地域信息、待追问事项、检索结果与最终方案。事实保存用户原话、来源轮次、确定性及修订状态，使同一事实能够在跨轮对话中合并、补充或更正。
 
-### 九节点工作流
+### 正式工作流与兼容节点
 
-维权 Agent 使用 LangGraph 实现固定的九节点业务图：
+维权 Agent 使用 LangGraph 实现八个正式核心节点；旧节点和 `conclude`/`save_record` 继续作为历史会话兼容边界保留：
 
 ```text
-prepare_turn -> check_urgency -> extract_issues
-                                      |        |
-                                      |        +-> clarify -> END
-                                      v
-                              assess_retrieve
-                                  |        |
-                                  |        +-> ask_followup -> END
-                                  v
-                              conclude -> save_record -> END
+prepare_case -> guard_case -> update_facts -> decide_facts
+                                             |
+                                      plan_evidence
+                                             |
+                                      assess_evidence
+                                             |
+                                      generate_solution
+                                             |
+                                      audit_and_save
+                                             |
+                                            END
 
-用户回答追问后：prepare_turn -> check_urgency -> parse_details
-                                                   |          |
-                                                   +----------+-> extract_issues / assess_retrieve
+用户回答追问、提交证据或补充进展后，均从 `prepare_case` 恢复同一案件版本。
+
+历史会话仍可走 `conclude -> save_record -> END`，但新工作流不会绕过正式审校。
 ```
 
 | 节点 | 作用 |
 | --- | --- |
-| `prepare_turn` | 载入上下文和历史记忆，推进轮次，识别用户是否希望直接收束为方案或生成文书。 |
-| `check_urgency` | 每轮检查人身安全、紧急风险和时效风险，优先输出安全行动提示。 |
-| `extract_issues` | 提取法律问题、归类领域，并将叙述拆分为带来源的原子事实。 |
-| `clarify` | 当案情尚无法归类时，以低负担问题完成基础澄清。 |
-| `assess_retrieve` | 评估案情完整度，执行法条、类案、图谱和渠道检索，规划下一步。 |
-| `ask_followup` | 每轮只提出一个对责任、请求、时效、管辖、程序或证据有实质影响的问题。 |
-| `parse_details` | 解析用户补充，更新事实、证据、冲突与缺失状态。 |
-| `conclude` | 汇总检索结果，生成维权路径、风险提示、证据建议和行动清单。 |
-| `save_record` | 保存本次咨询的结构化结果，便于后续会话衔接。 |
+| `prepare_case` | 恢复案件和历史版本，识别事实、证据、进展或控制指令。 |
+| `guard_case` | 每轮检查案件边界、安全、紧迫期限和证据灭失风险。 |
+| `update_facts` | 从输入中提取事实，更新、修正、去重并保留冲突历史。 |
+| `decide_facts` | 评估事实充分度，批量追问或形成事实快照。 |
+| `plan_evidence` | 建立法律模型、证明目标、正式证据清单和交付入口。 |
+| `assess_evidence` | 评估已提交材料，计算证明目标覆盖并识别冲突和新事实。 |
+| `generate_solution` | 生成五维定性判断、行动路径、长期任务和参考文书建议。 |
+| `audit_and_save` | 校验上游版本，审校事实、依据、证据边界、推理和 Markdown，发布并保存正式方案版本。 |
+| `conclude` / `save_record` | 仅保留旧会话兼容呈现与咨询记录保存能力。 |
 
 ### 动态追问与方案生成
 

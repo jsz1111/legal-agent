@@ -12,10 +12,10 @@ from src.agents.legal_guide.graph import (
     build_guide_graph,
     node_assess_retrieve,
     node_clarify,
-    node_extract_issues,
+    node_update_facts,
     node_parse_details,
     route_after_assess_retrieve,
-    route_after_extract,
+    route_after_update_facts,
     route_after_parse,
     run_guide,
 )
@@ -82,10 +82,10 @@ def test_needs_clarify_2_round_cap():
     assert _needs_clarify(GuideState(unmatched_issues=["老板不给钱"])) is False
 
 
-def test_route_after_extract_branches():
-    assert route_after_extract(GuideState(clarify_rounds=0)) == "clarify"
-    assert route_after_extract(GuideState(clarify_rounds=2)) == "assess_retrieve"
-    assert route_after_extract(
+def test_route_after_update_facts_branches():
+    assert route_after_update_facts(GuideState(clarify_rounds=0)) == "clarify"
+    assert route_after_update_facts(GuideState(clarify_rounds=2)) == "assess_retrieve"
+    assert route_after_update_facts(
         GuideState(confirmed_issues=["拖欠工资"])
     ) == "assess_retrieve"
 
@@ -98,7 +98,7 @@ def test_route_after_parse_branches():
         confirmed_issues=["拖欠工资", "违法解除劳动合同"],
         last_confirmed_count=1,
     )
-    assert route_after_parse(new_issue) == "extract_issues"
+    assert route_after_parse(new_issue) == "update_facts"
 
     answered = GuideState(
         confirmed_issues=["拖欠工资"],
@@ -107,7 +107,7 @@ def test_route_after_parse_branches():
     assert route_after_parse(answered) == "assess_retrieve"
 
     off_target_supplement = GuideState(issue_refresh_needed=True)
-    assert route_after_parse(off_target_supplement) == "extract_issues"
+    assert route_after_parse(off_target_supplement) == "update_facts"
 
 
 def test_route_after_assess_retrieve_converges_or_asks_once():
@@ -247,11 +247,22 @@ def test_more_specific_grounded_facts_can_revise_an_early_low_confidence_domain(
     deps.neo4j_driver = MagicMock()
     deps.embedding_model = MagicMock()
     deps.milvus_client = MagicMock()
+    from src.agents.legal_guide.issue_normalizer import IssuesOutput
     with patch(
-        "src.agents.legal_guide.graph.normalize_legal_issues",
-        new=AsyncMock(return_value=normalized),
+        "src.agents.legal_guide.update_facts.extract_case_facts",
+        new=AsyncMock(
+            return_value=IssuesOutput(
+                issues=normalized["standard"],
+                domain=normalized["domain"],
+                facts=normalized["collected_facts"],
+                case_updates=normalized["case_updates"],
+                evidence_details=[],
+                region="",
+                time_info="",
+            )
+        ),
     ):
-        result = asyncio.run(node_extract_issues(state, deps))
+        result = asyncio.run(node_update_facts(state, deps))
 
     assert result["legal_domain"] == "consumer_market"
     assert "网络购物付款后未收到货物" in result["confirmed_issues"]
@@ -310,7 +321,7 @@ def test_off_target_but_substantive_answer_requests_issue_and_domain_refresh():
     result = asyncio.run(node_parse_details(state, deps))
 
     assert result["issue_refresh_needed"] is True
-    assert route_after_parse(state.model_copy(update=result)) == "extract_issues"
+    assert route_after_parse(state.model_copy(update=result)) == "update_facts"
 
 
 def test_assess_retrieve_sets_force_conclude_at_total_limit():
@@ -503,15 +514,22 @@ def test_explicit_continue_can_use_bounded_extra_rounds_but_not_exceed_absolute_
     assert at_absolute["followup_plan"]["should_ask"] is False
 
 
-def test_compiled_graph_has_exactly_nine_business_nodes():
+def test_compiled_graph_has_prepare_case_and_boundary_pause():
     compiled = build_guide_graph(MagicMock())
     nodes = set(compiled.get_graph().nodes) - {"__start__", "__end__"}
     assert nodes == {
-        "prepare_turn",
-        "check_urgency",
-        "extract_issues",
-        "clarify",
-        "assess_retrieve",
+        "prepare_case",
+        "pause_case_boundary",
+        "handoff_document",
+            "guard_case",
+                "update_facts",
+                    "decide_facts",
+                    "plan_evidence",
+                    "assess_evidence",
+                    "generate_solution",
+                    "audit_and_save",
+                    "clarify",
+            "assess_retrieve",
         "ask_followup",
         "parse_details",
         "conclude",
@@ -524,7 +542,7 @@ def test_end_to_end_route_returns_question_then_final_plan():
     common = [
         patch("src.agents.legal_guide.graph.node_load_context", new=AsyncMock(return_value={})),
         patch("src.agents.legal_guide.graph.node_check_urgency", new=AsyncMock(return_value={"urgency_level": "normal"})),
-        patch("src.agents.legal_guide.graph.node_extract_issues", new=AsyncMock(return_value={
+        patch("src.agents.legal_guide.graph.node_update_facts", new=AsyncMock(return_value={
             "confirmed_issues": ["拖欠工资"],
             "legal_domain": "labor_social_security",
             "phase": GuidePhase.ISSUE_SEARCH,
@@ -559,12 +577,12 @@ def test_end_to_end_route_returns_question_then_final_plan():
 
     second_turn = [
         patch("src.agents.legal_guide.graph.node_check_urgency", new=AsyncMock(return_value={"urgency_level": "normal"})),
-        patch("src.agents.legal_guide.graph.node_parse_details", new=AsyncMock(return_value={
-            "pending_ask_details": [],
-            "pending_ask_type": "",
-            "evidence_confirmed": ["工资流水"],
-            "phase": GuidePhase.ISSUE_SEARCH,
-        })),
+            patch("src.agents.legal_guide.graph.node_update_facts", new=AsyncMock(return_value={
+                "pending_ask_details": [],
+                "pending_ask_type": "",
+                "evidence_confirmed": ["工资流水"],
+                "phase": GuidePhase.ISSUE_SEARCH,
+            })),
         patch("src.agents.legal_guide.graph.node_assess_retrieve", new=AsyncMock(return_value={
             "confidence_score": 0.8,
             "confidence_tier": "HIGH",
@@ -591,7 +609,7 @@ def test_end_to_end_route_returns_question_then_final_plan():
 
 if __name__ == "__main__":
     test_needs_clarify_2_round_cap()
-    test_route_after_extract_branches()
+    test_route_after_update_facts_branches()
     test_route_after_parse_branches()
     test_route_after_assess_retrieve_converges_or_asks_once()
     test_parse_details_clears_explicit_ask_type_and_saves_time()

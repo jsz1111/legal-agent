@@ -28,7 +28,7 @@ class _FakeRedis:
             self.values.pop(key, None)
 
 
-def test_document_request_bypasses_guide_graph_and_does_not_become_case_fact(
+def test_document_request_runs_guarded_handoff_and_does_not_become_case_fact(
     monkeypatch,
 ):
     thread_id = "user:session"
@@ -57,15 +57,28 @@ def test_document_request_bypasses_guide_graph_and_does_not_become_case_fact(
             missing_fields=["姓名"],
         )
 
-    async def fail_run_guide(**_kwargs):
-        raise AssertionError("document control intent must not enter GuideGraph")
+    async def fake_prepare_case_turn(*, message, existing_state, **_kwargs):
+        return message, existing_state, None
+
+    async def fake_run_guide(**kwargs):
+        captured["run_guide_called"] = True
+        guarded = kwargs["existing_state"].model_copy(
+            update={
+                "document_request_ready": True,
+                "input_event_type": "document_requested",
+                "requested_route": "document_service",
+                "state_version": 1,
+            }
+        )
+        return "上一条案件回复", guarded
 
     monkeypatch.setattr(
         chat_router,
         "build_guide_deps",
         lambda db_session=None: SimpleNamespace(llm=object()),
     )
-    monkeypatch.setattr(chat_router, "run_guide", fail_run_guide)
+    monkeypatch.setattr(chat_router, "_prepare_case_turn", fake_prepare_case_turn)
+    monkeypatch.setattr(chat_router, "run_guide", fake_run_guide)
     monkeypatch.setattr(
         "src.agents.legal_guide.doc_generator.generate_legal_document",
         fake_generate,
@@ -83,6 +96,7 @@ def test_document_request_bypasses_guide_graph_and_does_not_become_case_fact(
     saved = GuideState.model_validate_json(redis.values[state_key])
     assert reply == "消费者投诉信参考稿"
     assert document and document["doc_type"] == "消费者投诉信"
+    assert captured["run_guide_called"] is True
     assert captured["collected_facts"] == state.draftable_facts
     assert saved.phase == GuidePhase.DETAIL_GATHER
     assert saved.doc_draft == "消费者投诉信参考稿"

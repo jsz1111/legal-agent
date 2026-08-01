@@ -9,7 +9,7 @@ import traceback
 from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 from pathlib import Path
@@ -21,10 +21,13 @@ from src.infra.redis_cache import get_checkpointer_redis, set_with_optional_ttl
 from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.legal_guide.graph import run_guide, build_guide_deps
 from src.agents.legal_guide.state import GuideState, GuidePhase
+from src.agents.legal_guide.prepare_case import (
+    resolve_control_intent,
+    split_mixed_payload,
+)
 from src.agents.legal_guide.case_lifecycle import (
     CaseRelation,
     boundary_audit_entry,
-    boundary_confirmation_reply,
     decide_case_boundary,
     resolve_pending_boundary,
     start_isolated_case,
@@ -39,6 +42,19 @@ class ChatRequest(BaseModel):
     user_id: str
     session_id: str
     message: str
+    case_id: str | None = None
+    request_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    idempotency_key: str = ""
+    message_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    base_case_generation: int | None = None
+    base_state_version: int | None = None
+    base_fact_snapshot_version: int | None = None
+    base_evidence_plan_version: int | None = None
+    frontend_mode: str = "case"
+    event_hint: str = ""
+    attachments: list[dict] = Field(default_factory=list)
+    form_updates: list[dict] = Field(default_factory=list)
+    control_action: str = ""
 
 
 class DeleteConversationRequest(BaseModel):
@@ -47,7 +63,102 @@ class DeleteConversationRequest(BaseModel):
 
 class DebugInfo(BaseModel):
     case_id: str = ""
+    case_generation: int = 1
     case_boundary_status: str = ""
+    workflow_stage: str = ""
+    state_version: int = 0
+    event_sequence: int = 0
+    input_event_type: str = ""
+    requested_route: str = ""
+    guard_status: str = "clear"
+    guard_report: dict | None = None
+    fact_blackboard_version: int = 0
+    fact_snapshot_version: int = 0
+    fact_change_count: int = 0
+    fact_conflict_count: int = 0
+    evidence_name_inventory_version: int = 0
+    decision_status: str = ""
+    next_route: str = ""
+    fact_sufficiency: dict = Field(default_factory=dict)
+    question_batch: dict = Field(default_factory=dict)
+    fact_snapshot_draft: dict | None = None
+    pause_state: dict | None = None
+    internal_evidence_requirements: list[dict] = Field(default_factory=list)
+    evidence_requirement_changes: list[dict] = Field(default_factory=list)
+    legal_model: dict = Field(default_factory=dict)
+    legal_model_version: int = 0
+    legal_model_status: str = ""
+    relation_candidates: list[dict] = Field(default_factory=list)
+    request_models: list[dict] = Field(default_factory=list)
+    plan_retrieval_trace: dict = Field(default_factory=dict)
+    plan_retrieval_gaps: list[str] = Field(default_factory=list)
+    proof_targets: list[dict] = Field(default_factory=list)
+    formal_evidence_requirements: list[dict] = Field(default_factory=list)
+    evidence_name_links: list[dict] = Field(default_factory=list)
+    delivery_entries: list[dict] = Field(default_factory=list)
+    plan_basis_refs: list[dict] = Field(default_factory=list)
+    plan_basis_limitations: list[str] = Field(default_factory=list)
+    plan_change_summary: str = ""
+    plan_audit_id: str = ""
+    evidence_plan_request_id: str = ""
+    previous_evidence_plan_version: int = 0
+    evidence_plan_status: str = "not_created"
+    stale_dependencies: list[str] = Field(default_factory=list)
+    evidence_plan_version: int = 0
+    evidence_collection_status: str = "not_open"
+    evidence_batch_id: str = ""
+    evidence_batch_version: int = 0
+    decision_trace_id: str = ""
+    evidence_review_version: int = 0
+    evidence_review_id: str = ""
+    evidence_review_status: str = "not_started"
+    evidence_reviewed_at: str = ""
+    evidence_observations: list[dict] = Field(default_factory=list)
+    evidence_basis_refs: list[dict] = Field(default_factory=list)
+    evidence_basis_missing: list[str] = Field(default_factory=list)
+    pending_evidence_verification: list[dict] = Field(default_factory=list)
+    verification_round_count: int = 0
+    new_fact_candidates_from_evidence: list[dict] = Field(default_factory=list)
+    content_conflicts: list[dict] = Field(default_factory=list)
+    quality_gaps: list[str] = Field(default_factory=list)
+    unclassified_materials: list[dict] = Field(default_factory=list)
+    assessment_change_summary: dict = Field(default_factory=dict)
+    evidence_review_report: dict = Field(default_factory=dict)
+    solution_draft: dict = Field(default_factory=dict)
+    solution_draft_status: str = "not_started"
+    solution_generation_id: str = ""
+    solution_generated_at: str = ""
+    plan_version_candidate: str = ""
+    solution_based_on_fact_snapshot_version: int = 0
+    solution_based_on_legal_model_version: int = 0
+    solution_based_on_evidence_plan_version: int = 0
+    solution_based_on_evidence_review_version: int = 0
+    likelihood_assessment: dict = Field(default_factory=dict)
+    likelihood_tier: str = ""
+    likelihood_change: str = ""
+    solution_change_summary: dict = Field(default_factory=dict)
+    recommended_routes: list[dict] = Field(default_factory=list)
+    alternative_routes: list[dict] = Field(default_factory=list)
+    immediate_actions: list[dict] = Field(default_factory=list)
+    case_tasks: list[dict] = Field(default_factory=list)
+    document_suggestions: list[dict] = Field(default_factory=list)
+    action_basis_refs: list[dict] = Field(default_factory=list)
+    action_basis_gaps: list[str] = Field(default_factory=list)
+    conditional_plan: bool = False
+    pending_solution_audit: bool = False
+    solution_audit_status: str = "not_started"
+    solution_audit_id: str = ""
+    solution_reviewed_at: str = ""
+    solution_audit_report: dict = Field(default_factory=dict)
+    published_solution: dict = Field(default_factory=dict)
+    plan_version: int = 0
+    previous_plan_version: int = 0
+    plan_published_at: str = ""
+    solution_version_summaries: list[dict] = Field(default_factory=list)
+    solution_persistence_status: str = "not_saved"
+    retrieval_summary: dict = Field(default_factory=dict)
+    issue_term_map: dict[str, str] = Field(default_factory=dict)
+    issue_normalization_trace: dict = Field(default_factory=dict)
     domain: str = ""
     confidence_tier: str = ""
     statute_hits: str = ""
@@ -81,6 +192,9 @@ def _should_keep_guide_state(state: GuideState) -> bool:
         state.confirmed_issues
         or state.unmatched_issues
         or state.case_facts
+        or state.fact_blackboard
+        or state.evidence_name_inventory
+        or state.material_fact_observations
         or state.safety_pause_active
     )
 
@@ -90,9 +204,134 @@ def _guide_debug(state: GuideState) -> DebugInfo:
 
     return DebugInfo(
         case_id=state.case_id,
+        case_generation=state.case_generation,
         case_boundary_status=(
             "awaiting_confirmation" if state.awaiting_case_boundary else "resolved"
         ),
+        workflow_stage=state.workflow_stage,
+        state_version=state.state_version,
+        event_sequence=state.event_sequence,
+        input_event_type=state.input_event_type,
+        requested_route=state.requested_route,
+        guard_status=state.guard_status,
+        guard_report=state.guard_report or None,
+        fact_blackboard_version=state.fact_blackboard_version,
+        fact_snapshot_version=state.fact_snapshot_version,
+        fact_change_count=len(state.fact_changes),
+        fact_conflict_count=len(state.fact_conflict_groups),
+        evidence_name_inventory_version=state.evidence_name_inventory_version,
+        decision_status=state.decision_status,
+        next_route=state.next_route,
+        fact_sufficiency=state.fact_sufficiency or {},
+        question_batch=state.question_batch or {},
+        fact_snapshot_draft=state.fact_snapshot_draft,
+        pause_state=state.pause_state,
+        internal_evidence_requirements=state.internal_evidence_requirements or [],
+        evidence_requirement_changes=state.evidence_requirement_changes or [],
+        legal_model=state.legal_model or {},
+        legal_model_version=state.legal_model_version,
+        legal_model_status=state.legal_model_status or "",
+        relation_candidates=state.relation_candidates or [],
+        request_models=state.request_models or [],
+        plan_retrieval_trace=state.plan_retrieval_trace or {},
+        plan_retrieval_gaps=state.plan_retrieval_gaps or [],
+        proof_targets=state.proof_targets or [],
+        formal_evidence_requirements=state.formal_evidence_requirements or [],
+        evidence_name_links=state.evidence_name_links or [],
+        delivery_entries=state.delivery_entries or [],
+        plan_basis_refs=state.plan_basis_refs or [],
+        plan_basis_limitations=state.plan_basis_limitations or [],
+        plan_change_summary=state.plan_change_summary or "",
+        plan_audit_id=state.plan_audit_id or "",
+        evidence_plan_request_id=state.evidence_plan_request_id or "",
+        previous_evidence_plan_version=state.previous_evidence_plan_version,
+        evidence_plan_status=state.evidence_plan_status or "not_created",
+        stale_dependencies=state.stale_dependencies or [],
+        evidence_plan_version=state.evidence_plan_version,
+        evidence_collection_status=state.evidence_collection_status or "not_open",
+        evidence_batch_id=state.evidence_batch_id or "",
+        evidence_batch_version=state.evidence_batch_version,
+        decision_trace_id=state.decision_trace_id,
+        evidence_review_version=state.evidence_review_version,
+        evidence_review_id=state.evidence_review_id or "",
+        evidence_review_status=state.evidence_review_status or "not_started",
+        evidence_reviewed_at=state.evidence_reviewed_at or "",
+        evidence_observations=state.evidence_observations or [],
+        evidence_basis_refs=state.evidence_basis_refs or [],
+        evidence_basis_missing=state.evidence_basis_missing or [],
+        pending_evidence_verification=state.pending_evidence_verification or [],
+        verification_round_count=state.verification_round_count,
+        new_fact_candidates_from_evidence=state.new_fact_candidates_from_evidence or [],
+        content_conflicts=state.content_conflicts or [],
+        quality_gaps=state.quality_gaps or [],
+        unclassified_materials=state.unclassified_materials or [],
+        assessment_change_summary=state.assessment_change_summary or {},
+        evidence_review_report=state.evidence_review_report or {},
+        solution_draft=state.solution_draft or {},
+        solution_draft_status=state.solution_draft_status or "not_started",
+        solution_generation_id=state.solution_generation_id or "",
+        solution_generated_at=state.solution_generated_at or "",
+        plan_version_candidate=state.plan_version_candidate or "",
+        solution_based_on_fact_snapshot_version=(
+            state.solution_based_on_fact_snapshot_version
+        ),
+        solution_based_on_legal_model_version=(
+            state.solution_based_on_legal_model_version
+        ),
+        solution_based_on_evidence_plan_version=(
+            state.solution_based_on_evidence_plan_version
+        ),
+        solution_based_on_evidence_review_version=(
+            state.solution_based_on_evidence_review_version
+        ),
+        likelihood_assessment=state.likelihood_assessment or {},
+        likelihood_tier=state.likelihood_tier or "",
+        likelihood_change=state.likelihood_change or "",
+        solution_change_summary=state.solution_change_summary or {},
+        recommended_routes=state.recommended_routes or [],
+        alternative_routes=state.alternative_routes or [],
+        immediate_actions=state.immediate_actions or [],
+        case_tasks=state.case_tasks or [],
+        document_suggestions=state.document_suggestions or [],
+        action_basis_refs=state.action_basis_refs or [],
+        action_basis_gaps=state.action_basis_gaps or [],
+        conditional_plan=state.conditional_plan,
+        pending_solution_audit=state.pending_solution_audit,
+        solution_audit_status=state.solution_audit_status or "not_started",
+        solution_audit_id=state.solution_audit_id or "",
+        solution_reviewed_at=state.solution_reviewed_at or "",
+        solution_audit_report=state.solution_audit_report or {},
+        published_solution=state.published_solution or {},
+        plan_version=state.plan_version,
+        previous_plan_version=state.previous_plan_version,
+        plan_published_at=state.plan_published_at or "",
+        solution_version_summaries=[
+            {
+                "plan_version": item.get("plan_version"),
+                "previous_plan_version": item.get("previous_plan_version"),
+                "published_at": item.get("published_at"),
+                "reviewed_at": item.get("reviewed_at"),
+                "likelihood_tier": (
+                    (
+                        item.get("solution", {}).get(
+                            "likelihood_assessment", {}
+                        )
+                    ).get("tier")
+                    if isinstance(item.get("solution"), dict)
+                    else ""
+                ),
+                "change_summary": item.get("change_summary") or {},
+                "published_fingerprint": item.get("published_fingerprint"),
+            }
+            for item in (state.solution_versions or [])
+            if isinstance(item, dict)
+        ],
+        solution_persistence_status=(
+            state.solution_persistence_status or "not_saved"
+        ),
+        retrieval_summary=state.retrieval_summary or {},
+        issue_term_map=state.issue_term_map or {},
+        issue_normalization_trace=state.issue_normalization_trace or {},
         domain=state.legal_domain or "",
         confidence_tier=state.confidence_tier or "GATHERING",
         statute_hits=state.law_context_str or "",
@@ -118,12 +357,27 @@ async def _prepare_case_turn(
     if existing_state.safety_pause_active:
         # 现实危险是可恢复中断。危险状态没有被明确解除前，下一条消息必须先回到
         # 同一状态机重新做安全判断，不能因为首轮尚未提取法律问题而丢失案件。
-        decision = await decide_case_boundary(existing_state, message, llm)
-        existing_state.phase = GuidePhase.ISSUE_SEARCH
+        control_intent = resolve_control_intent(message)
+        payloads = split_mixed_payload(
+            message,
+            control_intent=control_intent,
+            message_id=existing_state.current_message_id,
+        )
+        existing_state.phase = (
+            GuidePhase.ISSUE_SEARCH
+            if existing_state.phase == GuidePhase.END
+            else existing_state.phase
+        )
         existing_state.force_conclude = False
         existing_state.wants_conclude = False
-        existing_state.turn_control_intent = decision.control_intent.value
-        existing_state.turn_contains_case_details = decision.carries_case_detail
+        existing_state.turn_control_intent = control_intent
+        existing_state.turn_contains_case_details = bool(
+            payloads["fact_payload"].get("text")
+            or payloads["progress_payload"].get("text")
+            or payloads["evidence_payload"].get("named_evidence")
+        )
+        existing_state.case_relation = CaseRelation.CONTINUE.value
+        existing_state.case_boundary_read_only = False
         return message, existing_state, None
 
     if existing_state.awaiting_case_boundary:
@@ -136,19 +390,17 @@ async def _prepare_case_turn(
     transition = boundary_audit_entry(existing_state, case_message, decision)
     if decision.relation == CaseRelation.UNCERTAIN:
         existing_state.awaiting_case_boundary = True
+        existing_state.case_relation = CaseRelation.UNCERTAIN.value
+        existing_state.case_boundary_read_only = True
         if not existing_state.pending_case_message:
             existing_state.pending_case_message = message
         existing_state.case_boundary_audit = [
             *existing_state.case_boundary_audit,
             transition,
         ][-30:]
-        await set_with_optional_ttl(
-            redis,
-            state_key,
-            existing_state.model_dump_json(),
-            settings.GUIDE_SESSION_TTL,
-        )
-        return message, existing_state, boundary_confirmation_reply(existing_state)
+        # 不在 API 层直接回复。待归属文本以只读上下文进入 guard_case，
+        # 风险检查通过后再由图内暂停节点展示案件边界确认。
+        return message, existing_state, None
 
     pending_confirmation = existing_state.awaiting_case_boundary
     effective_message = case_message
@@ -173,12 +425,20 @@ async def _prepare_case_turn(
         )
         next_state.turn_control_intent = decision.control_intent.value
         next_state.turn_contains_case_details = decision.carries_case_detail
+        next_state.case_relation = CaseRelation.NEW.value
+        next_state.case_boundary_read_only = False
+        if pending_confirmation:
+            next_state.event_hint = "case_boundary_answered"
         return effective_message, next_state, None
 
     existing_state.turn_control_intent = decision.control_intent.value
     existing_state.turn_contains_case_details = decision.carries_case_detail
+    existing_state.case_relation = CaseRelation.CONTINUE.value
+    existing_state.case_boundary_read_only = False
     existing_state.awaiting_case_boundary = False
     existing_state.pending_case_message = ""
+    if pending_confirmation:
+        existing_state.event_hint = "case_boundary_answered"
     existing_state.case_boundary_audit = [
         *existing_state.case_boundary_audit,
         transition,
@@ -246,15 +506,10 @@ async def _pop_supervisor_reply_artifacts(
             if isinstance(raw_debug, bytes):
                 raw_debug = raw_debug.decode("utf-8")
             value = json.loads(raw_debug)
-            debug = DebugInfo(
-                domain=value.get("domain", ""),
-                confidence_tier=value.get("confidence_tier", "") or "GATHERING",
-                statute_hits=value.get("statute_hits", ""),
-                case_hits=value.get("case_hits", ""),
-                graph_laws=value.get("graph_laws", []),
-                graph_channels=value.get("graph_channels", []),
-                fallback_guide=value.get("fallback_guide"),
+            value["confidence_tier"] = (
+                value.get("confidence_tier") or "GATHERING"
             )
+            debug = DebugInfo.model_validate(value)
             await redis.delete(debug_key)
     except Exception:
         logger.warning(
@@ -305,20 +560,122 @@ async def _run_statistics_followup_if_needed(
     return result
 
 
+async def _generate_document_turn(
+    *,
+    message: str,
+    state: GuideState,
+    deps,
+    redis,
+    state_key: str,
+    active_key: str,
+    user_id: str | None,
+) -> tuple[str, DebugInfo, dict]:
+    """Generate a document only after prepare_case and guard_case have run."""
+
+    from src.agents.legal_guide.doc_generator import generate_legal_document
+    from src.agents.legal_guide.formatters import requested_doc_type
+    from src.agents.legal_guide.prompts import DOC_TYPE_MAP
+
+    document_issues = list(state.confirmed_issues) or list(state.unmatched_issues)
+    if not document_issues:
+        raise ValueError("当前案件尚未形成可用于文书的争议事项")
+
+    doc_type = requested_doc_type(
+        message,
+        DOC_TYPE_MAP.get(state.legal_domain, "投诉信"),
+    )
+    state.requested_doc_type = doc_type
+    generated = await generate_legal_document(
+        legal_domain=state.legal_domain,
+        confirmed_issues=document_issues,
+        collected_facts=state.draftable_facts,
+        region=state.region,
+        evidence_confirmed=state.evidence_confirmed,
+        law_context_str=state.law_context_str,
+        llm=deps.llm,
+        requested_doc_type=doc_type,
+    )
+    state.doc_draft = generated.text
+    state.document_request_ready = False
+
+    document_id = uuid.uuid4().hex
+    document_ttl = settings.GUIDE_DOCUMENT_TTL
+    file_key = f"legal_document_file:{document_id}"
+    meta_key = f"legal_document_meta:{document_id}"
+    await redis.set(file_key, generated.docx_bytes, ex=document_ttl)
+    await redis.set(
+        meta_key,
+        json.dumps(
+            {
+                "filename": generated.filename,
+                "user_id": user_id or "",
+                "session_id": state.session_id or "",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        ex=document_ttl,
+    )
+
+    official = generated.official_template or generated.related_official_template
+    official_match = (
+        "exact"
+        if generated.official_template
+        else "related"
+        if official
+        else "none"
+    )
+    official_note = None
+    if official_match == "related":
+        official_note = (
+            "该官方空白模板与当前纠纷领域相关，但适用于法院诉讼阶段；"
+            "本次智能填写 DOCX 仍按当前维权阶段生成，二者不是同一文书。"
+        )
+    document_artifact = {
+        "document_id": document_id,
+        "doc_type": generated.doc_type,
+        "filename": generated.filename,
+        "generated_docx_url": f"/api/v1/chat/documents/{document_id}",
+        "official_blank_url": (
+            f"/api/v1/chat/document-templates/{official.template_id}/official"
+            if official
+            else None
+        ),
+        "source": official.public_metadata() if official else None,
+        "official_template_match": official_match,
+        "official_template_note": official_note,
+        "missing_fields": generated.missing_fields,
+        "expires_in_seconds": document_ttl,
+    }
+    state.last_response_text = generated.text
+    state.last_document_artifact = document_artifact
+
+    await set_with_optional_ttl(
+        redis,
+        state_key,
+        state.model_dump_json(),
+        settings.GUIDE_SESSION_TTL,
+    )
+    await set_with_optional_ttl(
+        redis,
+        active_key,
+        "1",
+        settings.GUIDE_SESSION_TTL,
+    )
+    return generated.text, _guide_debug(state), document_artifact
+
+
 async def _run_guide_turn(
     message: str,
     thread_id: str,
     redis,
     db,
+    request_context: dict | None = None,
 ) -> tuple[str, DebugInfo, dict | None]:
     """
     执行一轮法律指引对话（路由层直接调用，绕过 Supervisor）。
     从 Redis 恢复状态 → 执行 GuideGraph → 保存新状态 → 返回回复+调试信息。
     """
-    from src.agents.legal_guide.formatters import is_doc_request, requested_doc_type
-    from src.agents.legal_guide.doc_generator import generate_legal_document
-    from src.agents.legal_guide.prompts import DOC_TYPE_MAP
-    from langchain_core.messages import HumanMessage, AIMessage
+    from langchain_core.messages import AIMessage
 
     active_key = f"guide_active:{thread_id}"
     state_key  = f"guide_state:{thread_id}"
@@ -328,111 +685,62 @@ async def _run_guide_turn(
 
     # 从 thread_id 提取 user_id（格式：user_id:session_id）
     user_id = thread_id.split(":")[0] if ":" in thread_id else None
+    request_context = dict(request_context or {})
+    if existing_state:
+        request_id = str(request_context.get("request_id") or "")
+        if request_id and request_id == existing_state.last_processed_request_id:
+            previous_reply = existing_state.last_response_text or next(
+                (
+                    str(item.content)
+                    for item in reversed(existing_state.messages)
+                    if isinstance(item, AIMessage)
+                ),
+                "",
+            )
+            if previous_reply:
+                logger.info(
+                    "节点一命中重复请求，直接复用结果 | case={} request={}",
+                    existing_state.case_id,
+                    request_id,
+                )
+                return (
+                    previous_reply,
+                    _guide_debug(existing_state),
+                    existing_state.last_document_artifact,
+                )
+        existing_state.current_request_id = request_id
+        existing_state.current_idempotency_key = str(
+            request_context.get("idempotency_key") or request_id
+        )
+        existing_state.current_message_id = str(
+            request_context.get("message_id") or request_id
+        )
+        existing_state.current_message_text = message
+        existing_state.base_case_generation = request_context.get(
+            "base_case_generation"
+        )
+        existing_state.base_state_version = request_context.get("base_state_version")
+        existing_state.base_fact_snapshot_version = request_context.get(
+            "base_fact_snapshot_version"
+        )
+        existing_state.base_evidence_plan_version = request_context.get(
+            "base_evidence_plan_version"
+        )
+        existing_state.frontend_mode = str(
+            request_context.get("frontend_mode") or "case"
+        )
+        existing_state.event_hint = str(request_context.get("event_hint") or "")
+        existing_state.current_attachments = list(
+            request_context.get("attachments") or []
+        )
+        existing_state.current_form_updates = list(
+            request_context.get("form_updates") or []
+        )
+        existing_state.control_payload = {
+            "explicit_action": str(request_context.get("control_action") or "")
+        }
 
     deps = build_guide_deps(db_session=db)
-
-    # 文书请求是针对当前案件的控制意图，不是新的案情事实。只要已有可用的
-    # 案件状态，就直接进入独立文书服务；不能依赖 phase 恰好为 END，否则旧
-    # 状态、恢复中的会话或条件式方案会把“生成文书”重新送进事实抽取流程。
-    if (
-        existing_state
-        and is_doc_request(message)
-        and _should_keep_guide_state(existing_state)
-    ):
-        document_issues = (
-            list(existing_state.confirmed_issues)
-            or list(existing_state.unmatched_issues)
-        )
-        if document_issues:
-            logger.info("检测到文书生成请求，直接调用独立文书生成服务")
-            doc_type = requested_doc_type(
-                message,
-                DOC_TYPE_MAP.get(existing_state.legal_domain, "投诉信"),
-            )
-            existing_state.requested_doc_type = doc_type
-            # 直接调用文书生成函数
-            generated = await generate_legal_document(
-                legal_domain=existing_state.legal_domain,
-                confirmed_issues=document_issues,
-                collected_facts=existing_state.draftable_facts,
-                region=existing_state.region,
-                evidence_confirmed=existing_state.evidence_confirmed,
-                law_context_str=existing_state.law_context_str,
-                llm=deps.llm,
-                requested_doc_type=doc_type,
-            )
-            existing_state.doc_draft = generated.text
-
-            document_id = uuid.uuid4().hex
-            document_ttl = settings.GUIDE_DOCUMENT_TTL
-            file_key = f"legal_document_file:{document_id}"
-            meta_key = f"legal_document_meta:{document_id}"
-            await redis.set(file_key, generated.docx_bytes, ex=document_ttl)
-            await redis.set(
-                meta_key,
-                json.dumps(
-                    {
-                        "filename": generated.filename,
-                        "user_id": user_id or "",
-                        "session_id": existing_state.session_id or "",
-                    },
-                    ensure_ascii=False,
-                ).encode("utf-8"),
-                ex=document_ttl,
-            )
-
-            official = (
-                generated.official_template
-                or generated.related_official_template
-            )
-            official_match = (
-                "exact"
-                if generated.official_template
-                else "related"
-                if official
-                else "none"
-            )
-            official_note = None
-            if official_match == "related":
-                official_note = (
-                    "该官方空白模板与当前纠纷领域相关，但适用于法院诉讼阶段；"
-                    "本次智能填写 DOCX 仍按当前维权阶段生成，二者不是同一文书。"
-                )
-            document_artifact = {
-                "document_id": document_id,
-                "doc_type": generated.doc_type,
-                "filename": generated.filename,
-                "generated_docx_url": f"/api/v1/chat/documents/{document_id}",
-                "official_blank_url": (
-                    f"/api/v1/chat/document-templates/{official.template_id}/official"
-                    if official
-                    else None
-                ),
-                "source": official.public_metadata() if official else None,
-                "official_template_match": official_match,
-                "official_template_note": official_note,
-                "missing_fields": generated.missing_fields,
-                "expires_in_seconds": document_ttl,
-            }
-
-            # 文书指令和生成正文都不写入案情消息池，防止后续“继续补充”时
-            # 被事实抽取器误当成本案陈述。原有流程阶段保持不变，用户可以
-            # 重新生成、改文书类型，或继续补充同一案件。
-            await set_with_optional_ttl(
-                redis,
-                state_key,
-                existing_state.model_dump_json(),
-                settings.GUIDE_SESSION_TTL,
-            )
-            await set_with_optional_ttl(
-                redis,
-                active_key,
-                "1",
-                settings.GUIDE_SESSION_TTL,
-            )
-
-            debug = _guide_debug(existing_state)
-            return generated.text, debug, document_artifact
 
     if existing_state:
         message, existing_state, boundary_reply = await _prepare_case_turn(
@@ -459,7 +767,20 @@ async def _run_guide_turn(
         deps=deps,
         existing_state=existing_state,
         user_id=user_id,
+        request_context=request_context,
     )
+
+    if new_state.document_request_ready:
+        logger.info("文书请求已通过 prepare_case 与 guard_case，进入文书服务")
+        return await _generate_document_turn(
+            message=message,
+            state=new_state,
+            deps=deps,
+            redis=redis,
+            state_key=state_key,
+            active_key=active_key,
+            user_id=user_id,
+        )
 
     debug = _guide_debug(new_state)
 
@@ -505,7 +826,11 @@ async def chat(
         # ── 指引进行中：直接走 GuideGraph ──
         if await _has_guide_session(redis, active_key, state_key):
             reply, debug, document = await _run_guide_turn(
-                req.message, thread_id, redis, db
+                req.message,
+                thread_id,
+                redis,
+                db,
+                request_context=req.model_dump(mode="python"),
             )
             return ChatResponse(
                 reply=reply,
@@ -529,20 +854,30 @@ async def chat(
 
         # ── 无活跃指引：走 Supervisor ──
         current_message_key = f"current_user_message:{req.user_id}:{req.session_id}"
+        request_context_key = (
+            f"current_guide_request_context:{req.user_id}:{req.session_id}"
+        )
         await redis.set(
             current_message_key,
             req.message,
             ex=settings.REDIS_SESSION_TTL,
         )
+        await redis.set(
+            request_context_key,
+            req.model_dump_json(),
+            ex=settings.REDIS_SESSION_TTL,
+        )
         agent = await get_supervisor_agent()
         config = {"configurable": {"thread_id": thread_id}}
 
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": req.message}]},
-            config=config,
-            context=UserContext(user_id=req.user_id, session_id=req.session_id),
-        )
-        await redis.delete(current_message_key)
+        try:
+            result = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": req.message}]},
+                config=config,
+                context=UserContext(user_id=req.user_id, session_id=req.session_id),
+            )
+        finally:
+            await redis.delete(current_message_key, request_context_key)
         supervisor_reply = result["messages"][-1].content
 
         # Keep the HTTP and SSE paths aligned with Gradio: only return the
@@ -598,7 +933,11 @@ async def chat_stream(
             # ── 指引进行中：GuideGraph 非流式执行，结果整体推送 ──
             if await _has_guide_session(redis, active_key, state_key):
                 reply, debug, document = await _run_guide_turn(
-                    req.message, thread_id, redis, db
+                    req.message,
+                    thread_id,
+                    redis,
+                    db,
+                    request_context=req.model_dump(mode="python"),
                 )
                 data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
                 yield f"data: {data}\n\n"
@@ -640,9 +979,17 @@ async def chat_stream(
 
                 # ── 无活跃指引：Supervisor 流式推送 ──
                 current_message_key = f"current_user_message:{req.user_id}:{req.session_id}"
+                request_context_key = (
+                    f"current_guide_request_context:{req.user_id}:{req.session_id}"
+                )
                 await redis.set(
                     current_message_key,
                     req.message,
+                    ex=settings.REDIS_SESSION_TTL,
+                )
+                await redis.set(
+                    request_context_key,
+                    req.model_dump_json(),
                     ex=settings.REDIS_SESSION_TTL,
                 )
                 agent = await get_supervisor_agent()
@@ -657,7 +1004,7 @@ async def chat_stream(
                         ),
                     )
                 finally:
-                    await redis.delete(current_message_key)
+                    await redis.delete(current_message_key, request_context_key)
                 supervisor_reply = result["messages"][-1].content
                 reply, debug = await _pop_supervisor_reply_artifacts(
                     redis,

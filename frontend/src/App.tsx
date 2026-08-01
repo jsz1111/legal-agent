@@ -50,6 +50,7 @@ import {
   ZAxis,
 } from 'recharts'
 import {
+  ChatRequest,
   DebugInfo,
   DocumentArtifact,
   HealthResponse,
@@ -81,6 +82,7 @@ type AttachmentItem = {
   id: string
   file: File
   status: 'ready' | 'processing' | 'done' | 'error'
+  evidenceRequirementId?: string
   note?: string
 }
 
@@ -521,11 +523,13 @@ function IntakePanel({
   setIntake,
   onSubmit,
   busy,
+  evidencePlanOpen,
 }: {
   intake: IntakeState
   setIntake: (value: IntakeState) => void
   onSubmit: () => void
   busy: boolean
+  evidencePlanOpen: boolean
 }) {
   const update = (key: keyof IntakeState, value: string) =>
     setIntake({ ...intake, [key]: value })
@@ -584,10 +588,14 @@ function IntakePanel({
           />
         </label>
         <div className="intake-footer">
-          <span className="muted-copy">上传材料可在下方输入框旁添加，系统会保留文件指纹和核验边界。</span>
+          <span className="muted-copy">
+            {evidencePlanOpen
+              ? '证据清单已开放，可在右侧按证明目标逐项提交材料。'
+              : '当前先登记案情和已有证据名称，事实确认后再逐项提交材料。'}
+          </span>
           <button className="primary-button small" onClick={onSubmit} disabled={busy}>
             <Sparkles size={15} />
-            {busy ? '正在分析' : '提交材料包'}
+            {busy ? '正在分析' : '提交案件信息'}
           </button>
         </div>
       </div>
@@ -807,6 +815,308 @@ function StatsView({ statistics }: { statistics: Statistics }) {
   )
 }
 
+const EVIDENCE_IMPORTANCE_LABELS: Record<string, string> = {
+  essential: '优先准备',
+  important: '重要补强',
+  reinforcing: '可选补充',
+}
+
+const EVIDENCE_STATE_LABELS: Record<string, string> = {
+  submitted: '已提交待评估',
+  user_claimed_present: '用户称持有',
+  temporarily_unavailable: '暂时找不到',
+  user_claimed_unavailable: '明确没有',
+  available_for_third_party_request: '可向第三方调取',
+  not_submitted: '暂未提交',
+  unclassified: '待归类',
+}
+
+const readStringList = (value: unknown) =>
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).slice(0, 5)
+    : []
+
+const readRecordList = (value: unknown) =>
+  Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+    : []
+
+const EVIDENCE_REVIEW_STATUS_LABELS: Record<string, string> = {
+  supports: '支持较强',
+  partially_supports: '部分支持',
+  conflicted: '存在冲突',
+  received_but_unparsed: '解析未完成',
+  received_but_unstored: '暂未完成保存',
+  not_relevant_to_current_target: '与当前目标不匹配',
+  covered: '初步覆盖',
+  partially_covered: '部分覆盖',
+  explicitly_absent: '明确缺口',
+  third_party_available: '可向第三方调取',
+  not_submitted: '尚未提交',
+  unresolved: '待确认',
+}
+
+function EvidencePlanPanel({
+  debug,
+  onSelectRequirement,
+  onCompleteBatch,
+}: {
+  debug: DebugInfo | null
+  onSelectRequirement: (requirementId: string) => void
+  onCompleteBatch: () => void
+}) {
+  const requirements = debug?.formal_evidence_requirements ?? []
+  if (!requirements.length) return null
+  const planOpen = debug?.evidence_collection_status === 'open'
+  const planStatus = debug?.evidence_plan_status || 'not_created'
+  return (
+    <section className="inspector-card evidence-plan-card">
+      <div className="card-title-row">
+        <h3><ClipboardList size={15} />证据准备清单</h3>
+        <span className="counter">
+          {planOpen ? `第 ${debug?.evidence_plan_version || 1} 版` : '待确认'}
+        </span>
+      </div>
+      <p className="muted-copy">
+        {planOpen
+          ? '每项材料都绑定到对应证明目标，提交后单独进入评估。'
+          : planStatus === 'needs_fact_update'
+            ? '法律建模发现新的关键事实缺口，确认后会重新生成清单。'
+            : '事实确认后会在这里开放逐项提交通道。'}
+      </p>
+      <div className="evidence-plan-list">
+        {requirements
+          .filter((item) => !['stale', 'not_applicable', 'superseded'].includes(String(item.status || '')))
+          .map((item, index) => {
+            const requirementId = String(item.requirement_id || '')
+            const importance = String(item.importance || 'reinforcing')
+            const materialState = String(item.user_material_state || 'not_submitted')
+            const recommended = readStringList(item.recommended_materials)
+            const alternatives = readStringList(item.alternative_materials)
+            return (
+              <article className="evidence-plan-item" key={requirementId || index}>
+                <div className="evidence-plan-item-head">
+                  <div>
+                    <span className={`evidence-priority ${importance}`}>
+                      {EVIDENCE_IMPORTANCE_LABELS[importance] || '材料建议'}
+                    </span>
+                    <strong>{String(item.label || requirementId || '未命名材料')}</strong>
+                  </div>
+                  <span className="evidence-state">
+                    {EVIDENCE_STATE_LABELS[materialState] || '待确认'}
+                  </span>
+                </div>
+                <p><b>用于证明：</b>{String(item.purpose || '支持当前证明目标')}</p>
+                {recommended.length ? (
+                  <p><b>可提交：</b>{recommended.join('、')}</p>
+                ) : null}
+                {alternatives.length ? (
+                  <p><b>替代：</b>{alternatives.join('、')}</p>
+                ) : null}
+                <button
+                  className="evidence-submit-button"
+                  type="button"
+                  onClick={() => onSelectRequirement(requirementId)}
+                  disabled={!planOpen || !requirementId}
+                >
+                  <Paperclip size={14} />
+                  {planOpen ? '提交此项材料' : '清单尚未开放'}
+                </button>
+              </article>
+            )
+          })}
+      </div>
+      <p className="evidence-plan-note">
+        <Check size={13} />未提交不等于没有；可以稍后补交或标记为可调取。
+      </p>
+      {planOpen ? (
+        <button
+          className="evidence-batch-complete"
+          type="button"
+          onClick={onCompleteBatch}
+        >
+          <Check size={14} />
+          完成本批次并评估
+        </button>
+      ) : null}
+    </section>
+  )
+}
+
+function EvidenceAssessmentPanel({ debug }: { debug: DebugInfo | null }) {
+  const report = debug?.evidence_review_report
+  const items = readRecordList(report?.items)
+  const coverage = readRecordList(report?.coverage)
+  const status = debug?.evidence_review_status || String(report?.assessment_status || '')
+  if (!items.length && !coverage.length && !status) return null
+  return (
+    <section className="inspector-card evidence-review-card">
+      <div className="card-title-row">
+        <h3><ShieldCheck size={15} />材料初步评估</h3>
+        <span className="counter">
+          {debug?.evidence_review_version ? `第 ${debug.evidence_review_version} 版` : '待生成'}
+        </span>
+      </div>
+      <p className="muted-copy">
+        {status === 'needs_verification'
+          ? '有一项材料属性需要确认，回答后会继续评估。'
+          : status === 'awaiting_batch'
+            ? '材料已暂存，完成本批次后才形成完整评估。'
+            : '以下是材料用途和证明目标覆盖的初步判断，不是司法意义上的效力结论。'}
+      </p>
+      {items.length ? (
+        <div className="evidence-review-list">
+          {items.slice(0, 8).map((item, index) => {
+            const itemStatus = String(item.assessment_status || '')
+            const gaps = readStringList(item.quality_gaps)
+            return (
+              <article className="evidence-review-item" key={String(item.evidence_id || item.material_id || index)}>
+                <div className="evidence-review-head">
+                  <strong>{String(item.name || item.file_name || '未命名材料')}</strong>
+                  <span className={`evidence-review-status ${itemStatus}`}>
+                    {EVIDENCE_REVIEW_STATUS_LABELS[itemStatus] || '待确认'}
+                  </span>
+                </div>
+                <p>{String(item.probative_scope || '暂未形成可定位的证明范围')}</p>
+                {gaps.length ? <small>待补强：{gaps.slice(0, 3).join('、')}</small> : null}
+              </article>
+            )
+          })}
+        </div>
+      ) : null}
+      {coverage.length ? (
+        <div className="evidence-coverage-list">
+          <strong>证明目标覆盖</strong>
+          {coverage.slice(0, 8).map((item, index) => (
+            <div className="evidence-coverage-row" key={String(item.target_id || index)}>
+              <span>{String(item.label || '证明目标')}</span>
+              <b>{EVIDENCE_REVIEW_STATUS_LABELS[String(item.status || '')] || '待确认'}</b>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {debug?.pending_evidence_verification?.length ? (
+        <div className="evidence-verification-callout">
+          <CircleHelp size={14} />
+          <span>{String(debug.pending_evidence_verification[0]?.question || '请确认材料来源和完整性。')}</span>
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+const LIKELIHOOD_DIMENSION_LABELS: Record<string, string> = {
+  rights_basis: '权利基础',
+  fact_clarity: '事实清晰度',
+  evidence_coverage: '证据覆盖',
+  procedural_feasibility: '程序可行性',
+  performance_risk: '履行风险',
+}
+
+const LIKELIHOOD_STATUS_LABELS: Record<string, string> = {
+  favorable: '有利',
+  mixed: '有条件',
+  unfavorable: '风险明显',
+  unknown: '待确认',
+  not_applicable: '暂不适用',
+}
+
+function SolutionPanel({ debug }: { debug: DebugInfo | null }) {
+  const published = debug?.published_solution
+  const solution = published && Object.keys(published).length
+    ? published
+    : debug?.solution_draft
+  const likelihood = (debug?.likelihood_assessment || solution?.likelihood_assessment || {}) as Record<string, unknown>
+  const tier = debug?.likelihood_tier || String(likelihood.tier || '')
+  const dimensions = readRecordList(likelihood.dimensions)
+  const actions = debug?.immediate_actions ?? readRecordList(solution?.immediate_actions)
+  const routes = debug?.recommended_routes ?? readRecordList(solution?.recommended_routes)
+  const tasks = debug?.case_tasks ?? readRecordList(solution?.case_tasks)
+  const change = (debug?.solution_change_summary || solution?.change_summary || {}) as Record<string, unknown>
+  const planVersion = debug?.plan_version || Number(solution?.plan_version || 0)
+  const publishedPlan = planVersion > 0 && debug?.solution_draft_status === 'published'
+  if (!tier && !debug?.solution_draft_status) return null
+  return (
+    <section className="inspector-card solution-summary-card">
+      <div className="card-title-row">
+        <h3><Scale size={15} />行动方案</h3>
+        <span className="counter">
+          {publishedPlan
+            ? `第 ${planVersion} 版`
+            : debug?.pending_solution_audit
+              ? '审校中'
+              : '生成中'}
+        </span>
+      </div>
+      <div className={`likelihood-band tier-${tier}`}>
+        <span>当前维权可能性</span>
+        <strong>{tier || '不确定'}</strong>
+        <small>{debug?.conditional_plan ? '条件式判断' : '基于当前版本'}</small>
+      </div>
+      {dimensions.length ? (
+        <div className="likelihood-dimensions">
+          {dimensions.map((item, index) => {
+            const status = String(item.status || 'unknown')
+            return (
+              <div className="likelihood-dimension-row" key={String(item.dimension_id || index)}>
+                <span>{LIKELIHOOD_DIMENSION_LABELS[String(item.dimension_id || '')] || String(item.label || '评估维度')}</span>
+                <b className={`dimension-status ${status}`}>
+                  {LIKELIHOOD_STATUS_LABELS[status] || '待确认'}
+                </b>
+              </div>
+            )
+          })}
+        </div>
+      ) : null}
+      {actions.length ? (
+        <div className="solution-list-block">
+          <strong><ClipboardList size={13} />当前先做</strong>
+          <ol>
+            {actions.slice(0, 4).map((item, index) => (
+              <li key={String(item.action_id || index)}>
+                <b>{String(item.title || '当前行动')}</b>
+                <span>{String(item.reason || '')}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+      {routes.length ? (
+        <div className="solution-list-block route-list">
+          <strong><ArrowUp size={13} />推荐路径</strong>
+          {routes.slice(0, 3).map((item, index) => (
+            <div className="solution-route-row" key={String(item.route_id || index)}>
+              <b>{String(item.label || '行动路径')}</b>
+              <span>{String(item.first_action || item.rationale || '')}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {tasks.length ? (
+        <div className="solution-task-summary">
+          <span><Clock3 size={13} />长期任务</span>
+          <b>{tasks.filter((item) => String(item.status || 'pending') !== 'completed').length} 项待处理</b>
+        </div>
+      ) : null}
+      <p className="solution-version-note">
+        {debug?.pending_solution_audit
+          ? '当前草稿正在完成事实、法律依据、证据边界和格式审校。'
+          : publishedPlan
+            ? String(change.likelihood_change || '') === 'upgraded'
+              ? `第 ${planVersion} 版已发布，本版判断较上一版上调。`
+              : String(change.likelihood_change || '') === 'downgraded'
+                ? `第 ${planVersion} 版已发布，本版判断较上一版下调，请优先查看新增风险。`
+                : `第 ${planVersion} 版已完成审校并长期保存。`
+          : String(change.likelihood_change || '') === 'upgraded'
+            ? '本版判断较上一版上调。'
+            : String(change.likelihood_change || '') === 'downgraded'
+              ? '本版判断较上一版下调，请优先查看新增风险。'
+              : '事实或证据变化后会在这里显示方案版本差异。'}
+      </p>
+    </section>
+  )
+}
+
 function Inspector({
   mode,
   open,
@@ -820,6 +1130,8 @@ function Inspector({
   selectedTemplate,
   setSelectedTemplate,
   templateError,
+  onSelectRequirement,
+  onCompleteBatch,
 }: {
   mode: WorkspaceMode
   open: boolean
@@ -833,6 +1145,8 @@ function Inspector({
   selectedTemplate: string
   setSelectedTemplate: (value: string) => void
   templateError: string
+  onSelectRequirement: (requirementId: string) => void
+  onCompleteBatch: () => void
 }) {
   const domain = debug?.domain
     ? DOMAIN_LABELS[debug.domain] || debug.domain
@@ -919,6 +1233,13 @@ function Inspector({
                 )}
               </div>
             </section>
+            <EvidencePlanPanel
+              debug={debug}
+              onSelectRequirement={onSelectRequirement}
+              onCompleteBatch={onCompleteBatch}
+            />
+            <EvidenceAssessmentPanel debug={debug} />
+            <SolutionPanel debug={debug} />
             {statistics ? (
               <section className="inspector-card">
                 <div className="card-title-row">
@@ -1096,6 +1417,7 @@ function App() {
   const [templateError, setTemplateError] = useState('')
   const [activeTab, setActiveTab] = useState<InspectorTab>(boot.active.activeTab)
   const [inspectorOpen, setInspectorOpen] = useState(false)
+  const [pendingRequirementId, setPendingRequirementId] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textAreaRef = useRef<HTMLTextAreaElement>(null)
   const conversationEndRef = useRef<HTMLDivElement>(null)
@@ -1178,6 +1500,17 @@ function App() {
     textAreaRef.current?.focus()
   }
 
+  const evidencePlanOpen = mode === 'case' && (
+    debug?.evidence_collection_status === 'open'
+    || ['active', 'conditional', 'retrieval_degraded'].includes(debug?.evidence_plan_status || '')
+  )
+
+  const selectEvidenceRequirement = (requirementId: string) => {
+    if (!evidencePlanOpen || !requirementId) return
+    setPendingRequirementId(requirementId)
+    fileInputRef.current?.click()
+  }
+
   const handleFileSelection = (files: FileList | null) => {
     if (!files) return
     const next = Array.from(files)
@@ -1186,8 +1519,10 @@ function App() {
         id: uid(),
         file,
         status: 'ready' as const,
+        evidenceRequirementId: pendingRequirementId || undefined,
       }))
     setAttachments((current) => [...current, ...next].slice(0, 8))
+    setPendingRequirementId('')
     if (fileInputRef.current) fileInputRef.current.value = ''
     focusComposer()
   }
@@ -1212,7 +1547,11 @@ function App() {
     ].join('\n').trim()
   }
 
-  const send = async (messageText: string, files = attachments) => {
+  const send = async (
+    messageText: string,
+    files = attachments,
+    controlAction = '',
+  ) => {
     const trimmed = messageText.trim()
     if (busy || (!trimmed && files.length === 0)) return
     setBusy(true)
@@ -1242,6 +1581,7 @@ function App() {
     setUploading(files.length > 0)
 
     const evidenceBlocks: string[] = []
+    const attachmentRefs: NonNullable<ChatRequest['attachments']> = []
     try {
       for (const item of files.slice(0, 8)) {
         const file = item.file
@@ -1252,6 +1592,15 @@ function App() {
         if (/\.(pdf|docx|txt)$/i.test(lower)) {
           const result = await uploadDocument(file)
           evidenceBlocks.push(result.evidence_block)
+          attachmentRefs.push({
+            material_id: item.id,
+            file_name: result.filename,
+            file_type: file.type || lower.split('.').pop() || 'document',
+            sha256: result.sha256,
+            upload_status: 'uploaded',
+            evidence_requirement_id: item.evidenceRequirementId,
+            evidence_batch_id: debug?.evidence_batch_id,
+          })
           setMessages((current) =>
             current.map((candidate) =>
               candidate.id === userMessageId
@@ -1266,6 +1615,15 @@ function App() {
           evidenceBlocks.push(
             `【图片证据补充（视觉模型识别，需与原图核对）】\n文件：${file.name}\n原图 SHA-256：${result.image_sha256 || ''}\n${result.analysis}`,
           )
+          attachmentRefs.push({
+            material_id: item.id,
+            file_name: file.name,
+            file_type: file.type || 'image',
+            sha256: result.image_sha256 || '',
+            upload_status: 'uploaded',
+            evidence_requirement_id: item.evidenceRequirementId,
+            evidence_batch_id: debug?.evidence_batch_id,
+          })
         } else {
           throw new Error(`${file.name} 暂不支持，仅支持图片、PDF、DOCX 和 TXT`)
         }
@@ -1277,7 +1635,22 @@ function App() {
       const combinedMessage = [trimmed, ...evidenceBlocks].filter(Boolean).join('\n\n')
       let reply = ''
       await streamChat(
-        { user_id: userId, session_id: sessionId, message: combinedMessage },
+        {
+          user_id: userId,
+          session_id: sessionId,
+          message: combinedMessage,
+          case_id: debug?.case_id,
+          request_id: userMessageId,
+          idempotency_key: `${sessionId}:${userMessageId}`,
+          message_id: userMessageId,
+          base_case_generation: debug?.case_generation,
+          base_state_version: debug?.state_version,
+          base_fact_snapshot_version: debug?.fact_snapshot_version,
+          base_evidence_plan_version: debug?.evidence_plan_version,
+          frontend_mode: mode,
+          attachments: attachmentRefs,
+          control_action: controlAction || undefined,
+        },
         (event) => {
           if (event.type === 'token') {
             reply += event.content || ''
@@ -1289,7 +1662,8 @@ function App() {
           }
           if (event.type === 'done') {
             if (event.session_id && event.session_id !== sessionId) setSessionId(event.session_id)
-            setDebug(event.debug ?? null)
+            const nextDebug = event.debug ?? null
+            setDebug(nextDebug)
             setStatistics(event.statistics ?? null)
             setDocument(event.document ?? null)
             if (event.document) {
@@ -1299,6 +1673,18 @@ function App() {
               setInspectorOpen(true)
             } else if (event.statistics) {
               setActiveTab('sources')
+              setInspectorOpen(true)
+            } else if (
+              mode === 'case'
+              && nextDebug
+              && (
+                nextDebug.evidence_collection_status === 'open'
+                || ['active', 'conditional', 'retrieval_degraded'].includes(
+                  nextDebug.evidence_plan_status || '',
+                )
+              )
+            ) {
+              setActiveTab('case')
               setInspectorOpen(true)
             }
           }
@@ -1337,6 +1723,11 @@ function App() {
   }
 
   const submitDraft = () => void send(draft)
+
+  const completeEvidenceBatch = () => {
+    if (!evidencePlanOpen || busy) return
+    void send('完成本批次并评估', [], 'complete_batch')
+  }
 
   const submitIntake = () => {
     const intakeMessage = buildIntakeMessage()
@@ -1599,7 +1990,13 @@ function App() {
 
         <section className="conversation-column">
           {mode === 'case' ? (
-            <IntakePanel intake={intake} setIntake={setIntake} onSubmit={submitIntake} busy={busy} />
+            <IntakePanel
+              intake={intake}
+              setIntake={setIntake}
+              onSubmit={submitIntake}
+              busy={busy}
+              evidencePlanOpen={evidencePlanOpen}
+            />
           ) : null}
           <div className="conversation-header">
             <div>
@@ -1633,6 +2030,7 @@ function App() {
                     {item.file.type.startsWith('image/') ? <ImagePlus size={14} /> : <FileText size={14} />}
                     <span title={item.file.name}>{item.file.name}</span>
                     <small>{formatBytes(item.file.size)}</small>
+                    {item.evidenceRequirementId ? <small>已关联清单</small> : null}
                     {item.status === 'processing' ? <LoaderCircle size={13} className="spin" /> : null}
                     {item.status === 'done' ? <Check size={13} /> : null}
                     <button className="remove-file" title={`移除 ${item.file.name}`} onClick={() => removeAttachment(item.id)} disabled={busy}><X size={13} /></button>
@@ -1649,9 +2047,15 @@ function App() {
                 accept="image/*,.pdf,.docx,.txt"
                 onChange={(event) => handleFileSelection(event.target.files)}
               />
-              <button className="composer-tool" title="添加图片、PDF、DOCX 或 TXT" onClick={() => fileInputRef.current?.click()} disabled={busy}>
-                <Paperclip size={19} />
-              </button>
+              {mode === 'case' && evidencePlanOpen ? (
+                <button className="composer-tool" title="添加图片、PDF、DOCX 或 TXT" onClick={() => fileInputRef.current?.click()} disabled={busy}>
+                  <Paperclip size={19} />
+                </button>
+              ) : mode === 'case' ? (
+                <span className="composer-stage-lock" title="事实确认后开放证据提交通道">
+                  <LockIcon />
+                </span>
+              ) : null}
               <textarea
                 ref={textAreaRef}
                 value={draft}
@@ -1664,7 +2068,9 @@ function App() {
                 }}
                 placeholder={
                   mode === 'case'
-                    ? '描述案件进展、补充事实或上传证据……'
+                    ? evidencePlanOpen
+                      ? '补充事实或提交本批次证据……'
+                      : '先描述案件进展或补充事实……'
                     : '询问法律规定、办理流程、类案或统计数据……'
                 }
                 rows={1}
@@ -1706,6 +2112,8 @@ function App() {
           selectedTemplate={selectedTemplate}
           setSelectedTemplate={setSelectedTemplate}
           templateError={templateError}
+          onSelectRequirement={selectEvidenceRequirement}
+          onCompleteBatch={completeEvidenceBatch}
         />
       </main>
       <footer className="app-footer">

@@ -23,16 +23,141 @@ class GuideState(BaseModel):
 
     # 流程控制
     phase: GuidePhase = GuidePhase.CLARIFY
-    round: int = 0  # 用户消息轮次，只由 prepare_turn 每轮递增一次
+    round: int = 0  # 用户消息轮次，只由 prepare_case 每轮递增一次
     session_id: str = ""
     total_rounds: int = 0  # 兼容旧状态的总轮次计数，用于强制收敛
     case_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     case_generation: int = 1
+    workflow_stage: str = "case_intake"
+    state_version: int = 0
+    event_sequence: int = 0
+
+    # 节点一：请求信封、结构化输入事件与候选路由。旧状态缺少这些字段时由
+    # Pydantic 默认值平滑迁移；后续节点只消费结构化载荷，不应再次分类。
+    current_request_id: str = ""
+    current_idempotency_key: str = ""
+    current_message_id: str = ""
+    current_message_text: str = ""
+    base_state_version: int | None = None
+    base_case_generation: int | None = None
+    frontend_mode: str = "case"
+    base_fact_snapshot_version: int | None = None
+    base_evidence_plan_version: int | None = None
+    event_hint: str = ""
+    input_event_type: str = ""
+    input_events: list[dict] = Field(default_factory=list)
+    fact_payload: dict = Field(default_factory=dict)
+    evidence_payload: dict = Field(default_factory=dict)
+    progress_payload: dict = Field(default_factory=dict)
+    control_payload: dict = Field(default_factory=dict)
+    current_attachments: list[dict] = Field(default_factory=list)
+    current_form_updates: list[dict] = Field(default_factory=list)
+    requested_route: str = ""
+    route_after_guard: list[str] = Field(default_factory=list)
+    document_request_ready: bool = False
+    pause_state: dict | None = None
+    last_processed_request_id: str = ""
+    last_processed_message_id: str = ""
+    last_processed_idempotency_key: str = ""
+    last_response_text: str = ""
+    last_document_artifact: dict | None = None
+    case_relation: str = ""
+    case_boundary_read_only: bool = False
     awaiting_case_boundary: bool = False
     pending_case_message: str = ""
     case_boundary_audit: list[dict] = Field(default_factory=list)
     turn_control_intent: str = ""
     turn_contains_case_details: bool = False
+
+    # 新工作流暂停点和版本字段。当前旧流程尚未全部消费这些字段，但节点一
+    # 已统一恢复和输出，便于 update_facts / plan_evidence 等节点逐步迁移。
+    fact_snapshot_version: int = 0
+    fact_snapshot_confirmed: bool = False
+    # 节点五：法律模型、请求目标和正式证据规划。旧字段继续保留，
+    # 新节点只在事实快照确认后写入这些字段，便于长期案件增量更新。
+    legal_model: dict = Field(default_factory=dict)
+    legal_model_version: int = 0
+    legal_model_status: str = ""
+    relation_candidates: list[dict] = Field(default_factory=list)
+    request_models: list[dict] = Field(default_factory=list)
+    plan_retrieval_trace: dict = Field(default_factory=dict)
+    plan_retrieval_gaps: list[str] = Field(default_factory=list)
+    proof_targets: list[dict] = Field(default_factory=list)
+    formal_evidence_requirements: list[dict] = Field(default_factory=list)
+    evidence_name_links: list[dict] = Field(default_factory=list)
+    delivery_entries: list[dict] = Field(default_factory=list)
+    plan_basis_refs: list[dict] = Field(default_factory=list)
+    plan_basis_limitations: list[str] = Field(default_factory=list)
+    plan_change_summary: str = ""
+    plan_audit_id: str = ""
+    evidence_plan_request_id: str = ""
+    evidence_plan_fingerprint: str = ""
+    previous_evidence_plan_version: int = 0
+    evidence_plan_status: str = "not_created"
+    stale_dependencies: list[str] = Field(default_factory=list)
+    evidence_plan_version: int = 0
+    evidence_collection_status: str = "not_open"
+    evidence_batch_id: str = ""
+    evidence_batch_version: int = 0
+    evidence_batch_completed: bool = False
+    evidence_verification_pending: bool = False
+    pending_evidence_verification: list[dict] = Field(default_factory=list)
+    verification_round_count: int = 0
+    evidence_review_version: int = 0
+    evidence_review_id: str = ""
+    evidence_review_fingerprint: str = ""
+    evidence_review_status: str = "not_started"
+    evidence_reviewed_at: str = ""
+    evidence_observations: list[dict] = Field(default_factory=list)
+    evidence_basis_refs: list[dict] = Field(default_factory=list)
+    evidence_basis_missing: list[str] = Field(default_factory=list)
+    new_fact_candidates_from_evidence: list[dict] = Field(default_factory=list)
+    content_conflicts: list[dict] = Field(default_factory=list)
+    quality_gaps: list[str] = Field(default_factory=list)
+    unclassified_materials: list[dict] = Field(default_factory=list)
+    assessment_change_summary: dict = Field(default_factory=dict)
+    evidence_review_report: dict = Field(default_factory=dict)
+    # 节点七：只生成待审校的结构化行动方案，不直接发布或覆盖正式版本。
+    solution_draft: dict = Field(default_factory=dict)
+    solution_draft_markdown: str = ""
+    solution_draft_status: str = "not_started"
+    solution_draft_fingerprint: str = ""
+    solution_generation_id: str = ""
+    solution_generated_at: str = ""
+    solution_input_validation: dict = Field(default_factory=dict)
+    plan_version_candidate: str = ""
+    solution_based_on_fact_snapshot_version: int = 0
+    solution_based_on_legal_model_version: int = 0
+    solution_based_on_evidence_plan_version: int = 0
+    solution_based_on_evidence_review_version: int = 0
+    likelihood_assessment: dict = Field(default_factory=dict)
+    likelihood_tier: str = ""
+    likelihood_change: str = ""
+    solution_change_summary: dict = Field(default_factory=dict)
+    recommended_routes: list[dict] = Field(default_factory=list)
+    alternative_routes: list[dict] = Field(default_factory=list)
+    immediate_actions: list[dict] = Field(default_factory=list)
+    document_suggestions: list[dict] = Field(default_factory=list)
+    action_basis_refs: list[dict] = Field(default_factory=list)
+    action_basis_gaps: list[str] = Field(default_factory=list)
+    conditional_plan: bool = False
+    pending_solution_audit: bool = False
+    # 节点八：审校通过后发布正式版本；历史版本只追加，不覆盖旧方案。
+    solution_audit_status: str = "not_started"
+    solution_audit_id: str = ""
+    solution_reviewed_at: str = ""
+    solution_audit_report: dict = Field(default_factory=dict)
+    solution_audit_history: list[dict] = Field(default_factory=list)
+    published_solution: dict = Field(default_factory=dict)
+    published_solution_markdown: str = ""
+    published_solution_fingerprint: str = ""
+    plan_version: int = 0
+    previous_plan_version: int = 0
+    plan_published_at: str = ""
+    solution_versions: list[dict] = Field(default_factory=list)
+    solution_persistence_status: str = "not_saved"
+    case_tasks: list[dict] = Field(default_factory=list)
+    case_progress: list[dict] = Field(default_factory=list)
 
     # 法律问题追踪（对标症状四元组）
     # confirmed_issues / unmatched_issues 是两个互不合并的池：
@@ -45,6 +170,59 @@ class GuideState(BaseModel):
     collected_facts: list[str] = Field(default_factory=list)    # 跨轮累积的金额、时间、关系、行为等案情事实
     draftable_facts: list[str] = Field(default_factory=list)    # 用户清晰陈述、可安全用于文书的事实；疑问/冲突/推测不得进入
     case_facts: list[dict] = Field(default_factory=list)        # 通用原子案情：语义键、原文、确定性、轮次和修订状态
+    # 节点三的规范事实账本。``case_facts`` 继续作为旧节点兼容投影，
+    # ``fact_blackboard`` 使用七种事实状态和完整来源、冲突、版本关系。
+    fact_blackboard: list[dict] = Field(default_factory=list)
+    fact_blackboard_version: int = 0
+    fact_changes: list[dict] = Field(default_factory=list)
+    fact_conflict_groups: dict[str, list[str]] = Field(default_factory=dict)
+    fact_aliases: dict[str, str] = Field(default_factory=dict)
+    active_fact_schema: list[str] = Field(default_factory=list)
+    material_fact_observations: list[dict] = Field(default_factory=list)
+    downstream_invalidations: list[str] = Field(default_factory=list)
+    fact_update_audit_id: str = ""
+    fact_update_audit_history: list[dict] = Field(default_factory=list)
+    fact_update_degraded: bool = False
+    last_processed_fact_event_key: str = ""
+    evidence_name_inventory: list[dict] = Field(default_factory=list)
+    evidence_name_inventory_version: int = 0
+    evidence_name_changes: list[dict] = Field(default_factory=list)
+    # 节点四：事实决策、批量追问和事实快照。旧字段继续保留，便于
+    # 已持久化会话平滑迁移；新节点只把这些字段作为自己的持久化契约。
+    fact_sufficiency: dict = Field(default_factory=dict)
+    sufficiency_report: dict = Field(default_factory=dict)
+    convergence_reason: str = ""
+    no_progress_rounds: int = 0
+    convergence_config_snapshot: dict = Field(default_factory=dict)
+    active_fact_schema_version: int = 0
+    question_batch: dict = Field(default_factory=dict)
+    question_batch_history: list[dict] = Field(default_factory=list)
+    asked_question_batches: list[dict] = Field(default_factory=list)
+    pending_fact_batch_id: str = ""
+    pending_question_ids: list[str] = Field(default_factory=list)
+    pending_decision_keys: list[str] = Field(default_factory=list)
+    answered_decision_keys: list[str] = Field(default_factory=list)
+    unknown_decision_keys: list[str] = Field(default_factory=list)
+    waived_decision_keys: list[str] = Field(default_factory=list)
+    internal_evidence_requirements: list[dict] = Field(default_factory=list)
+    evidence_requirement_changes: list[dict] = Field(default_factory=list)
+    fact_snapshot_draft: dict | None = None
+    proceed_under_uncertainty: bool = False
+    fact_change_materiality: str = "none"
+    decision_trace: dict = Field(default_factory=dict)
+    decision_trace_id: str = ""
+    decision_status: str = ""
+    next_route: str = ""
+    retrieval_summary: dict = Field(default_factory=dict)
+    retrieval_trace_id: str = ""
+    retrieval_basis_candidates: list[dict] = Field(default_factory=list)
+    retrieval_gaps: list[str] = Field(default_factory=list)
+    issue_term_map: dict[str, str] = Field(default_factory=dict)
+    issue_normalization_trace: dict = Field(default_factory=dict)
+    activated_fact_slots: list[str] = Field(default_factory=list)
+    targeted_retrieval_cache: list[dict] = Field(default_factory=list)
+    issue_candidates: list[str] = Field(default_factory=list)
+    domain_candidate: str = ""
     asked_details: list[str] = Field(default_factory=list)      # 已追问过的细节（防重复）
     pending_ask_details: list[str] = Field(default_factory=list) # 本轮追问内容，供 parse_details 解析
     pending_ask_type: str = ""                                  # facts / evidence，避免跨轮追问类型串线
@@ -58,7 +236,6 @@ class GuideState(BaseModel):
     fact_records: dict[str, dict] = Field(default_factory=dict)   # 用户陈述的清晰度/冲突状态，不代表已查证
     evidence_assessments: dict[str, dict] = Field(default_factory=dict) # 存在性、相关性、真实性和可采性分层
     evidence_items: list[dict] = Field(default_factory=list)      # 结构化证据项及其来源、完整性等基础属性
-    proof_targets: list[dict] = Field(default_factory=list)       # 当前领域需要覆盖的证明目标
     evidence_links: list[dict] = Field(default_factory=list)      # 证据项与证明目标之间的可解释关联
     evidence_coverage: dict = Field(default_factory=dict)         # 证明目标覆盖、缺口和补强建议
     evidence_unavailable: list[str] = Field(default_factory=list) # 用户明确表示没有的证据
@@ -95,6 +272,28 @@ class GuideState(BaseModel):
     current_safety_status: str = "not_applicable"  # danger / safe / unknown / not_applicable
     safety_pause_active: bool = False     # 现实危险处理中暂停普通流程；确认安全后恢复同一案件
     safety_pause_case_message: str = ""   # 暂停前的原始危险陈述，恢复后归入同一案件
+    guard_status: str = "clear"          # clear / warning / urgent / critical / unknown
+    guard_checked_at: str = ""
+    guard_report: dict = Field(default_factory=dict)
+    guard_pause_required: bool = False
+    guard_notice_markdown: str = ""
+    guard_notice_pending: bool = False
+    guard_next_route: str = ""
+    active_risk_flags: list[dict] = Field(default_factory=list)
+    resolved_risk_flags: list[dict] = Field(default_factory=list)
+    guard_audit_history: list[dict] = Field(default_factory=list)
+    risk_observations: list[dict] = Field(default_factory=list)
+    risk_related_missing_facts: list[dict] = Field(default_factory=list)
+    safety_pause_started_at: str = ""
+    safety_resume_route: list[str] = Field(default_factory=list)
+    safety_resume_stage: str = ""
+    safety_confirmation_required: bool = False
+    safety_pause_pending_events: list[dict] = Field(default_factory=list)
+    deadline_risk: dict | None = None
+    evidence_loss_risk: dict | None = None
+    asset_emergency_risk: dict | None = None
+    restricted_action_flags: list[dict] = Field(default_factory=list)
+    guard_retrieval_trace: dict = Field(default_factory=dict)
     time_warning: str = ""             # 时效提醒文案（由 check_urgency 生成）
     clarify_rounds: int = 0            # 澄清轮数（上限 2 轮）
     ask_rounds: int = 0                # 事实+证据追问总轮数

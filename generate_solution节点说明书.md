@@ -1,6 +1,6 @@
 # `generate_solution` 行动方案生成节点说明书
 
-> 文档状态：目标节点设计，可作为后端重构和前后端联调依据
+> 文档状态：正式节点说明，已接入 GuideGraph、节点八正式审校保存、FastAPI、Gradio 和电脑网页端行动方案面板
 > 编写日期：2026-08-01
 > 所属工作流：维权助手 GuideGraph
 > 节点序号：节点七
@@ -26,7 +26,10 @@ assess_evidence                             |
                 generate_solution
                          |
                          v
-                 audit_and_save
+                audit_and_save
+                         |
+                         v
+                        END
 ```
 
 一句话定义：
@@ -34,6 +37,23 @@ assess_evidence                             |
 > `generate_solution` 负责确认“在当前事实、法律依据和证据覆盖条件下，用户应该先做什么、可以走哪些路径、当前维权形势如何，以及后续任务和参考文书如何组织”。
 
 节点七生成的是待审校方案，不直接发布最终版本。节点八完成事实、法条、证据边界、逻辑和 Markdown 审校后，才能保存并向用户展示。
+
+当前实现边界：
+
+| 已实现能力 | 当前行为 |
+|---|---|
+| 独立图节点 | `GuideGraph` 已暴露 `generate_solution`，节点六完成后先进入节点七 |
+| 条件式方案 | 用户暂不提交材料但明确要求出方案时，节点五可直接进入节点七 |
+| 上游版本校验 | 绑定事实快照、法律模型、证据计划和证据评估版本；过期状态返回对应上游节点 |
+| 五维定性判断 | 输出权利基础、事实清晰度、证据覆盖、程序可行性和履行风险 |
+| 四级结果 | 用户可见等级只使用“较有利、条件性有利、不确定、风险较高” |
+| 行动规划 | 生成当前行动、推荐路径、替代/升级路径及进入、升级和停止条件 |
+| 长期任务 | 任务具有稳定 ID、状态、优先级、依赖和完成标准；不会假装任务已经完成 |
+| 参考文书 | 生成文书类型建议和缺失字段，占位信息不得补造 |
+| 方案版本 | 生成 `plan_version_candidate`、指纹、变化摘要和定性等级变化 |
+| 前端/Gradio | 共用同一结构化方案；网页端单独展示定性等级、五维判断、行动、路径和任务 |
+
+正式流程已经直接进入 `audit_and_save`。节点八通过审校后分配正式 `plan_version`、保存完整版本包并返回最终 Markdown；`conclude` 只保留给旧会话，不再承担正式草稿的默认呈现。
 
 ## 2. 节点职责
 
@@ -916,11 +936,20 @@ conditional_plan = true
 
 ## 17. 当前代码映射
 
-当前部分能力主要位于：
+当前节点七已经独立接入，旧逻辑继续作为兼容边界：
 
 | 当前实现 | 当前职责 |
 |---|---|
-| `src/agents/legal_guide/graph.py::node_conclude` | 旧流程中的行动方案生成、部分审校和长期记忆保存 |
+| `src/agents/legal_guide/generate_solution.py::run_generate_solution` | 节点七入口，负责版本校验、结构化草稿和路由结果 |
+| `src/agents/legal_guide/generate_solution.py::build_likelihood_dimensions` | 生成五个定性评估维度 |
+| `src/agents/legal_guide/generate_solution.py::derive_qualitative_likelihood` | 生成四级定性维权可能性 |
+| `src/agents/legal_guide/generate_solution.py::build_immediate_actions` | 将风险和证据缺口转换为当前行动 |
+| `src/agents/legal_guide/generate_solution.py::build_action_routes` | 生成推荐、替代和升级路径 |
+| `src/agents/legal_guide/generate_solution.py::build_case_tasks` | 生成并继承长期任务状态 |
+| `src/agents/legal_guide/generate_solution.py::render_solution_markdown` | 将结构化草稿渲染为稳定 Markdown |
+| `src/agents/legal_guide/graph.py::node_generate_solution` | GuideGraph 正式节点七入口 |
+| `src/agents/legal_guide/audit_and_save.py::run_audit_and_save` | 节点八入口，负责版本门禁、审校、发布和历史版本包 |
+| `src/agents/legal_guide/graph.py::node_conclude` | 只保留旧会话的兼容呈现和原生成逻辑 |
 | `src/agents/legal_guide/graph.py::_deterministic_conclusion_draft` | 模型失败时的确定性降级方案 |
 | `src/agents/legal_guide/graph.py::_ensure_required_plan_sections` | 补齐路径、胜算评估和行动清单 |
 | `src/agents/legal_guide/graph.py::_ensure_action_checklist` | 生成旧版行动清单兜底 |
@@ -928,31 +957,28 @@ conditional_plan = true
 | `src/agents/legal_guide/graph.py::_ensure_evidence_coverage_section` | 补充证据作用和缺口 |
 | `src/agents/legal_guide/graph.py::_ensure_case_reference` | 从结构化类案生成参考说明 |
 | `src/agents/legal_guide/prompts.py::CONCLUDE_PROMPT` | 旧版结论提示词 |
-| `src/agents/legal_guide/prompts.py::PLAN_AUDIT_PROMPT` | 当前与生成混合的审校提示词 |
+| `src/agents/legal_guide/prompts.py::PLAN_AUDIT_PROMPT` | 旧 `conclude` 兼容流程使用的审校提示词；正式节点八不让模型重写事实 |
 
 ### 17.1 当前已有能力
 
-- 使用事实、法律上下文和证据覆盖生成方案；
-- 生成维权路径、行动清单和条件式判断；
-- 模型失败时使用确定性降级；
-- 清理未经核验的证据断言；
-- 引用结构化类案和渠道；
-- 对输出章节进行确定性补齐；
-- 用户要求结论时按当前信息收敛。
+- 节点七只读取结构化事实、法律模型和证据覆盖，不修改上游状态；
+- 无材料时可以生成明确标注缺口的条件式方案；
+- 五个维度均保留因素、依据和限制；
+- 定性等级不使用内部置信分数或百分比；
+- 已提交、未提交、明确没有和可调取材料保持不同状态；
+- 每个关键证据缺口至少映射到一个行动；
+- 路径具有进入、首个行动、升级和停止条件；
+- 任务状态可以跨方案版本继承；
+- 方案候选版本和变化摘要可重复计算和幂等复用；
+- 模型不参与事实补造，Markdown 由结构化结果确定性渲染；
+- 旧会话仍可进入原 `conclude` 生成路径。
 
-### 17.2 当前缺口
+### 17.2 当前仍需后续完善
 
-- `node_conclude` 仍是旧节点编号和旧状态机；
-- 方案生成、审校、保存和长期记忆写入混在同一节点；
-- 当前置信度仍使用 `HIGH/MEDIUM/LOW` 和数值分数，不符合目标定性四级；
-- 旧输出使用“维权胜算评估”，容易被理解为概率判断；
-- 缺少事实、法律、证据和方案版本的完整绑定；
-- 缺少结构化五维评估和来源引用；
-- 缺少推荐路径的进入、升级和停止条件；
-- 缺少任务依赖、完成标准和状态模型；
-- 缺少正式的方案变化摘要和局部重算；
-- 文书草稿与事实快照、模板来源和方案版本尚未稳定关联；
-- 目标八节点工作流尚未真正建立独立 `generate_solution` 图节点。
+- 生产环境任务状态变更、程序进展事件和任务审计接口仍需单独接入；
+- 节点七当前默认复用节点五、六和现有渠道依据，易变期限、费用、地址的定向刷新可继续补强；
+- 参考文书当前以类型建议和缺失字段为主，正式文书草稿仍通过现有文书服务生成；
+- 旧 `HIGH/MEDIUM/LOW` 字段为兼容旧流程保留，但节点七用户输出不再使用它。
 
 ## 18. 重构建议
 
