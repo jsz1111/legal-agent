@@ -1,78 +1,69 @@
 """法律指引 Agent 的所有提示词常量。"""
 
 # ── 1. 法律问题提取（with_structured_output 用） ────────────────────────────
-ISSUE_EXTRACT_PROMPT = """你是法律问题提取专家。
+ISSUE_EXTRACT_PROMPT = """从对话中提取法律问题和当前用户新补充的原子事实，只输出 JSON。
 
-从用户描述中提取具体的法律问题，并标准化为法律术语。
-同时判断所属法律领域（从以下领域代码中选一个）：
-- labor_social_security（劳动/社保）
-- consumer_market（消费/市场）
-- contracts_property_housing（合同/商事/房产/建筑/租房）
-- criminal_public_security（刑事/治安）
-- family_vulnerable_groups（婚姻家庭/妇女儿童）
-- traffic_personal_injury（交通事故及非故意事故造成的人身损害）
-- medical_education_tax（医疗纠纷/税务纠纷）
-- administrative_remedies（行政救济/行政复议）
-- intellectual_property（知识产权）
-- environment_pollution（环境保护）
-- cyber_data_fraud（网络/数据/诈骗）
-- mediation_notary_arbitration（调解/公证/仲裁）
-- other（其他）
+领域 domain 只能选：
+labor_social_security, consumer_market, contracts_property_housing,
+criminal_public_security, family_vulnerable_groups, traffic_personal_injury,
+medical_education_tax, administrative_remedies, intellectual_property,
+environment_pollution, cyber_data_fraud, mediation_notary_arbitration, other。
 
-标准化示例：
-- "老板不给工资" → "拖欠劳动报酬"，domain: labor_social_security
-- "公司不签合同" → "未签订劳动合同"，domain: labor_social_security
-- "公司突然裁员/开除我" → "违法解除劳动合同"，domain: labor_social_security
-- "公司拖欠加班费" → "拖欠加班费"，domain: labor_social_security
-- "工伤不给赔偿" → "工伤赔偿纠纷"，domain: labor_social_security
-- "买到假货" → "销售假冒伪劣商品"，domain: consumer_market
-- "手机用一周就坏了商家不退" → "产品质量纠纷"，domain: consumer_market
-- "商家虚假宣传，买到的东西和描述不符" → "虚假宣传/欺诈消费者"，domain: consumer_market
-- "预付款/充值卡商家跑路了" → "预付款消费纠纷"，domain: consumer_market
-- "借钱不还" → "民间借贷纠纷"，domain: contracts_property_housing
-- "退房押金不退" → "房屋租赁押金纠纷"，domain: contracts_property_housing
-- "买了二手房发现漏水" → "房屋质量纠纷"，domain: contracts_property_housing
-- "买房定金不退" → "房屋买卖定金纠纷"，domain: contracts_property_housing
-- "装修包工头做一半跑路了" → "建设工程施工合同纠纷"，domain: contracts_property_housing
-- "股东不让我看公司账目" → "股东知情权纠纷"，domain: contracts_property_housing
-- "开发商延期交房" → "逾期交房违约纠纷"，domain: contracts_property_housing
-- "被车撞了想索赔" → "交通事故损害赔偿"，domain: traffic_personal_injury
-- "追尾事故对方不赔" → "交通事故责任纠纷"，domain: traffic_personal_injury
-- "被人故意打伤了" → "故意伤害/治安违法及人身损害赔偿"，domain: criminal_public_security
-- "有人在网上散布我的谣言" → "名誉权侵权"，domain: criminal_public_security
-- "邻居天天装修噪音扰民" → "噪声污染侵权"，domain: environment_pollution
-- "工厂排污导致庄稼受损" → "环境污染损害赔偿"，domain: environment_pollution
-- "别人抄了我的文章/图片/代码" → "著作权侵权"，domain: intellectual_property
-- "别人用了我的商标" → "商标侵权"，domain: intellectual_property
-- "对方在网上卖我的照片/隐私信息" → "个人信息权益侵权"，domain: cyber_data_fraud
-- "离婚想争孩子抚养权" → "抚养权争议"，domain: family_vulnerable_groups
-- "老公家暴" → "家庭暴力侵权"，domain: family_vulnerable_groups
-- "不服交警罚款" → "行政处罚异议"，domain: administrative_remedies
-- "城管没收了我的摊位" → "行政强制措施异议"，domain: administrative_remedies
-- "医疗事故赔偿" → "医疗损害赔偿"，domain: medical_education_tax
-- "网络诈骗" → "电信网络诈骗"，domain: cyber_data_fraud
-- "被网贷平台骚扰催收" → "暴力催收/骚扰侵权"，domain: cyber_data_fraud
+输入：
+{user_input}
 
-用户描述：{user_input}
+输出结构：
+{{
+  "issues": ["简短、保守的标准法律问题"],
+  "domain": "领域代码",
+  "facts": ["当前用户明确说出的事实"],
+  "case_updates": [{{
+    "key": "稳定语义键",
+    "category": "actor|relationship|event|claim|amount|time|location|evidence|procedure|harm|uncertainty",
+    "statement": "不含法律结论的完整事实",
+    "subject": "", "relation": "", "value": "",
+    "certainty": "asserted|uncertain|denied",
+    "operation": "add|replace|deny",
+    "source_text": "当前用户消息中的逐字原文"
+  }}],
+  "evidence_details": [{{
+    "name": "材料名称",
+    "source_form": "paper_original|native_electronic|exported_file|screenshot|copy|user_statement|unknown",
+    "completeness": "complete|partial|unknown",
+    "identity_visibility": "clear|unclear|not_applicable|unknown",
+    "time_visibility": "clear|unclear|not_applicable|unknown",
+    "acquisition_method": "user_created|received_from_counterparty|platform_or_institution_export|third_party|unknown",
+    "proof_roles": ["relationship|transaction|agreement|payment|event|problem|identity|time|communication|procedure|harm|loss|liability|ownership|infringement"],
+    "source_text": "当前用户消息中的逐字原文"
+  }}],
+  "region": "", "time_info": ""
+}}
 
-同时把用户明确说出的内容拆成通用原子事实 case_updates。每项包含：
-- key：稳定语义键，如 transaction.total_paid、counterparty.response、event.closure_time；同一事实跨轮更正时必须沿用同一个 key
-- category：actor/relationship/event/claim/amount/time/location/evidence/procedure/harm/uncertainty
-- statement：不添加法律结论的简明陈述
-- subject/relation/value：结构化三元信息，可为空
-- certainty：asserted/uncertain/denied
-- operation：add；用户明确更正旧说法时为 replace；明确否定旧事实时为 deny
-- source_text：必须逐字引用当前用户描述中的原文片段，不能写改写后的句子
+约束：
+1. 结合近期对话理解短回答，但 case_updates 和 evidence_details 只记录“当前用户消息”的新增、更正或否定内容。
+2. source_text 必须逐字出自当前用户消息；没有原文支持就不输出该项。
+3. 对照已有语义键：重复事实不新增键；补充沿用原键；更正用 replace；明确否定用 deny。
+4. 事实、诉求和法律判断分开。不得把用户陈述直接认定为违法、违约、侵权或犯罪。
+5. 证据材料一份只生成一个 evidence_details；金额、日期、主体等材料内容不是新的证据项。
+6. 不判断证据真实性、合法性、可采性、证明力或案件结果。信息不足时使用空数组或 unknown。
+7. 不输出解释、Markdown 或代码围栏。"""
 
-只提取原文明确内容，不做推测。行为事实、用户主张和法律结论必须分开；不得把事实自动改写成已经成立的违法、违约、侵权或犯罪结论。
-statement 必须脱离字段名后仍能独立读懂并包含实际值，例如写“用餐地点是某餐馆”，不能只写“发生问题的餐馆名称”；不要输出缺少具体值的栏目标题。
-如果用户描述中已经包含“已有结构化事实及语义键”，请先对照已有事实：
-- 当前消息只是重复已有事实、没有新增细节时，不要再次输出该事实的 case_updates。
-- 当前消息对已有事实补充了金额、时间、对象、地点、证据等新细节时，尽量沿用已有事实的 key；需要覆盖旧说法时 operation=replace。
-- 不要为了换一种说法而生成新的 key；key 要服务于跨轮合并，不是服务于自然语言摘要。
-长期记忆与本轮冲突时以本轮为准。
 
-填入 issues、domain、facts、case_updates、region、time_info 字段。无明确问题时 issues 为空列表。"""
+INTAKE_CLASSIFY_PROMPT = """根据用户已经填写的案件信息，只完成法律问题和领域分类。
+
+案件信息：
+{case_summary}
+
+domain 只能选：
+labor_social_security, consumer_market, contracts_property_housing,
+criminal_public_security, family_vulnerable_groups, traffic_personal_injury,
+medical_education_tax, administrative_remedies, intellectual_property,
+environment_pollution, cyber_data_fraud, mediation_notary_arbitration, other。
+
+只输出JSON：
+{{"issues":["简短、保守的法律问题"],"domain":"领域代码","region":"用户明确写出的地区或空字符串","time_info":"用户明确写出的时间或空字符串"}}
+
+不得把用户陈述直接认定为违法、违约、侵权或犯罪；信息不足时 issues 使用空数组。"""
 
 
 # ── 2. 紧急程度判断 ─────────────────────────────────────────────────────────
@@ -137,13 +128,21 @@ COUNTER_QUESTION_RESPONSE_PROMPT = """你在法律维权信息整理过程中，
 # ── 3. 澄清模糊描述 ─────────────────────────────────────────────────────────
 CLARIFY_PROMPT = """你是法律指引助手，帮助普通市民描述法律情况。
 
-用户说：{user_input}
+截至当前的对话：
+{recent_dialogue}
+
+已保存的案情：
+{case_context}
+
+用户最新回复：{user_input}
 
 描述较模糊，请用通俗语言只询问1个最关键的问题：
 - 发生了什么事情
 - 对方是谁（个人/公司/政府机构）
 - 大概什么时候发生的
 
+必须结合完整上下文理解用户最新回复，先判断哪些内容已经说清楚。
+不得再次询问对话或已保存案情中已经回答的内容，也不得让用户重新讲一遍事情经过。
 尽量给出二选一或简单示例，允许用户回答“不知道”。语气亲切，像朋友帮忙梳理。
 直接输出一个问题，不要开场白，不要一次列出多个编号问题。"""
 
@@ -199,6 +198,18 @@ PARSE_DETAILS_PROMPT = """从用户回答中提取关键信息，并形成可跨
   ],
   "evidence": ["用户提到已有的证据，如有"],
   "evidence_unavailable": ["用户明确表示没有的证据"],
+  "evidence_details": [
+    {{
+      "name": "材料名称",
+      "source_form": "paper_original/native_electronic/exported_file/screenshot/copy/user_statement/unknown",
+      "completeness": "complete/partial/unknown",
+      "identity_visibility": "clear/unclear/not_applicable/unknown",
+      "time_visibility": "clear/unclear/not_applicable/unknown",
+      "acquisition_method": "user_created/received_from_counterparty/platform_or_institution_export/third_party/unknown",
+      "proof_roles": ["该材料内容直接对应的通用证明角色"],
+      "source_text": "能够支持上述属性的用户回答逐字片段"
+    }}
+  ],
   "region": "提取到的城市/地区，无则空字符串",
   "time_info": "提取到的时间信息，无则空字符串",
   "adverse_facts": ["用户自身存在的不利法律事实；无则空列表"]
@@ -216,7 +227,9 @@ PARSE_DETAILS_PROMPT = """从用户回答中提取关键信息，并形成可跨
 7. 证据也写入 case_updates，category=evidence；用户称持有时 certainty=asserted，明确没有时 certainty=denied。
 8. adverse_facts 只记录用户明确陈述且可能影响责任、时效、请求或程序的客观内容，不能替用户作出“构成违约、超过时效、必然不能获赔”等法律判断。
 9. 本节点只解析回答中的事实和证据，不新增或升级法律问题；违法、违约、侵权、犯罪及责任成立与否均交给检索后的法律判断。
-10. 用户即使同时说“不要再问”“现在生成方案”，只要还提供了事实或证据，is_answer 仍为 true，并照常提取这些内容；流程控制指令不等于没有回答。"""
+10. 用户即使同时说“不要再问”“现在生成方案”，只要还提供了事实或证据，is_answer 仍为 true，并照常提取这些内容；流程控制指令不等于没有回答。
+11. evidence_details 只结构化用户明确说出的材料属性和 proof_roles，不得根据材料类型自行猜测。proof_roles 只能从 relationship/transaction/agreement/payment/event/problem/identity/time/communication/procedure/harm/loss/liability/ownership/infringement 中选择。没有逐字 source_text 锚点的属性一律填 unknown；不要在这里判断真实性、合法性、可采性或证明力。
+12. 每份材料只生成一条 evidence_details 和一条 category=evidence 的 case_update；材料里能看到的名称、金额、日期、是否裁剪等是材料属性，不得拆成新的证据项。"""
 
 
 # ── 6. 生成行动方案（conclude节点用） ──────────────────────────────────────
@@ -247,6 +260,9 @@ CONCLUDE_PROMPT = """请为用户生成一份实用的法律维权行动方案�
 
 ## 结构化证据状态（方案准备度不等于法律证明力）
 {evidence_assessments}
+
+## 证明目标覆盖评估（必须区分“有材料”和“能证明什么”）
+{evidence_coverage}
 
 使用规则：长期记忆只在与本案直接相关时作为补充；若与本轮陈述冲突，以用户本轮及较新的陈述为准。
 
@@ -301,6 +317,13 @@ CONCLUDE_PROMPT = """请为用户生成一份实用的法律维权行动方案�
 10. “追问规则的依据来源”用于解释问题设计和材料整理边界，不等于该来源已经对用户个案作出认定；标有仍待精确条款定位的来源不得冒充逐条人工审校结论。
 
 ## 输出格式（严格按以下部分，简洁实用）
+
+格式规则：
+1. 使用标准 Markdown；每个栏目标题必须单独成行，标题前后保留空行。
+2. 并列条件、证据、路径、利弊和行动步骤必须使用列表，不得挤成连续长段落。
+3. 每个自然段原则上不超过四句话；先给判断，再给理由和行动。
+4. 只加粗影响判断的关键词、期限、金额和行动，不得整段加粗。
+5. 不得把多个栏目标题或多个独立要点写在同一行。
 
 **【理解您的情况】**
 一句话识别用户处境和情绪（如"工资被拖欠确实令人气愤"），不超过20字。

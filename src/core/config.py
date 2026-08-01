@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     APP_NAME: str = "legal-agent"
     APP_ENV: str = "dev"
     APP_DEBUG: bool = True
+    FRONTEND_ORIGINS: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:7862,http://127.0.0.1:7862"
+    )
 
     # ── 法律指引业务配置 ──
     # 置信度分档阈值
@@ -27,12 +32,23 @@ class Settings(BaseSettings):
     GUIDE_MAX_LOW_INFO_ANSWERS: int = 3   # 连续三次真正无进展后停止盘问
     GUIDE_MAX_COUNTER_QUESTIONS: int = 3  # 连续只反问 3 次后按现有信息收敛
     GUIDE_MAX_TOTAL_ROUNDS: int = 20      # 仅作异常循环保险，不作为普通收敛依据
-    GUIDE_SESSION_TTL: int = 86400         # 法律指引状态与文书保留 24 小时，支持离开页面后继续
+    GUIDE_SESSION_TTL: int = 0             # 案件状态保留秒数；0 表示仅由用户手动删除
+    GUIDE_DOCUMENT_TTL: int = 86400        # 生成文书下载对象保留 24 小时
     GUIDE_CASE_BOUNDARY_CONFIDENCE: float = 0.72  # 低于该置信度时不继承旧案，先向用户确认
     # 检索超时配置（秒）
     GUIDE_RETRIEVE_TIMEOUT_STATUTE: float = 8.0   # 法条检索超时
     GUIDE_RETRIEVE_TIMEOUT_CASE: float = 5.0      # 案例检索超时
     GUIDE_RETRIEVE_TIMEOUT_GRAPH: float = 3.0     # 图谱查询超时
+    GUIDE_RETRIEVE_TIMEOUT_AUX: float = 5.0       # PG补充、标题、渠道等辅助查询
+    GUIDE_RETRIEVE_TIMEOUT_RERANK: float = 6.0    # 法条候选统一精排
+    # 各阶段模型调用独立超时；超时后由对应节点执行确定性降级。
+    GUIDE_LLM_TIMEOUT_URGENCY: float = 10.0
+    GUIDE_LLM_TIMEOUT_EXTRACT: float = 15.0
+    GUIDE_LLM_TIMEOUT_PARSE: float = 15.0
+    GUIDE_LLM_TIMEOUT_FOLLOWUP: float = 8.0
+    GUIDE_LLM_TIMEOUT_CONCLUDE: float = 35.0
+    GUIDE_LLM_TIMEOUT_AUDIT: float = 8.0
+    GUIDE_LLM_TIMEOUT_BOUNDARY: float = 10.0
 
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432

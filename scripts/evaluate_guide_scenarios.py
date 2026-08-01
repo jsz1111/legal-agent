@@ -578,7 +578,7 @@ def render_markdown(results: list[ScenarioResult], memory: dict) -> str:
         "## 验收结论",
         "",
         f"- 真实场景通过 {passed}/{len(results)}，评测警告 {warning_count} 项，场景累计耗时 {total_seconds:.1f} 秒。",
-        "- 核心 LangGraph 保持 9 个业务节点；连续只反问 3 次会提前收敛，全局第 12 个用户轮次仍是硬上限。",
+        "- 核心 LangGraph 保持 9 个业务节点；连续只反问 3 次会提前收敛，全局第 20 个用户轮次仅作为异常循环保险。",
         "- 法条、类案和渠道检索结果已进入最终方案；未检索到的法律名称或条号由确定性白名单拦截。",
         "- Redis 短期状态和 Milvus 长期记忆均通过真实读写。"
         + (f" API 两轮集成 {sum(bool(v) for v in api_checks.values())}/{len(api_checks)} 项通过。" if api_checks else ""),

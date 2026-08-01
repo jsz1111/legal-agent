@@ -6,14 +6,14 @@
 """
 import asyncio
 import json
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 import src.agents.legal_guide.graph as g
 from src.agents.legal_guide.state import GuideState, GuidePhase
 from src.agents.legal_guide.graph import (
-    node_check_urgency, node_prepare_turn, route_after_urgency,
+    node_check_urgency, node_extract_issues, node_prepare_turn, route_after_urgency,
     URGENCY_CRITICAL_RESPONSE, GuideDeps,
 )
 from langgraph.graph import END
@@ -42,6 +42,8 @@ def test_check_urgency_runs_on_later_rounds():
     assert deps.llm.ainvoke.await_count == 1, "非首轮必须实际执行高危检测"
     assert result["urgency_level"] == "critical"
     assert result["phase"] == GuidePhase.END
+    assert result["safety_pause_active"] is True
+    assert result["safety_pause_case_message"] == "对方今天上门把我打伤了"
     assert result["messages"][0].content == URGENCY_CRITICAL_RESPONSE
 
 
@@ -139,6 +141,71 @@ def test_normal_input_not_flagged():
     result = asyncio.run(node_check_urgency(state, deps))
     assert result.get("urgency_level") == "normal"
     assert result.get("phase") != GuidePhase.END
+
+
+def test_safety_pause_waits_for_clear_status_and_then_resumes_same_case():
+    paused = GuideState(
+        phase=GuidePhase.ISSUE_SEARCH,
+        safety_pause_active=True,
+        safety_pause_case_message="对方拿刀堵在门外",
+        current_safety_status="danger",
+        messages=[HumanMessage(content="我不知道他走没走")],
+    )
+    unknown = asyncio.run(node_check_urgency(paused, _make_deps({
+        "urgency": "NORMAL",
+        "safety_relevant": True,
+        "safety_status": "unknown",
+        "time_clue": "",
+    })))
+    assert unknown["phase"] == GuidePhase.END
+    assert unknown["safety_pause_active"] is True
+    assert "是否已经脱离现场" in unknown["messages"][0].content
+
+    safe = paused.model_copy(update={
+        "messages": [HumanMessage(content="我已经到朋友家，现在安全了")],
+    })
+    resumed = asyncio.run(node_check_urgency(safe, _make_deps({
+        "urgency": "NORMAL",
+        "safety_relevant": True,
+        "safety_status": "safe",
+        "time_clue": "",
+    })))
+    assert resumed["safety_pause_active"] is False
+    assert resumed["current_safety_status"] == "safe"
+    assert resumed.get("phase") != GuidePhase.END
+
+
+def test_resumed_safety_case_extracts_the_original_event_and_clears_pause_message():
+    state = GuideState(
+        round=2,
+        safety_pause_active=False,
+        safety_pause_case_message="对方拿刀堵在门外",
+        current_safety_status="safe",
+        messages=[HumanMessage(content="我已经到朋友家，现在安全了")],
+    )
+    normalizer = AsyncMock(return_value={
+        "standard": ["人身安全威胁"],
+        "colloquial": [],
+        "domain": "criminal_public_security",
+        "term_map": {},
+        "collected_facts": ["对方拿刀堵在门外", "用户现在安全"],
+        "case_updates": [],
+        "region": "",
+        "time_info": "",
+    })
+    deps = MagicMock()
+
+    with patch(
+        "src.agents.legal_guide.graph.normalize_legal_issues",
+        new=normalizer,
+    ):
+        updates = asyncio.run(node_extract_issues(state, deps))
+
+    submitted = normalizer.await_args.kwargs["user_input"]
+    assert "对方拿刀堵在门外" in submitted
+    assert "我已经到朋友家，现在安全了" in submitted
+    assert updates["safety_pause_case_message"] == ""
+    assert updates["confirmed_issues"] == ["人身安全威胁"]
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ from src.agents.legal_guide.followup_policy import (
     rank_followup_candidates,
     score_dynamic_proposal,
 )
+from src.agents.legal_guide.evidence_analysis import coverage_for_rule
+from src.agents.legal_guide.llm_runtime import ainvoke_bounded, llm_for_stage
 from src.core.config import get_settings
 
 
@@ -169,7 +171,7 @@ _SLOT_ALIASES = {
     "harm": (("harm",),),
     "infringement": (("event",),),
     "insurance_and_claim": (("relationship",), ("claim",)),
-    "legal_relationship": (("relationship", "counterparty", "actor"),),
+    "legal_relationship": (("event",), ("relationship", "counterparty", "actor")),
     "procedure": (("procedure",),),
     "property_and_safety": (("harm", "event"),),
     "right_type": (("relationship", "subject_matter"),),
@@ -177,6 +179,54 @@ _SLOT_ALIASES = {
     "transaction": (("amount",), ("counterparty", "relationship", "transaction", "location")),
     "claim": (("claim",),),
 }
+
+_DIMENSION_FOLLOWUP_QUESTIONS = {
+    "actor": "这件事主要涉及哪些人或单位？",
+    "counterparty": "对方是什么身份，例如个人、公司还是政府机构？",
+    "relationship": "您和对方是什么关系，例如买卖、借贷、劳动或租赁关系？",
+    "transaction": "这笔交易具体买了什么或约定了什么服务？",
+    "subject_matter": "争议涉及的商品、服务或其他标的具体是什么？",
+    "amount": "这件事涉及多少钱，已经实际支付或损失了多少？",
+    "event": "对方具体做了什么，当前争议结果是什么？",
+    "time": "事情大约是什么时候发生的？",
+    "location": "事情发生在哪里，或者通过哪个平台办理？",
+    "claim": "您现在最希望对方怎么处理？",
+    "procedure": "您此前是否已经联系、投诉、报警或申请处理，结果怎样？",
+    "evidence": "目前有哪些能够反映事情经过的材料？",
+    "harm": "这件事目前给您造成了哪些实际损失或影响？",
+    "safety": "您现在是否安全？",
+}
+_DIMENSION_ANSWER_HINTS = {
+    "actor": "简单说明涉及的人或单位即可，不清楚可以直接说“不清楚”。",
+    "counterparty": "简单说对方是个人、公司或其他机构即可。",
+    "relationship": "简单说明您和对方是什么关系即可，不确定可以说“不清楚”。",
+    "transaction": "简单说购买或约定的内容即可。",
+    "subject_matter": "说出商品、服务或其他争议对象即可。",
+    "amount": "可以说准确金额，也可以说大概数。",
+    "event": "按先后顺序简单说最关键的行为和结果即可。",
+    "time": "记不清具体日期时，说大概月份或时间范围即可。",
+    "location": "说出线下地点或线上平台即可。",
+    "claim": "直接说您最希望实现的结果即可。",
+    "procedure": "没有处理过也可以直接说“没有”。",
+    "evidence": "有、没有或暂时找不到都可以直接说。",
+    "harm": "可以只说目前已经发生的实际损失或影响。",
+    "safety": "如果危险仍在，先说“现在有危险”即可。",
+}
+
+
+def _focused_candidate_copy(candidate: dict[str, Any] | None) -> tuple[str, str]:
+    """Render only the still-missing part of a partially covered decision."""
+
+    coverage = (candidate or {}).get("coverage") or {}
+    known = list(coverage.get("known_dimension_keys") or [])
+    missing = list(coverage.get("missing_dimension_keys") or [])
+    if not known or not missing:
+        return "", ""
+    dimension = missing[0]
+    return (
+        _DIMENSION_FOLLOWUP_QUESTIONS.get(dimension, ""),
+        _DIMENSION_ANSWER_HINTS.get(dimension, ""),
+    )
 
 
 def _case_dimension_context(state: Any) -> tuple[set[str], dict[str, list[str]]]:
@@ -237,6 +287,8 @@ def candidate_coverage(slot: str, state: Any) -> dict[str, list[str]]:
     return {
         "known": relevant[-3:],
         "missing": [_DIMENSION_LABELS.get(item, item) for item in missing_dimensions],
+        "known_dimension_keys": known_dimensions,
+        "missing_dimension_keys": missing_dimensions,
     }
 
 
@@ -262,7 +314,8 @@ def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
         getattr(state, "evidence_unavailable", []) or []
     )
     for rule in domain_rules.evidence:
-        if rule.id not in asked and not evidence_rule_resolved(rule, known_evidence):
+        resolved = evidence_rule_resolved(rule, known_evidence)
+        if rule.id not in asked and not resolved:
             rows.append({
                 "id": rule.id, "kind": "evidence", "decision_dimension": rule.evidence_key,
                 "seed_question": rule.question, "legal_effect": rule.purpose,
@@ -272,6 +325,42 @@ def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
                     "known": known_evidence[-3:],
                     "missing": [rule.item],
                 },
+            })
+            continue
+        coverage = coverage_for_rule(
+            getattr(state, "evidence_coverage", {}) or {},
+            rule.id,
+        )
+        if (
+            rule.id not in asked
+            and resolved
+            and coverage
+            and coverage.status == "partially_covered"
+            and coverage.quality_gaps
+        ):
+            rows.append({
+                "id": rule.id,
+                "kind": "evidence",
+                "decision_dimension": rule.evidence_key,
+                "seed_question": (
+                    f"您提到已有{rule.item}，请确认原始载体是否还在、内容是否完整，"
+                    "以及能否看清相关主体和形成时间？"
+                ),
+                "legal_effect": "判断该材料的具体证明范围和优先补强方向",
+                "alternatives": rule.alternatives,
+                "priority": rule.priority + 1,
+                "low_burden_hint": "不确定的项目可以直接说“不清楚”。",
+                "coverage": {
+                    "known": [
+                        str(item.get("name") or "")
+                        for item in (
+                            getattr(state, "evidence_items", []) or []
+                        )
+                        if isinstance(item, dict) and item.get("name")
+                    ][-3:],
+                    "missing": coverage.quality_gaps[:3],
+                },
+                "evaluation_mode": "quality",
             })
     return rows, domain_rules.source
 
@@ -444,6 +533,79 @@ def _grounded_acknowledgement(state: Any, requested_keys: list[str]) -> tuple[st
     return f"您刚补充的“{'；'.join(quotes)}”我已经记下", keys
 
 
+def _selected_candidate_fallback(
+    *,
+    state: Any,
+    candidate: dict[str, Any] | None,
+    score: Any,
+    scores: list[Any],
+    source: Any,
+    mode: str,
+) -> dict[str, Any]:
+    """Use the application-owned catalog question when model phrasing fails."""
+
+    if not candidate or not score:
+        return _stop_plan(
+            mode,
+            decision_trace=_policy_trace(
+                mode=mode,
+                scores=scores,
+                selected_id="",
+            ),
+        )
+    focused_question, focused_hint = _focused_candidate_copy(candidate)
+    question = _single_question(
+        focused_question or str(candidate.get("seed_question") or "").strip()
+    )
+    if not question:
+        return _stop_plan(
+            mode,
+            decision_trace=_policy_trace(
+                mode=mode,
+                scores=scores,
+                selected_id=str(candidate.get("id") or ""),
+            ),
+        )
+    if "？" not in question and "?" not in question:
+        question += "？"
+    acknowledgement, acknowledged = _grounded_acknowledgement(state, [])
+    reason = str(candidate.get("legal_effect") or "判断下一步处理方式")
+    for prefix in ("为了用于", "用于", "为了"):
+        if reason.startswith(prefix):
+            reason = reason[len(prefix):].strip()
+            break
+    return {
+        "should_ask": True,
+        "ask_type": str(candidate.get("kind") or "facts"),
+        "decision_key": str(candidate.get("id") or ""),
+        "candidate_id": str(candidate.get("id") or ""),
+        "question": question,
+        "reason": reason,
+        "contextual_reason": "",
+        "answer_hint": str(
+            focused_hint
+            or candidate.get("low_burden_hint")
+            or "不确定时可以直接说“不清楚”。"
+        ),
+        "acknowledgement": acknowledgement,
+        "acknowledged_fact_keys": acknowledged,
+        "basis_kind": "official_elements",
+        "law_index": -1,
+        "law_source": {},
+        "official_source": source.model_dump(),
+        "information_gain": score.information_gain,
+        "user_burden": score.user_burden,
+        "policy_score": score.net_score,
+        "decision_effects": score.decision_effects,
+        "decision_trace": _policy_trace(
+            mode=mode,
+            scores=scores,
+            selected_id=str(candidate.get("id") or ""),
+        ),
+        "planner_mode": mode,
+    }
+
+
 async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
     """Choose and phrase the single highest-value next question."""
     candidates, source = build_followup_candidates(state)
@@ -523,40 +685,45 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
         ),
     )
     try:
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=700),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_FOLLOWUP,
+            stage="followup_planner",
+        )
         proposal = FollowupPlanProposal.model_validate(_json_content(response.content))
         plan = proposal.model_dump()
-    except (AttributeError, TypeError, ValueError, ValidationError, json.JSONDecodeError) as exc:
-        logger.warning("动态追问规划失败，按现有信息收敛: {}", exc)
-        return _stop_plan(
-            "planner_error",
-            decision_trace=_policy_trace(
-                mode="planner_error",
-                scores=policy_scores,
-                selected_id=selected_score.candidate_id if selected_score else "",
-            ),
+    except Exception as exc:
+        logger.warning("动态追问表达失败，回退到确定性题库问题: {}", exc)
+        return _selected_candidate_fallback(
+            state=state,
+            candidate=selected_candidate,
+            score=selected_score,
+            scores=policy_scores,
+            source=source,
+            mode="deterministic_fallback_planner_error",
         )
 
     if not bool(plan.get("should_ask")):
-        return _stop_plan(
-            "model_declined_selected_candidate",
-            decision_trace=_policy_trace(
-                mode="model_declined_selected_candidate",
-                scores=policy_scores,
-                selected_id=selected_score.candidate_id if selected_score else "",
-            ),
+        return _selected_candidate_fallback(
+            state=state,
+            candidate=selected_candidate,
+            score=selected_score,
+            scores=policy_scores,
+            source=source,
+            mode="deterministic_fallback_model_declined",
         )
 
     proposed_candidate_id = str(plan.get("candidate_id") or "").strip()
     if selected_candidate:
         if proposed_candidate_id and proposed_candidate_id != selected_candidate["id"]:
-            return _stop_plan(
-                "model_changed_policy_candidate",
-                decision_trace=_policy_trace(
-                    mode="model_changed_policy_candidate",
-                    scores=policy_scores,
-                    selected_id=selected_candidate["id"],
-                ),
+            return _selected_candidate_fallback(
+                state=state,
+                candidate=selected_candidate,
+                score=selected_score,
+                scores=policy_scores,
+                source=source,
+                mode="deterministic_fallback_model_changed_candidate",
             )
         candidate_id = selected_candidate["id"]
         policy_score = selected_score
@@ -581,6 +748,10 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
     question = _single_question(raw_question)
     if question != raw_question:
         logger.info("动态追问包含多个问题，保留首个中心问题 | raw={}", raw_question)
+    focused_question, focused_hint = _focused_candidate_copy(selected_candidate)
+    if focused_question:
+        question = focused_question
+        plan["answer_hint"] = focused_hint
     ask_type = str(plan.get("ask_type") or "facts")
     if ask_type == "evidence" and selected_candidate and not any(
         marker in question
@@ -602,6 +773,15 @@ async def plan_next_followup(state: Any, llm: Any) -> dict[str, Any]:
         or _FREE_TEXT_LEGAL_CLAIM.search(question)
     ):
         logger.warning("动态追问计划未通过结构校验，按现有信息收敛 | plan={}", plan)
+        if selected_candidate:
+            return _selected_candidate_fallback(
+                state=state,
+                candidate=selected_candidate,
+                score=selected_score,
+                scores=policy_scores,
+                source=source,
+                mode="deterministic_fallback_invalid_expression",
+            )
         return _stop_plan(
             "policy_rejected",
             decision_trace=_policy_trace(

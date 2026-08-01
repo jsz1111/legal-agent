@@ -204,7 +204,7 @@ def assess_evidence_answer(
     limitations = []
     if availability not in {"unavailable", "unclear"}:
         limitations.extend(_evidence_limitations(f"{rule.item} {value}"))
-    return {
+    record = {
         "rule_id": rule.id,
         "evidence_key": rule.evidence_key,
         "canonical_item": rule.item,
@@ -217,6 +217,22 @@ def assess_evidence_answer(
         "limitations": limitations,
         "answer_excerpt": value,
     }
+    for field in (
+        "source_form",
+        "completeness",
+        "identity_visibility",
+        "time_visibility",
+        "acquisition_method",
+        "case_specificity",
+        "content_digest",
+        "material_claims",
+        "content_conflicts",
+        "inspection_basis",
+        "quality_source_excerpt",
+    ):
+        if previous and previous.get(field):
+            record[field] = previous[field]
+    return record
 
 
 def assess_initial_evidence(
@@ -278,6 +294,8 @@ def evidence_effective_count(evidence_items: list[str], assessments: dict[str, d
             None,
         )
         availability = (matched or {}).get("availability")
+        if (matched or {}).get("case_specificity") == "blank_or_reference":
+            continue
         if availability == "uploaded_copy":
             total += 0.70
         elif availability in {"user_claimed_present", "conflicted"}:
@@ -322,8 +340,13 @@ def format_evidence_assessments(records: dict[str, dict]) -> str:
         purpose = record.get("purpose") or "证明目的待结合案情判断"
         limitations = "；".join(record.get("limitations") or [])
         suffix = f"；局限：{limitations}" if limitations else ""
+        specificity = (
+            "；材料性质：空白模板或参考资料，不能作为本案事实记录"
+            if record.get("case_specificity") == "blank_or_reference"
+            else ""
+        )
         lines.append(
             f"- {record.get('canonical_item')}：{label}；可能用途：{purpose}；"
-            f"法律上的可采性尚未确定{suffix}"
+            f"法律上的可采性尚未确定{specificity}{suffix}"
         )
     return "\n".join(lines)

@@ -163,6 +163,8 @@ uploads/
 
 # Local runtime, validation, and ad-hoc debugging artifacts
 tmp/
+/.tmp_*/
+/output/
 test_output_*.txt
 /_test_*.py
 /_check_*.py

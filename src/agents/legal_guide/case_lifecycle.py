@@ -11,6 +11,7 @@ from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
 from src.agents.legal_guide.case_model import format_case_context
+from src.agents.legal_guide.llm_runtime import ainvoke_bounded, llm_for_stage
 from src.agents.legal_guide.state import GuidePhase, GuideState
 from src.core.config import get_settings
 
@@ -158,9 +159,14 @@ async def decide_case_boundary(
         message=message,
     )
     try:
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=500),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_BOUNDARY,
+            stage="case_boundary",
+        )
         proposal = CaseBoundaryProposal.model_validate(_json_payload(response.content))
-    except (AttributeError, TypeError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+    except Exception as exc:
         logger.warning("案件边界判断失败，转人工确认式澄清 | error={}", exc)
         return CaseBoundaryDecision(
             relation=CaseRelation.UNCERTAIN,
@@ -197,9 +203,14 @@ async def resolve_pending_boundary(
         message=message,
     )
     try:
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=500),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_BOUNDARY,
+            stage="pending_case_boundary",
+        )
         proposal = CaseBoundaryProposal.model_validate(_json_payload(response.content))
-    except (AttributeError, TypeError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+    except Exception as exc:
         logger.warning("案件边界确认解析失败，继续保持待确认状态 | error={}", exc)
         return CaseBoundaryDecision(
             relation=CaseRelation.UNCERTAIN,

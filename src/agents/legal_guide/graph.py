@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from difflib import SequenceMatcher
@@ -52,6 +53,16 @@ from src.agents.legal_guide.evidence_rules import (
     format_evidence_source,
     resolve_state_evidence_checklist,
 )
+from src.agents.legal_guide.evidence_analysis import (
+    EvidenceEvaluationReport,
+    evaluate_state_evidence,
+    format_evidence_coverage,
+    inspect_uploaded_evidence_blocks,
+    merge_evidence_observations,
+    normalize_evidence_observations,
+    split_uploaded_evidence_blocks,
+)
+from src.agents.legal_guide.llm_runtime import ainvoke_bounded, llm_for_stage
 from src.agents.legal_guide.followup_catalog import (
     assess_evidence_answer,
     assess_fact_answer,
@@ -388,35 +399,51 @@ async def node_check_urgency(state: GuideState, deps: GuideDeps) -> dict:
         f"- 第{index + 1}条：{message}"
         for index, message in enumerate(recent_human_messages)
     )
+    explicitly_safe = any(
+        marker in "\n".join(recent_human_messages)
+        for marker in (
+            "今天暂时安全", "现在暂时安全", "目前暂时安全", "现在安全",
+            "目前安全", "已经安全", "没有安全危险", "现在没有危险",
+            "目前没有危险", "已经离开现场", "现在不在现场",
+        )
+    )
+    deterministic_current_danger = any(
+        marker in last_msg
+        for marker in (
+            "现在有危险", "目前有危险", "正在打", "正在施暴", "正在追",
+            "拿刀", "持刀", "要杀", "赶过来", "马上过来", "被困",
+            "不让我走", "无法离开", "就在门外",
+        )
+    )
+    # 高精度现实危险信号先于模型处理，避免模型超时让安全熔断失效。
+    if deterministic_current_danger and not explicitly_safe:
+        logger.warning("节点②确定性检测到当前危险，立即触发安全中断")
+        return {
+            "urgency_level": "critical",
+            "safety_relevant": True,
+            "current_safety_status": "danger",
+            "safety_pause_active": True,
+            "safety_pause_case_message": state.safety_pause_case_message or last_msg,
+            "phase": GuidePhase.END,
+            "messages": [AIMessage(content=URGENCY_CRITICAL_RESPONSE)],
+        }
     prompt = URGENCY_CHECK_PROMPT.format(
         user_input=last_msg,
         recent_dialogue=recent_dialogue or f"- {last_msg}",
     )
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
     try:
+        response = await ainvoke_bounded(
+            llm_for_stage(deps.llm, max_tokens=500),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_URGENCY,
+            stage="urgency_check",
+        )
         content = response.content.strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         result = json.loads(content)
         urgency = result.get("urgency", "NORMAL")
         time_clue = result.get("time_clue", "")
-        recent_text = "\n".join(recent_human_messages)
-        explicitly_safe = any(
-            marker in recent_text
-            for marker in (
-                "今天暂时安全", "现在暂时安全", "目前暂时安全", "现在安全",
-                "目前安全", "已经安全", "没有安全危险", "现在没有危险",
-                "目前没有危险", "已经离开现场", "现在不在现场",
-            )
-        )
-        deterministic_current_danger = any(
-            marker in last_msg
-            for marker in (
-                "现在有危险", "目前有危险", "正在打", "正在施暴", "正在追",
-                "拿刀", "持刀", "要杀", "赶过来", "马上过来", "被困",
-                "不让我走", "无法离开", "就在门外",
-            )
-        )
         allowed_safety_statuses = {"danger", "safe", "unknown", "not_applicable"}
         model_safety_status = str(result.get("safety_status") or "").lower()
         safety_relevant = bool(result.get("safety_relevant"))
@@ -515,9 +542,15 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
     human_msgs = [m.content for m in state.messages if isinstance(m, HumanMessage)]
     if not human_msgs:
         return {}
-    combined_input = "\n".join(human_msgs[-3:])
+    combined_input = "\n".join(
+        split_uploaded_evidence_blocks(message)[0]
+        for message in human_msgs[-3:]
+    )
     memories = _active_long_term_memories(state)
-    prior_messages = human_msgs[-3:-1]
+    prior_messages = [
+        split_uploaded_evidence_blocks(message)[0]
+        for message in human_msgs[-3:-1]
+    ]
     current_user_input = human_msgs[-1]
     resumed_safety_case = bool(
         state.safety_pause_case_message
@@ -530,11 +563,25 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
             + "\n当前安全状态补充："
             + human_msgs[-1]
         )
+    narrative_input, uploaded_observations = split_uploaded_evidence_blocks(
+        current_user_input
+    )
+    attachment_inventory = "\n".join(
+        f"- {item['name']}（系统已收到副本，内容不得自动当作用户确认事实）"
+        for item in uploaded_observations
+    )
     normalizer_input = (
         "[近期对话，仅用于理解语境]\n"
         + ("\n".join(prior_messages) or "无")
         + "\n\n[当前用户消息]\n"
-        + current_user_input
+        + (narrative_input or "用户本轮仅提交了附件")
+        + (
+            "\n\n[本轮附件清单]\n"
+            + attachment_inventory
+            + "\n附件由程序单独进入证据库存；不要把附件全文或其中陈述写成用户已经确认的案情事实。"
+            if attachment_inventory
+            else ""
+        )
         + "\n\ncase_updates 只提取[当前用户消息]中的新增、更正或否定内容；"
           "source_text 必须来自该消息原文。"
     )
@@ -551,12 +598,16 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
             + "\n".join(f"- {item}" for item in memories)
         )
     logger.info("节点③提取法律问题 | round={}", state.round)
-    result = await normalize_legal_issues(
-        user_input=normalizer_input,
-        llm=deps.llm,
-        neo4j_driver=deps.neo4j_driver,
-        embedding_model=deps.embedding_model,
-        milvus_client=deps.milvus_client,
+    result, inspected_evidence_observations = await asyncio.gather(
+        normalize_legal_issues(
+            user_input=normalizer_input,
+            llm=deps.llm,
+            neo4j_driver=deps.neo4j_driver,
+            embedding_model=deps.embedding_model,
+            milvus_client=deps.milvus_client,
+            fallback_text=combined_input,
+        ),
+        inspect_uploaded_evidence_blocks(current_user_input, deps.llm),
     )
     # 两个池分别累积，跨轮保序去重（不用 set，避免检索 query 每轮字符串顺序漂移）
     def _merge(old: list[str], new: list[str]) -> list[str]:
@@ -574,9 +625,32 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
         if x not in promoted
     ]
     proposed_domain = result["domain"] or state.legal_domain
-    # The primary legal domain is stable for one case. New facts can broaden
-    # retrieval, but an inferred label must not silently replace the workflow.
-    domain = state.legal_domain or proposed_domain
+    # The domain is stable after retrieval/conclusion, but an early low-information
+    # label may be revised when a later message supplies grounded facts and a
+    # concrete issue. This handles ordinary user corrections without treating
+    # the first short answer as an irreversible routing decision.
+    can_revise_early_domain = bool(
+        state.legal_domain
+        and state.legal_domain != "other"
+        and proposed_domain
+        and proposed_domain != "other"
+        and proposed_domain != state.legal_domain
+        and not state.retrieval_completed
+        and state.confidence_tier in {"", "LOW"}
+        and result_standard
+        and (result.get("case_updates") or result.get("collected_facts"))
+    )
+    domain = (
+        proposed_domain
+        if not state.legal_domain or state.legal_domain == "other" or can_revise_early_domain
+        else state.legal_domain
+    )
+    if can_revise_early_domain:
+        logger.info(
+            "早期领域依据被更具体的新事实修正 | old={} new={}",
+            state.legal_domain,
+            proposed_domain,
+        )
     new_term_map = {**state.term_map, **result_term_map}
     raw_case_updates = result.get("case_updates") or legacy_fact_updates(
         result.get("collected_facts") or [],
@@ -606,7 +680,24 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
         if case_facts
         else _merge(state.draftable_facts, active_draftable_facts)
     )
-    atom_evidence, atom_unavailable = evidence_from_case_facts(case_facts)
+    initial_evidence_observations = normalize_evidence_observations(
+        result.get("evidence_details"),
+        user_text=latest_user_text,
+    )
+    initial_evidence_observations.extend(inspected_evidence_observations)
+    # Always merge the deterministic upload inventory after model output.  It
+    # supplies the transport facts (received copy, source form and digest) that
+    # must survive even when the model omits or misreads an attachment.
+    initial_evidence_observations.extend(uploaded_observations)
+    current_turn_atoms = latest_case_facts(case_facts, state.round)
+    atom_evidence, atom_unavailable = evidence_from_case_facts(current_turn_atoms)
+    if initial_evidence_observations:
+        # evidence_details is the material-level inventory.  case_updates may
+        # also contain attributes visible inside a document (amount, name,
+        # timestamp); those are not separate evidence items.
+        atom_evidence = [
+            item["name"] for item in initial_evidence_observations
+        ]
     new_evidence = _merge(state.evidence_confirmed, atom_evidence)
     new_unavailable = _merge(state.evidence_unavailable, atom_unavailable)
     region_extracted = (
@@ -623,6 +714,7 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
     updates = {
         "unmatched_issues": new_unmatched,
         "term_map": new_term_map,
+        "issue_refresh_needed": False,
         "collected_facts": new_facts,
         "draftable_facts": new_draftable_facts,
         "case_facts": case_facts,
@@ -634,13 +726,22 @@ async def node_extract_issues(state: GuideState, deps: GuideDeps) -> dict:
         ),
     }
 
+    evidence_assessments = state.evidence_assessments
     if new_evidence != state.evidence_confirmed:
         updates["evidence_confirmed"] = new_evidence
         newly_found = [item for item in new_evidence if item not in state.evidence_confirmed]
-        updates["evidence_assessments"] = assess_initial_evidence(
+        evidence_assessments = assess_initial_evidence(
             newly_found,
             state.evidence_assessments,
         )
+    if initial_evidence_observations:
+        evidence_assessments = merge_evidence_observations(
+            evidence_assessments,
+            initial_evidence_observations,
+            domain=domain,
+        )
+    if evidence_assessments != state.evidence_assessments:
+        updates["evidence_assessments"] = evidence_assessments
 
     if region_extracted and not state.region:
         updates["region"] = region_extracted
@@ -665,12 +766,46 @@ async def node_clarify(state: GuideState, deps: GuideDeps) -> dict:
     last_msg = next((m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)), "")
     logger.info("节点④澄清引导 | round={} clarify_rounds={} total_rounds={}",
                 state.round, state.clarify_rounds, state.total_rounds)
-    prompt = CLARIFY_PROMPT.format(user_input=last_msg)
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    recent_messages = state.messages[-8:]
+    recent_dialogue = "\n".join(
+        f"{'用户' if isinstance(message, HumanMessage) else '助手'}：{str(message.content)[:500]}"
+        for message in recent_messages
+    )
+    prompt = CLARIFY_PROMPT.format(
+        user_input=last_msg,
+        recent_dialogue=recent_dialogue or f"用户：{last_msg}",
+        case_context=format_case_context(state.case_facts),
+    )
+    try:
+        response = await ainvoke_bounded(
+            llm_for_stage(deps.llm, max_tokens=350),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_EXTRACT,
+            stage="clarify",
+        )
+        reply = str(response.content or "").strip()
+    except Exception as exc:
+        logger.warning("澄清生成失败，使用低负担固定澄清 | err={}", exc)
+        reply = (
+            "请用一两句话补充：事情发生在谁和谁之间、发生了什么，"
+            "以及您现在最希望解决什么问题。暂时不清楚的部分可以直接说“不清楚”。"
+        )
+    # 澄清也是一个真实追问：下一轮必须先解析这道题的回答，不能把用户
+    # 的短回答当成脱离上下文的新问题再次分类。
+    if "？" in reply:
+        reply = reply.split("？", 1)[0].strip() + "？"
+    elif "?" in reply:
+        reply = reply.split("?", 1)[0].strip() + "？"
+    elif reply:
+        reply = reply.rstrip("。；") + "？"
     return {
         "clarify_rounds": state.clarify_rounds + 1,
         "phase": GuidePhase.CLARIFY,
-        "messages": [AIMessage(content=response.content)],
+        "asked_details": _merge_unique(state.asked_details, [reply]),
+        "pending_ask_details": [reply],
+        "pending_ask_type": "facts",
+        "pending_followup_ids": [],
+        "messages": [AIMessage(content=reply)],
     }
 
 
@@ -678,10 +813,27 @@ async def node_score(state: GuideState, deps: GuideDeps) -> dict:
     """节点⑤：纯规则打分（打分前置、零 I/O），决定是否值得深度检索。"""
     domain = state.legal_domain
     evidence_total = len(resolve_state_evidence_checklist(state).items)
-    effective_evidence = evidence_effective_count(
-        state.evidence_confirmed,
-        state.evidence_assessments,
+    raw_evidence_report = state.evidence_coverage or {}
+    evidence_report = (
+        EvidenceEvaluationReport.model_validate(raw_evidence_report)
+        if raw_evidence_report
+        else evaluate_state_evidence(state)
     )
+    if evidence_report.target_count:
+        evidence_total = evidence_report.target_count
+        # This is plan-preparation coverage, not a judicial proof score.
+        # Partially covered targets receive limited credit so an uninspected
+        # screenshot cannot inflate confidence as much as a source-anchored,
+        # complete material.
+        effective_evidence = (
+            float(evidence_report.preliminarily_covered_count)
+            + 0.35 * float(evidence_report.partial_count)
+        )
+    else:
+        effective_evidence = evidence_effective_count(
+            state.evidence_confirmed,
+            state.evidence_assessments,
+        )
 
     time_known = (
         bool(state.time_warning) or
@@ -732,6 +884,41 @@ def _rrf_fuse(hits_a: list[dict], hits_b: list[dict], k: int = 60, top_n: int = 
         hit["score"] = round(rrf_scores[key], 6)
         result.append(hit)
     return result
+
+
+def _retrieval_fingerprint(state: GuideState) -> str:
+    """Hash only facts that materially shape legal retrieval."""
+
+    inputs = build_case_retrieval_inputs(
+        state.confirmed_issues,
+        active_case_facts(state.case_facts),
+    )
+    payload = {
+        "domain": state.legal_domain,
+        "issues": list(state.confirmed_issues),
+        "unmatched": list(state.unmatched_issues[:5]),
+        "lexical": list(inputs.get("lexical_phrases") or []),
+        "semantic": list(inputs.get("semantic_phrases") or []),
+        "evidence": list(state.evidence_confirmed[:5]),
+        "time": state.time_info,
+        "region": state.region,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def _retrieval_snapshot_reusable(state: GuideState) -> bool:
+    if not state.retrieval_completed:
+        return False
+    if not state.retrieval_fingerprint:
+        # Compatibility with snapshots persisted before fingerprints existed.
+        return True
+    return state.retrieval_fingerprint == _retrieval_fingerprint(state)
 
 
 async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
@@ -888,11 +1075,14 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
     if deps.db_session and effective_domain and lexical_phrases:
         from src.agents.legal_knowledge.statute_rag import search_statutes_pg_fallback
         try:
-            pg_hits = await search_statutes_pg_fallback(
-                effective_domain,
-                lexical_phrases,
-                deps.db_session,
-                limit=16,
+            pg_hits = await asyncio.wait_for(
+                search_statutes_pg_fallback(
+                    effective_domain,
+                    lexical_phrases,
+                    deps.db_session,
+                    limit=16,
+                ),
+                timeout=settings.GUIDE_RETRIEVE_TIMEOUT_AUX,
             )
             if pg_hits:
                 combined: list[dict] = []
@@ -912,8 +1102,15 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
     if effective_domain and law_hits:
         from src.agents.legal_knowledge.reranker import rerank_docs as _rerank
         candidate_count = len(law_hits)
-        law_hits = await _rerank(question, law_hits, top_k=8)
-        logger.info("法条统一精排完成 | candidates={} final={}", candidate_count, len(law_hits))
+        try:
+            law_hits = await asyncio.wait_for(
+                _rerank(question, law_hits, top_k=8),
+                timeout=settings.GUIDE_RETRIEVE_TIMEOUT_RERANK,
+            )
+            logger.info("法条统一精排完成 | candidates={} final={}", candidate_count, len(law_hits))
+        except Exception as rerank_err:
+            logger.warning("法条精排超时或失败，保留融合候选顺序 | err={}", rerank_err)
+            law_hits = law_hits[:8]
 
     fallback_guide = None
     similar_cases = []
@@ -940,7 +1137,10 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
     law_titles: dict[str, str] = {}
     if law_hits and deps.db_session:
         try:
-            law_titles = await _fetch_law_titles(law_hits, deps.db_session)
+            law_titles = await asyncio.wait_for(
+                _fetch_law_titles(law_hits, deps.db_session),
+                timeout=settings.GUIDE_RETRIEVE_TIMEOUT_AUX,
+            )
         except Exception as e:
             logger.warning(f"获取法律标题失败（PostgreSQL不可用），降级显示: {e}")
     # primary_count=5：前5条作为核心法条，确保关键法律依据被充分展示
@@ -957,12 +1157,19 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
 
     # 渠道是精确结构化数据：以 PostgreSQL 为主库，按专属渠道、公共法律服务、
     # 12345 兜底分层查询。数据库异常时 Repository 内部返回最小全国渠道。
-    channels = await query_recommended_channels(
-        domain=domain,
-        region=state.region,
-        db=deps.db_session,
-        limit=6,
-    )
+    try:
+        channels = await asyncio.wait_for(
+            query_recommended_channels(
+                domain=domain,
+                region=state.region,
+                db=deps.db_session,
+                limit=6,
+            ),
+            timeout=settings.GUIDE_RETRIEVE_TIMEOUT_AUX,
+        )
+    except Exception as channel_err:
+        logger.warning("渠道查询超时或失败，使用空渠道降级 | err={}", channel_err)
+        channels = []
 
     graph_laws = graph_result.get("laws", [])
 
@@ -985,6 +1192,7 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
         "fallback_guide": fallback_guide,  # 案例检索兜底指引
         "last_confirmed_count": len(state.confirmed_issues),  # 记录本次检索时的 issue 数量
         "retrieval_completed": True,
+        "retrieval_fingerprint": _retrieval_fingerprint(state),
     }
 
     # 仅 HIGH 档做自省（启发式判断：法条适用性/时效/管辖）
@@ -995,7 +1203,12 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
             law_context=law_context_formatted[:2000],  # 截取避免过长
         )
         try:
-            review_resp = await deps.llm.ainvoke([SystemMessage(content=review_prompt)])
+            review_resp = await ainvoke_bounded(
+                llm_for_stage(deps.llm, max_tokens=600),
+                [SystemMessage(content=review_prompt)],
+                timeout=settings.GUIDE_LLM_TIMEOUT_AUDIT,
+                stage="retrieval_self_review",
+            )
             content = review_resp.content.strip()
             if "```" in content:
                 content = content.split("```")[1].lstrip("json").strip()
@@ -1012,25 +1225,25 @@ async def node_retrieve(state: GuideState, deps: GuideDeps) -> dict:
 
 
 async def node_assess_retrieve(state: GuideState, deps: GuideDeps) -> dict:
-    """节点⑤：规则评分与法条、类案、渠道检索合并为一个原子业务步骤。"""
-    score_updates = await node_score(state, deps)
-    scored_state = state.model_copy(update=score_updates)
-    has_current_turn_facts = bool(
-        latest_case_facts(scored_state.case_facts, scored_state.round)
-    )
-    if (
-        scored_state.retrieval_completed
-        and (scored_state.wants_conclude or scored_state.supplement_choice in {"continue", "conclude"})
-        and not scored_state.supplement_has_details
-        and not has_current_turn_facts
-    ):
-        logger.info("节点⑤复用上一轮检索结果 | 用户已完成补充选择")
-        retrieval_updates = {}
-    else:
-        retrieval_updates = await node_retrieve(scored_state, deps)
-    assessed_state = scored_state.model_copy(update=retrieval_updates)
-    sufficiency = assess_decision_sufficiency(assessed_state)
-    assessed_state = assessed_state.model_copy(
+    """节点⑤：先决定追问或收敛，仅在收敛时执行完整检索。"""
+    evidence_report = evaluate_state_evidence(state)
+    evidence_updates = {
+        "evidence_items": [
+            item.model_dump() for item in evidence_report.items
+        ],
+        "proof_targets": [
+            item.model_dump() for item in evidence_report.targets
+        ],
+        "evidence_links": [
+            item.model_dump() for item in evidence_report.links
+        ],
+        "evidence_coverage": evidence_report.model_dump(),
+    }
+    evidence_state = state.model_copy(update=evidence_updates)
+    score_updates = await node_score(evidence_state, deps)
+    scored_state = evidence_state.model_copy(update=score_updates)
+    sufficiency = assess_decision_sufficiency(scored_state)
+    assessed_state = scored_state.model_copy(
         update={"decision_sufficiency": sufficiency.model_dump()}
     )
     should_stop, force = should_conclude(
@@ -1066,11 +1279,34 @@ async def node_assess_retrieve(state: GuideState, deps: GuideDeps) -> dict:
         followup_plan = {"should_ask": False, "planner_mode": mode}
     else:
         followup_plan = await plan_next_followup(assessed_state, deps.llm)
+
+    # Dynamic follow-up selection depends on structured state, evidence
+    # coverage and application-owned policy scores.  Statutes, cases, graph
+    # data and channels are only needed once the turn is actually concluding.
+    retrieval_updates: dict = {}
+    concluding = hard_stop or not bool(followup_plan.get("should_ask"))
+    if concluding:
+        if _retrieval_snapshot_reusable(assessed_state):
+            logger.info(
+                "节点⑤复用检索快照 | fingerprint={}",
+                assessed_state.retrieval_fingerprint or "(legacy)",
+            )
+        else:
+            logger.info("节点⑤进入最终收敛，执行完整知识检索")
+            retrieval_updates = await node_retrieve(assessed_state, deps)
+            assessed_state = assessed_state.model_copy(update=retrieval_updates)
+    else:
+        logger.info(
+            "节点⑤继续动态追问，本轮跳过法条、类案、图谱和渠道检索 | candidate={}",
+            followup_plan.get("candidate_id") or "(dynamic)",
+        )
+
     trace = followup_plan.get("decision_trace")
     trace_history = list(assessed_state.followup_decision_trace)
     if trace and (not trace_history or trace_history[-1] != trace):
         trace_history = [*trace_history, trace][-50:]
     return {
+        **evidence_updates,
         **score_updates,
         **retrieval_updates,
         "force_conclude": state.force_conclude or force,
@@ -1207,27 +1443,9 @@ def _followup_case_anchor(state: GuideState, limit: int = 72) -> str:
     return value[:limit].rstrip("；，。 ")
 
 
-def _contextualize_followup_question(state: GuideState, question: str) -> str:
-    anchor = _followup_case_anchor(state)
-    if not anchor:
-        return question
-    compact_question = re.sub(r"\W+", "", question)
-    atoms = [
-        re.sub(r"\W+", "", str(item.get(field) or ""))
-        for item in _distinct_case_atoms(state)[-4:]
-        for field in ("value", "subject")
-    ]
-    if any(len(atom) >= 2 and atom in compact_question for atom in atoms):
-        return question
-    return f"结合您说的“{anchor}”，{question}"
-
-
 def _followup_opening(state: GuideState) -> str:
     if state.supplement_choice == "continue":
         return "好的，我们继续，只补充真正会影响方案的信息。"
-    acknowledgement = str(state.followup_plan.get("acknowledgement") or "").strip()
-    if acknowledgement:
-        return f"{acknowledgement.rstrip('。')}。"
     latest_statements = [
         item.get("statement", "")
         for item in active_case_facts(state.case_facts)
@@ -1236,6 +1454,9 @@ def _followup_opening(state: GuideState) -> str:
     if latest_statements:
         recorded = "；".join(_user_facing_case_text(item) for item in latest_statements)
         return f"好的，{recorded}，我已经记下。"
+    acknowledgement = str(state.followup_plan.get("acknowledgement") or "").strip()
+    if acknowledgement:
+        return f"{acknowledgement.rstrip('。')}。"
     latest = next(
         (str(message.content).strip() for message in reversed(state.messages) if isinstance(message, HumanMessage)),
         "",
@@ -1256,33 +1477,37 @@ def _format_followup_reply(
     rule_id: str = "",
 ) -> str:
     """每轮只问一个关键问题，后台评估不增加用户的表单负担。"""
-    question = _contextualize_followup_question(state, question.strip())
+    question = question.strip()
     if "？" not in question and "?" not in question:
         question += "？"
     reason = _normalized_followup_reason(reason)
     contextual_reason = str(state.followup_plan.get("contextual_reason") or "").strip().rstrip("。；")
-    lines = [_followup_opening(state)]
     if contextual_reason:
-        lines.append(f"{contextual_reason}。")
+        purpose = f"{contextual_reason}。"
     elif ask_type == "evidence":
-        anchor = _followup_case_anchor(state)
-        prefix = f"针对您说的“{anchor}”，" if anchor else ""
-        lines.append(f"{prefix}这项材料主要用于{reason}。")
+        purpose = f"这项材料主要用于{reason}。"
     else:
-        anchor = _followup_case_anchor(state)
-        prefix = f"结合您目前说清的“{anchor}”，" if anchor else ""
-        lines.append(f"{prefix}再确认这一点是为了{reason}。")
-    lines.append(question)
+        purpose = f"再确认这一点是为了{reason}。"
     if ask_type == "evidence":
-        lines.append("没有或不确定都可以直接说，我会给替代办法。")
+        hint = "没有、暂时找不到或不确定都可以直接说，我会同时给出替代办法。"
     else:
-        lines.append(answer_hint or "不清楚时可以说大概情况或“不知道”。")
+        hint = answer_hint or "不清楚时可以说大概情况或“不知道”。"
     if state.followup_plan:
-        lines.append(format_followup_authority(state.followup_plan))
+        authority = format_followup_authority(state.followup_plan)
     else:
-        lines.append(_followup_authority_hint(state, ask_type=ask_type, reason=reason))
-    lines.append("如果不方便补充，直接回复“现在生成方案”，我会按现有信息给出建议。")
-    return "\n".join(lines)
+        authority = _followup_authority_hint(state, ask_type=ask_type, reason=reason)
+    authority = re.sub(r"^追问依据[：:]\s*", "", authority).strip()
+    return "\n\n".join([
+        "### 已记录",
+        _followup_opening(state),
+        "### 请确认",
+        f"> **{question}**",
+        f"**回答提示：** {hint}",
+        "### 为什么要问",
+        f"- **用途：** {purpose}\n- **追问依据：** {authority}",
+        "---",
+        "暂时不方便补充时，直接回复 **“现在生成方案”**，我会按现有信息给出建议。",
+    ])
 
 
 async def node_ask_facts(state: GuideState, deps: GuideDeps) -> dict:
@@ -1360,7 +1585,12 @@ async def _answer_counter_question(
         law_context=state.law_context_str or "（当前没有足够的已检索法律依据）",
     )
     try:
-        response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+        response = await ainvoke_bounded(
+            llm_for_stage(deps.llm, max_tokens=600),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_FOLLOWUP,
+            stage="counter_question",
+        )
         answer = " ".join(str(response.content or "").split())
         if answer:
             return answer[:500]
@@ -1388,21 +1618,75 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             "followup_plan": {},
             "phase": GuidePhase.ISSUE_SEARCH,
         }
+    answer_narrative, uploaded_observations = split_uploaded_evidence_blocks(
+        last_msg
+    )
+    attachment_inventory = "\n".join(
+        f"- {item['name']}（系统已收到副本）"
+        for item in uploaded_observations
+    )
+    answer_for_parse = (
+        answer_narrative
+        or ("用户本轮仅提交了附件" if uploaded_observations else last_msg)
+    )
+    if attachment_inventory:
+        answer_for_parse += (
+            "\n\n本轮附件清单：\n"
+            + attachment_inventory
+            + "\n附件全文由证据子系统单独处理，不得直接写成用户确认的案情事实。"
+        )
+    inspection_task = asyncio.create_task(
+        inspect_uploaded_evidence_blocks(last_msg, deps.llm)
+    )
     prompt = PARSE_DETAILS_PROMPT.format(
         asked_details="\n".join(f"- {q}" for q in state.pending_ask_details),
-        user_answer=last_msg,
+        user_answer=answer_for_parse,
         case_context=format_case_context(state.case_facts),
     )
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    raw_content = ""
     try:
-        content = response.content.strip()
+        response = await ainvoke_bounded(
+            llm_for_stage(deps.llm, max_tokens=1200),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_PARSE,
+            stage="parse_followup_answer",
+        )
+        raw_content = str(response.content or "")
+        content = raw_content.strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         parsed = json.loads(content)
     except Exception as e:
-        # 解析失败：清空 pending 避免卡在重述死循环，代价是本轮回答丢失
-        logger.warning("节点⑦解析追问回答失败，丢弃本轮抽取 | err={} raw={}", e, response.content[:200])
-        return {"pending_ask_details": [], "pending_ask_type": "", "pending_followup_ids": []}
+        # 不让模型超时丢掉用户本轮输入。一般陈述按待核实事实保留；
+        # 疑问句仍作为反问处理，后续安全回答后恢复原追问。
+        looks_like_question = _looks_like_user_question(answer_narrative)
+        parsed = {
+            "is_answer": not looks_like_question,
+            "answers_asked_question": not looks_like_question,
+            "user_question": answer_narrative if looks_like_question else "",
+            "collected_facts": (
+                [] if looks_like_question or not answer_narrative
+                else [answer_narrative]
+            ),
+            "case_updates": (
+                []
+                if looks_like_question or not answer_narrative
+                else legacy_fact_updates(
+                    [answer_narrative],
+                    user_text=answer_narrative,
+                )
+            ),
+            "evidence": [],
+            "evidence_details": [],
+            "evidence_unavailable": [],
+            "adverse_facts": [],
+        }
+        logger.warning(
+            "节点⑦解析追问回答失败，改用通用语义形态降级 | err={} raw={}",
+            e,
+            raw_content[:200],
+        )
+    inspected_evidence_observations = await inspection_task
 
     user_question = (parsed.get("user_question") or "").strip()
     is_answer = parsed.get("is_answer", True)
@@ -1560,8 +1844,19 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         if case_facts
         else _merge(state.collected_facts, parsed_facts)
     )
-    atom_evidence, atom_unavailable = evidence_from_case_facts(case_facts)
+    current_turn_atoms = latest_case_facts(case_facts, state.round)
+    atom_evidence, atom_unavailable = evidence_from_case_facts(current_turn_atoms)
     parsed_evidence = parsed.get("evidence") or []
+    evidence_observations = normalize_evidence_observations(
+        parsed.get("evidence_details"),
+        user_text=last_msg,
+    )
+    evidence_observations.extend(inspected_evidence_observations)
+    evidence_observations.extend(uploaded_observations)
+    if evidence_observations:
+        atom_evidence = [
+            item["name"] for item in evidence_observations
+        ]
     if is_multimodal_evidence:
         type_match = re.search(r"【证据类型】\s*([^\n]+)", last_msg)
         evidence_type = type_match.group(1).strip(" *：:") if type_match else "图片证据"
@@ -1570,6 +1865,11 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             item for item in parsed_evidence
             if item and not any(token in item for token in (evidence_type, "聊天记录截图", "图片证据"))
         ]
+    elif evidence_observations:
+        present_evidence = [
+            item["name"] for item in evidence_observations
+        ]
+        unverified_evidence = []
     else:
         unverified_markers = ("声称", "自述持有", "提及持有", "未在本图", "未显示", "待核验", "疑似持有")
         present_evidence = [
@@ -1589,7 +1889,9 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         "没有", "没拍", "没留", "没保存", "未拍", "未留", "未保存",
         "找不到", "拿不出", "丢了", "遗失", "无法提供",
     )
-    explicit_evidence_denial = any(marker in last_msg for marker in evidence_denial_markers)
+    explicit_evidence_denial = any(
+        marker in answer_narrative for marker in evidence_denial_markers
+    )
     parsed_unavailable = (parsed.get("evidence_unavailable") or []) if explicit_evidence_denial else []
     unavailable = _merge(
         state.evidence_unavailable,
@@ -1601,6 +1903,11 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
     evidence_assessments = assess_initial_evidence(
         [item for item in present_evidence if item not in state.evidence_confirmed],
         state.evidence_assessments,
+    )
+    evidence_assessments = merge_evidence_observations(
+        evidence_assessments,
+        evidence_observations,
+        domain=state.legal_domain,
     )
     low_info_answer = False
     pending_fact_statuses: list[str] = []
@@ -1630,9 +1937,11 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             )
             record = assess_evidence_answer(
                 rule,
-                last_msg,
+                answer_narrative or last_msg,
                 unavailable=explicitly_unavailable,
-                uploaded=is_multimodal_evidence and mentioned_present,
+                uploaded=(
+                    bool(uploaded_observations) or is_multimodal_evidence
+                ) and mentioned_present,
                 mentioned_as_present=mentioned_present,
                 previous=evidence_assessments.get(rule_id),
             )
@@ -1648,6 +1957,11 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
             # 明确没有某项证据会改变证据策略，属于有效进展；unclear/conflicted 才未推进。
             low_info_answer = low_info_answer or record["availability"] in {"unclear", "conflicted"}
 
+    evidence_assessments = merge_evidence_observations(
+        evidence_assessments,
+        evidence_observations,
+        domain=state.legal_domain,
+    )
     if not state.pending_followup_ids:
         # 动态问题没有题库 ID 时，解析器确认其回答了当前问题就视为有效推进；
         # 明确否定或不知道仍然是可用于后续决策的信息。
@@ -1732,6 +2046,15 @@ async def node_parse_details(state: GuideState, deps: GuideDeps) -> dict:
         "force_conclude": state.force_conclude or force_low_info_conclusion,
         "phase": GuidePhase.DETAIL_GATHER if needs_fact_confirmation else GuidePhase.ISSUE_SEARCH,
         "followup_plan": {},
+        "issue_refresh_needed": bool(
+            (not answers_asked_question)
+            and (
+                parsed_facts
+                or parsed.get("case_updates")
+                or evidence_observations
+                or parsed.get("new_issues")
+            )
+        ),
         "deferred_questions": state.deferred_questions + ([user_question] if user_question else []),
         "messages": confirmation_messages,
     }
@@ -2436,6 +2759,54 @@ def _ensure_decision_uncertainties(reply: str, state: GuideState) -> str:
     return reply.rstrip() + "\n\n" + block
 
 
+def _ensure_evidence_coverage_section(reply: str, state: GuideState) -> str:
+    """Render application-owned proof coverage instead of model certainty."""
+
+    report = state.evidence_coverage or evaluate_state_evidence(state)
+    content = format_evidence_coverage(report, max_targets=4)
+    if content.startswith("（"):
+        return reply
+    block = "## 证据作用与缺口\n\n" + content
+    pattern = re.compile(
+        r"\n*## 证据作用与缺口\s*\n.*?(?=\n## |\n---\n📄|\Z)",
+        re.S,
+    )
+    reply = pattern.sub("", reply).rstrip()
+    return _insert_before_document_offer(reply, block)
+
+
+def _deterministic_conclusion_draft(state: GuideState) -> str:
+    """Return a source-bounded plan when final-generation LLM times out."""
+
+    case_summary = _format_case_summary(state) or "当前案情仍有部分信息待确认"
+    law_section = (
+        state.law_context_str[:2400]
+        if state.law_context_str
+        else "当前未检索到可直接引用的具体条文，建议拨打12348进一步核验。"
+    )
+    channel_lines = _channel_summary_lines(state, limit=3)
+    if not channel_lines:
+        channel_lines = [
+            "- 暂无可核验的本地渠道记录，可先拨打12348核对受理机构、管辖和材料要求。"
+        ]
+    return (
+        "**【理解您的情况】**\n"
+        f"根据您目前的陈述：{case_summary}。\n\n"
+        "**【法律依据】**\n"
+        f"{law_section}\n\n"
+        "**【维权路径比较】**\n"
+        + "\n".join(channel_lines)
+        + "\n\n**【维权胜算评估】**\n"
+        "- 当前只能作条件式评估；最终结果取决于事实核验、原始证据、"
+        "法律适用和对方抗辩，系统不计算胜诉率。\n\n"
+        "**【行动清单】**\n"
+        "1. 立即备份原始材料和原始载体，按时间顺序整理事实。\n"
+        "2. 核对证据作用与缺口，优先补强会影响责任、金额或程序的材料。\n"
+        "3. 联系已列明渠道核对受理范围、管辖和材料要求，并保存回执。\n"
+        "4. 对关键期限或重大决定仍不确定时，拨打12348咨询专业律师。"
+    )
+
+
 async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
     """节点⑧：生成五段式行动方案（理解+法条+类案+路径+行动清单）。"""
     logger.info("节点⑧生成结论 | domain={} tier={}", state.legal_domain, state.confidence_tier)
@@ -2491,6 +2862,9 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
         evidence_unavailable="、".join(state.evidence_unavailable) or "（无）",
         fact_assessments=format_fact_assessments(state.fact_records),
         evidence_assessments=format_evidence_assessments(state.evidence_assessments),
+        evidence_coverage=format_evidence_coverage(
+            state.evidence_coverage or evaluate_state_evidence(state)
+        ),
         time_warning=state.time_warning,
         self_review_note=self_review_str,
         adverse_facts_section=adverse_facts_section,
@@ -2503,20 +2877,44 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
         followup_authority=format_domain_authority_summary(domain),
         force_conclude_note=force_note,
     )
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
-    audited_content = response.content
+    draft_content = ""
+    llm_draft_succeeded = False
     try:
+        response = await ainvoke_bounded(
+            llm_for_stage(deps.llm, max_tokens=3600),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_CONCLUDE,
+            stage="conclusion_draft",
+        )
+        draft_content = str(response.content or "").strip()
+        llm_draft_succeeded = bool(draft_content)
+    except Exception as exc:
+        logger.warning("行动方案生成超时或失败，使用确定性降级方案: {}", exc)
+    if not draft_content:
+        draft_content = _deterministic_conclusion_draft(state)
+
+    audited_content = draft_content
+    # The audit is an enhancement, not a reason to hold the user response.
+    # It receives its own short budget and is skipped automatically when slow.
+    try:
+        if not llm_draft_succeeded:
+            raise asyncio.TimeoutError("skip audit after deterministic draft fallback")
         audit_prompt = PLAN_AUDIT_PROMPT.format(
             case_context=format_case_context(state.case_facts),
             evidence_confirmed="、".join(state.evidence_confirmed) or "暂未确认",
             law_context=state.law_context_str or "（本轮未检索到可引用条文）",
-            draft=response.content,
+            draft=draft_content,
         )
-        audit_response = await deps.llm.ainvoke([SystemMessage(content=audit_prompt)])
+        audit_response = await ainvoke_bounded(
+            llm_for_stage(deps.llm, max_tokens=900),
+            [SystemMessage(content=audit_prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_AUDIT,
+            stage="conclusion_audit",
+        )
         if str(audit_response.content or "").strip():
             audited_content = audit_response.content
     except Exception as exc:
-        logger.warning("行动方案动态审校失败，继续执行确定性来源校验: {}", exc)
+        logger.warning("行动方案动态审校超时或失败，继续执行确定性来源校验: {}", exc)
 
     # 在回复末尾添加检索错误降级提示（如果有）
     final_reply = _normalize_required_sections(audited_content)
@@ -2611,6 +3009,7 @@ async def node_conclude(state: GuideState, deps: GuideDeps) -> dict:
         accessible_mode,
         compact=compact_mode,
     )
+    final_reply = _ensure_evidence_coverage_section(final_reply, state)
     final_reply = _ensure_decision_uncertainties(final_reply, state)
     final_reply = _ensure_post_conclusion_options(final_reply, state)
 
@@ -2731,9 +3130,19 @@ def route_after_parse(state: GuideState) -> str:
     """反问时继续等待；出现新法律问题则重新标准化，否则重新评分检索。"""
     if state.pending_ask_details:
         return END
+    if state.issue_refresh_needed:
+        logger.info("路由：用户补充超出原追问范围，重新识别法律问题和领域")
+        return "extract_issues"
     if len(state.confirmed_issues) > state.last_confirmed_count:
         logger.info("路由：检测到新法律问题（{}→{}），重新标准化+检索",
                     state.last_confirmed_count, len(state.confirmed_issues))
+        return "extract_issues"
+    if (
+        not state.confirmed_issues
+        and not state.unmatched_issues
+        and (not state.legal_domain or state.legal_domain == "other")
+    ):
+        logger.info("路由：澄清答案已结构化但法律问题仍未识别，重新执行语义标准化")
         return "extract_issues"
     return "assess_retrieve"
 

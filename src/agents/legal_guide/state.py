@@ -53,9 +53,14 @@ class GuideState(BaseModel):
     followup_plan: dict = Field(default_factory=dict)             # assess_retrieve 动态生成，ask_followup 负责展示
     followup_decision_trace: list[dict] = Field(default_factory=list)
     decision_sufficiency: dict = Field(default_factory=dict)
+    issue_refresh_needed: bool = False                            # 主动补充超出原追问范围时重跑问题/领域识别
     asked_decision_keys: list[str] = Field(default_factory=list)  # 已追问的法律决策点，跨问法去重
     fact_records: dict[str, dict] = Field(default_factory=dict)   # 用户陈述的清晰度/冲突状态，不代表已查证
     evidence_assessments: dict[str, dict] = Field(default_factory=dict) # 存在性、相关性、真实性和可采性分层
+    evidence_items: list[dict] = Field(default_factory=list)      # 结构化证据项及其来源、完整性等基础属性
+    proof_targets: list[dict] = Field(default_factory=list)       # 当前领域需要覆盖的证明目标
+    evidence_links: list[dict] = Field(default_factory=list)      # 证据项与证明目标之间的可解释关联
+    evidence_coverage: dict = Field(default_factory=dict)         # 证明目标覆盖、缺口和补强建议
     evidence_unavailable: list[str] = Field(default_factory=list) # 用户明确表示没有的证据
     evidence_unverified: list[str] = Field(default_factory=list)  # 图片/转述中提到但本次未直接核验的材料
     deferred_questions: list[str] = Field(default_factory=list)  # 追问期间用户反问、尚未答复的问题
@@ -103,6 +108,7 @@ class GuideState(BaseModel):
     self_review_note: str = ""         # 自省降档原因（HIGH→MID 时记录）
     retrieval_error_note: str = ""     # 检索服务异常降级提示
     retrieval_completed: bool = False   # 已完成过一次检索；收敛指令可复用上一轮结果
+    retrieval_fingerprint: str = ""     # 生成检索快照时的案情指纹，避免无实质变化时重复检索
 
     # 案例检索兜底指引（case_rag 返回空时生成）
     fallback_guide: dict | None = None  # {"platform": str, "url": str, "search_tips": str}

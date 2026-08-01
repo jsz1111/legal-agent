@@ -80,8 +80,13 @@ def create_app() -> FastAPI:
     # 注册中间件
     app.add_middleware(LoggingMiddleware)
     # 注册跨域中间件
+    frontend_origins = [
+        origin.strip()
+        for origin in settings.FRONTEND_ORIGINS.split(",")
+        if origin.strip()
+    ]
     app.add_middleware(CORSMiddleware,
-                       allow_origins=["http://localhost:3000","http://localhost:5173","http://localhost:7862","http://127.0.0.1:7862"],
+                       allow_origins=frontend_origins,
                        allow_credentials=True,
                        allow_methods=["*"],
                        allow_headers=["*"])

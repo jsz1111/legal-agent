@@ -95,3 +95,34 @@ def test_conclusion_prompt_and_reply_keep_official_evidence_source():
     assert "法〔2025〕82号" in reply
     assert "官方发布页" in reply
     assert "https://www.court.gov.cn/zixun/xiangqing/468671.html" in reply
+
+
+def test_conclusion_timeout_returns_a_complete_deterministic_plan():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=TimeoutError("slow model"))
+    deps = MagicMock(spec=GuideDeps)
+    deps.llm = llm
+    state = GuideState(
+        legal_domain="consumer_market",
+        confirmed_issues=["消费纠纷"],
+        collected_facts=["用户称购买的商品存在问题"],
+        law_context_str=(
+            "法条1【中华人民共和国消费者权益保护法 第五十五条】\n"
+            "经营者提供商品或者服务有欺诈行为的，依法承担相应责任。"
+        ),
+        confidence_tier="LOW",
+    )
+
+    updates = asyncio.run(guide_graph.node_conclude(state, deps))
+    reply = updates["messages"][0].content
+
+    for section in (
+        "理解您的情况",
+        "法律依据",
+        "维权路径比较",
+        "维权胜算评估",
+        "行动清单",
+    ):
+        assert section in reply
+    assert "中华人民共和国消费者权益保护法" in reply
+    assert "第五十五条" in reply

@@ -17,7 +17,7 @@ import uuid
 
 from src.core.config import get_settings
 from src.infra.database import get_db
-from src.infra.redis_cache import get_checkpointer_redis
+from src.infra.redis_cache import get_checkpointer_redis, set_with_optional_ttl
 from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.legal_guide.graph import run_guide, build_guide_deps
 from src.agents.legal_guide.state import GuideState, GuidePhase
@@ -39,6 +39,10 @@ class ChatRequest(BaseModel):
     user_id: str
     session_id: str
     message: str
+
+
+class DeleteConversationRequest(BaseModel):
+    user_id: str
 
 
 class DebugInfo(BaseModel):
@@ -72,8 +76,13 @@ async def _has_guide_session(redis, active_key: str, state_key: str) -> bool:
 
 
 def _should_keep_guide_state(state: GuideState) -> bool:
-    """已识别具体法律问题的终态仍需支持生成或重生成参考文书。"""
-    return bool(state.confirmed_issues or state.safety_pause_active)
+    """Keep any substantive case state, including degraded early extraction."""
+    return bool(
+        state.confirmed_issues
+        or state.unmatched_issues
+        or state.case_facts
+        or state.safety_pause_active
+    )
 
 
 def _guide_debug(state: GuideState) -> DebugInfo:
@@ -133,10 +142,11 @@ async def _prepare_case_turn(
             *existing_state.case_boundary_audit,
             transition,
         ][-30:]
-        await redis.set(
+        await set_with_optional_ttl(
+            redis,
             state_key,
             existing_state.model_dump_json(),
-            ex=settings.GUIDE_SESSION_TTL,
+            settings.GUIDE_SESSION_TTL,
         )
         return message, existing_state, boundary_confirmation_reply(existing_state)
 
@@ -149,10 +159,11 @@ async def _prepare_case_turn(
         archive_key = (
             f"guide_case_archive:{thread_id}:{existing_state.case_id}"
         )
-        await redis.set(
+        await set_with_optional_ttl(
+            redis,
             archive_key,
             existing_state.model_dump_json(),
-            ex=settings.GUIDE_SESSION_TTL,
+            settings.GUIDE_SESSION_TTL,
         )
         next_state = start_isolated_case(
             existing_state,
@@ -199,6 +210,59 @@ async def _pop_statistics_artifact(redis, user_id: str, session_id: str) -> dict
     except (TypeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+async def _pop_supervisor_reply_artifacts(
+    redis,
+    user_id: str,
+    session_id: str,
+    supervisor_reply: str,
+) -> tuple[str, DebugInfo | None]:
+    """Return only a worker's public reply, excluding Supervisor tool events."""
+    reply_key = f"guide_last_reply:{user_id}:{session_id}"
+    debug_key = f"guide_last_debug:{user_id}:{session_id}"
+    legal_qa_reply_key = f"legal_qa_last_reply:{user_id}:{session_id}"
+    reply = supervisor_reply
+    debug = None
+    try:
+        raw_reply = await redis.get(reply_key)
+        raw_debug = await redis.get(debug_key)
+        raw_legal_qa_reply = await redis.get(legal_qa_reply_key)
+        if raw_reply:
+            reply = (
+                raw_reply.decode("utf-8")
+                if isinstance(raw_reply, bytes)
+                else str(raw_reply)
+            )
+            await redis.delete(reply_key)
+        elif raw_legal_qa_reply:
+            reply = (
+                raw_legal_qa_reply.decode("utf-8")
+                if isinstance(raw_legal_qa_reply, bytes)
+                else str(raw_legal_qa_reply)
+            )
+            await redis.delete(legal_qa_reply_key)
+        if raw_debug:
+            if isinstance(raw_debug, bytes):
+                raw_debug = raw_debug.decode("utf-8")
+            value = json.loads(raw_debug)
+            debug = DebugInfo(
+                domain=value.get("domain", ""),
+                confidence_tier=value.get("confidence_tier", "") or "GATHERING",
+                statute_hits=value.get("statute_hits", ""),
+                case_hits=value.get("case_hits", ""),
+                graph_laws=value.get("graph_laws", []),
+                graph_channels=value.get("graph_channels", []),
+                fallback_guide=value.get("fallback_guide"),
+            )
+            await redis.delete(debug_key)
+    except Exception:
+        logger.warning(
+            "failed to resolve worker reply artifacts | user={} session={}",
+            user_id,
+            session_id,
+        )
+    return reply, debug
 
 
 async def _run_statistics_followup_if_needed(
@@ -267,12 +331,20 @@ async def _run_guide_turn(
 
     deps = build_guide_deps(db_session=db)
 
-    # 特殊处理：phase=END 且用户请求文书 → 直接生成文书，不走完整状态机
-    if existing_state and existing_state.phase == GuidePhase.END:
-        if is_doc_request(message) and existing_state.confirmed_issues:
+    # 文书请求是针对当前案件的控制意图，不是新的案情事实。只要已有可用的
+    # 案件状态，就直接进入独立文书服务；不能依赖 phase 恰好为 END，否则旧
+    # 状态、恢复中的会话或条件式方案会把“生成文书”重新送进事实抽取流程。
+    if (
+        existing_state
+        and is_doc_request(message)
+        and _should_keep_guide_state(existing_state)
+    ):
+        document_issues = (
+            list(existing_state.confirmed_issues)
+            or list(existing_state.unmatched_issues)
+        )
+        if document_issues:
             logger.info("检测到文书生成请求，直接调用独立文书生成服务")
-            # 添加用户消息到历史
-            existing_state.messages.append(HumanMessage(content=message))
             doc_type = requested_doc_type(
                 message,
                 DOC_TYPE_MAP.get(existing_state.legal_domain, "投诉信"),
@@ -281,7 +353,7 @@ async def _run_guide_turn(
             # 直接调用文书生成函数
             generated = await generate_legal_document(
                 legal_domain=existing_state.legal_domain,
-                confirmed_issues=existing_state.confirmed_issues,
+                confirmed_issues=document_issues,
                 collected_facts=existing_state.draftable_facts,
                 region=existing_state.region,
                 evidence_confirmed=existing_state.evidence_confirmed,
@@ -290,13 +362,12 @@ async def _run_guide_turn(
                 requested_doc_type=doc_type,
             )
             existing_state.doc_draft = generated.text
-            existing_state.messages.append(AIMessage(content=generated.text))
 
             document_id = uuid.uuid4().hex
-            ttl = settings.GUIDE_SESSION_TTL
+            document_ttl = settings.GUIDE_DOCUMENT_TTL
             file_key = f"legal_document_file:{document_id}"
             meta_key = f"legal_document_meta:{document_id}"
-            await redis.set(file_key, generated.docx_bytes, ex=ttl)
+            await redis.set(file_key, generated.docx_bytes, ex=document_ttl)
             await redis.set(
                 meta_key,
                 json.dumps(
@@ -307,7 +378,7 @@ async def _run_guide_turn(
                     },
                     ensure_ascii=False,
                 ).encode("utf-8"),
-                ex=ttl,
+                ex=document_ttl,
             )
 
             official = (
@@ -341,14 +412,24 @@ async def _run_guide_turn(
                 "official_template_match": official_match,
                 "official_template_note": official_note,
                 "missing_fields": generated.missing_fields,
-                "expires_in_seconds": ttl,
+                "expires_in_seconds": document_ttl,
             }
 
-            # 文书生成后仍保留结束状态：用户可能需要重新生成、改文书类型，
-            # 或在前端刷新后再次取得附件。状态只保存文本和案情，不保存 DOCX
-            # 二进制；文件本身仍使用独立短期 key 和相同 TTL。
-            await redis.set(state_key, existing_state.model_dump_json(), ex=ttl)
-            await redis.set(active_key, "1", ex=ttl)
+            # 文书指令和生成正文都不写入案情消息池，防止后续“继续补充”时
+            # 被事实抽取器误当成本案陈述。原有流程阶段保持不变，用户可以
+            # 重新生成、改文书类型，或继续补充同一案件。
+            await set_with_optional_ttl(
+                redis,
+                state_key,
+                existing_state.model_dump_json(),
+                settings.GUIDE_SESSION_TTL,
+            )
+            await set_with_optional_ttl(
+                redis,
+                active_key,
+                "1",
+                settings.GUIDE_SESSION_TTL,
+            )
 
             debug = _guide_debug(existing_state)
             return generated.text, debug, document_artifact
@@ -364,7 +445,12 @@ async def _run_guide_turn(
             state_key=state_key,
         )
         if boundary_reply is not None:
-            await redis.set(active_key, "1", ex=settings.GUIDE_SESSION_TTL)
+            await set_with_optional_ttl(
+                redis,
+                active_key,
+                "1",
+                settings.GUIDE_SESSION_TTL,
+            )
             return boundary_reply, _guide_debug(existing_state), None
 
     reply, new_state = await run_guide(
@@ -382,16 +468,21 @@ async def _run_guide_turn(
         if _should_keep_guide_state(new_state):
             # 支持用户离开页面或服务重启后继续生成/重生成参考文书。
             ttl = settings.GUIDE_SESSION_TTL
-            await redis.set(state_key, new_state.model_dump_json(), ex=ttl)
-            await redis.set(active_key, "1", ex=ttl)
+            await set_with_optional_ttl(
+                redis,
+                state_key,
+                new_state.model_dump_json(),
+                ttl,
+            )
+            await set_with_optional_ttl(redis, active_key, "1", ttl)
         else:
             await redis.delete(active_key, state_key)
         return reply, debug, None
 
-    # 指引继续：更新 Redis 状态，重置 TTL
+    # 指引继续：更新 Redis 状态；ttl=0 时长期保留，等待用户手动删除。
     ttl = settings.GUIDE_SESSION_TTL
-    await redis.set(state_key,  new_state.model_dump_json(), ex=ttl)
-    await redis.set(active_key, "1",                         ex=ttl)
+    await set_with_optional_ttl(redis, state_key, new_state.model_dump_json(), ttl)
+    await set_with_optional_ttl(redis, active_key, "1", ttl)
     return reply, debug, None
 
 
@@ -454,43 +545,14 @@ async def chat(
         await redis.delete(current_message_key)
         supervisor_reply = result["messages"][-1].content
 
-        # 若本轮调用了 call_guide_agent，直接取 guide_agent 原始回复，
-        # 绕过 Supervisor 可能的摘要/改写。
-        import json as _json
-        debug = None
-        reply = supervisor_reply  # 默认用 Supervisor 回复（非指引场景）
-        try:
-            reply_key = f"guide_last_reply:{req.user_id}:{req.session_id}"
-            debug_key = f"guide_last_debug:{req.user_id}:{req.session_id}"
-            legal_qa_reply_key = f"legal_qa_last_reply:{req.user_id}:{req.session_id}"
-            raw_reply = await redis.get(reply_key)
-            raw_debug = await redis.get(debug_key)
-            raw_legal_qa_reply = await redis.get(legal_qa_reply_key)
-            if raw_reply:
-                # guide_agent 原始回复存在 → 直接用，忽略 Supervisor 重写
-                reply = raw_reply.decode("utf-8") if isinstance(raw_reply, bytes) else raw_reply
-                await redis.delete(reply_key)
-            elif raw_legal_qa_reply:
-                reply = (
-                    raw_legal_qa_reply.decode("utf-8")
-                    if isinstance(raw_legal_qa_reply, bytes)
-                    else raw_legal_qa_reply
-                )
-                await redis.delete(legal_qa_reply_key)
-            if raw_debug:
-                d = _json.loads(raw_debug)
-                debug = DebugInfo(
-                    domain=d.get("domain", ""),
-                    confidence_tier=d.get("confidence_tier", "") or "GATHERING",
-                    statute_hits=d.get("statute_hits", ""),
-                    case_hits=d.get("case_hits", ""),
-                    graph_laws=d.get("graph_laws", []),
-                    graph_channels=d.get("graph_channels", []),
-                    fallback_guide=d.get("fallback_guide"),
-                )
-                await redis.delete(debug_key)
-        except Exception:
-            pass
+        # Keep the HTTP and SSE paths aligned with Gradio: only return the
+        # selected worker's public reply, never Supervisor tool events.
+        reply, debug = await _pop_supervisor_reply_artifacts(
+            redis,
+            req.user_id,
+            req.session_id,
+            supervisor_reply,
+        )
 
         statistics = await _pop_statistics_artifact(
             redis, req.user_id, req.session_id
@@ -585,25 +647,36 @@ async def chat_stream(
                 )
                 agent = await get_supervisor_agent()
                 config = {"configurable": {"thread_id": thread_id}}
-                async for chunk in agent.astream(
-                    {"messages": [{"role": "user", "content": req.message}]},
-                    config=config,
-                    stream_mode="messages",
-                ):
-                    if isinstance(chunk, tuple):
-                        msg_chunk, _ = chunk
-                        if hasattr(msg_chunk, "content") and msg_chunk.content:
-                            data = json.dumps(
-                                {"type": "token", "content": msg_chunk.content},
-                                ensure_ascii=False,
-                            )
-                            yield f"data: {data}\n\n"
-                await redis.delete(current_message_key)
+                try:
+                    result = await agent.ainvoke(
+                        {"messages": [{"role": "user", "content": req.message}]},
+                        config=config,
+                        context=UserContext(
+                            user_id=req.user_id,
+                            session_id=req.session_id,
+                        ),
+                    )
+                finally:
+                    await redis.delete(current_message_key)
+                supervisor_reply = result["messages"][-1].content
+                reply, debug = await _pop_supervisor_reply_artifacts(
+                    redis,
+                    req.user_id,
+                    req.session_id,
+                    supervisor_reply,
+                )
+                token_data = json.dumps(
+                    {"type": "token", "content": reply},
+                    ensure_ascii=False,
+                )
+                yield f"data: {token_data}\n\n"
 
             statistics = await _pop_statistics_artifact(
                 redis, req.user_id, req.session_id
             )
             done_payload = {"type": "done", "session_id": req.session_id}
+            if "debug" in locals() and debug:
+                done_payload["debug"] = debug.model_dump()
             if statistics:
                 done_payload["statistics"] = statistics
             done_data = json.dumps(done_payload, ensure_ascii=False)
@@ -625,6 +698,121 @@ async def chat_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+_PUBLIC_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def _validated_public_id(value: str, label: str) -> str:
+    normalized = str(value or "").strip()
+    if not _PUBLIC_ID_RE.fullmatch(normalized):
+        raise HTTPException(status_code=400, detail=f"{label}格式无效")
+    return normalized
+
+
+async def _delete_generated_documents(
+    redis,
+    *,
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+) -> list:
+    """Find short-lived document artifacts owned by this conversation."""
+    owned_keys: list = []
+    async for meta_key in redis.scan_iter(
+        match="legal_document_meta:*",
+        count=100,
+    ):
+        raw_meta = await redis.get(meta_key)
+        if not raw_meta:
+            continue
+        if isinstance(raw_meta, bytes):
+            raw_meta = raw_meta.decode("utf-8", errors="replace")
+        try:
+            meta = json.loads(raw_meta)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            str(meta.get("user_id") or "") != user_id
+            or str(meta.get("session_id") or "") not in {session_id, thread_id}
+        ):
+            continue
+        key_text = (
+            meta_key.decode("utf-8", errors="replace")
+            if isinstance(meta_key, bytes)
+            else str(meta_key)
+        )
+        document_id = key_text.rsplit(":", 1)[-1]
+        owned_keys.extend(
+            [meta_key, f"legal_document_file:{document_id}"],
+        )
+    return owned_keys
+
+
+@router.delete("/conversations/{session_id}")
+async def delete_conversation(
+    session_id: str,
+    req: DeleteConversationRequest,
+):
+    """Delete one conversation only when the user explicitly requests it."""
+    user_id = _validated_public_id(req.user_id, "用户标识")
+    session_id = _validated_public_id(session_id, "会话标识")
+    thread_id = f"{user_id}:{session_id}"
+    redis = get_checkpointer_redis()
+
+    keys: list = [
+        f"guide_active:{thread_id}",
+        f"guide_state:{thread_id}",
+        f"guide_last_debug:{thread_id}",
+        f"guide_last_reply:{thread_id}",
+        f"legal_qa_last_reply:{thread_id}",
+        f"legal_qa_history:{thread_id}",
+        f"legal_statistics_context:{thread_id}",
+        f"legal_statistics_last:{thread_id}",
+        f"current_user_message:{thread_id}",
+    ]
+    async for archive_key in redis.scan_iter(
+        match=f"guide_case_archive:{thread_id}:*",
+        count=100,
+    ):
+        keys.append(archive_key)
+    keys.extend(
+        await _delete_generated_documents(
+            redis,
+            user_id=user_id,
+            session_id=session_id,
+            thread_id=thread_id,
+        )
+    )
+    if keys:
+        await redis.delete(*keys)
+
+    warnings: list[str] = []
+    try:
+        from src.agents.supervisor_agent import delete_supervisor_thread
+
+        await delete_supervisor_thread(thread_id)
+    except Exception as exc:
+        logger.warning("删除 Supervisor 会话检查点失败 | thread={} error={}", thread_id, exc)
+        warnings.append("对话检查点清理未完成")
+
+    try:
+        from src.infra.milvus_store import get_milvus_store
+
+        memory_key = f"guide_{thread_id.replace(':', '_')[-120:]}"
+        await get_milvus_store().adelete(
+            ("users", user_id, "memories"),
+            memory_key,
+        )
+    except Exception as exc:
+        logger.warning("删除案件长期记忆失败 | thread={} error={}", thread_id, exc)
+        warnings.append("长期记忆清理未完成")
+
+    return {
+        "deleted": True,
+        "session_id": session_id,
+        "warnings": warnings,
+    }
 
 
 @router.get("/document-templates")
@@ -694,6 +882,33 @@ async def download_generated_document(document_id: str):
             "Cache-Control": "private, no-store",
         },
     )
+
+
+@router.post("/upload-document")
+async def upload_document(file: UploadFile = File(...)):
+    """Extract a bounded evidence block from PDF, DOCX or TXT without retention."""
+
+    from src.agents.legal_guide.attachment_parser import (
+        MAX_ATTACHMENT_BYTES,
+        extract_document_bytes,
+    )
+
+    content = await file.read(MAX_ATTACHMENT_BYTES + 1)
+    try:
+        return {
+            "success": True,
+            **extract_document_bytes(file.filename or "未命名文件", content),
+        }
+    except ValueError as exc:
+        detail = str(exc)
+        status = 413 if "10MB" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+    except Exception as exc:
+        logger.warning("文档附件解析失败 | filename={} error={}", file.filename, exc)
+        raise HTTPException(
+            status_code=400,
+            detail="文档解析失败，请确认文件未损坏，或改传TXT/清晰图片。",
+        ) from exc
 
 
 # ── 图片上传与分析接口（多模态支持，可选）───────────────────────────────

@@ -18,14 +18,17 @@ from langchain_core.embeddings import Embeddings
 from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
-from src.agents.legal_guide.prompts import ISSUE_EXTRACT_PROMPT, DOMAIN_MAPPING
+from src.agents.legal_guide.prompts import (
+    DOMAIN_MAPPING,
+    INTAKE_CLASSIFY_PROMPT,
+    ISSUE_EXTRACT_PROMPT,
+)
 from src.agents.legal_guide.case_model import CaseFactUpdate
+from src.agents.legal_guide.llm_runtime import ainvoke_bounded, llm_for_stage
+from src.core.config import get_settings
 
-# with_structured_output 失败时的降级提示词（DeepSeek thinking mode 不支持 tool_choice）
-_ISSUE_EXTRACT_FALLBACK_PROMPT = ISSUE_EXTRACT_PROMPT + """
-
-请严格输出 JSON，格式如下（只输出 JSON，不要有其他文字）：
-{{"issues": ["法律问题1", "法律问题2"], "domain": "领域代码", "facts": ["客观事实"], "case_updates": [{{"key": "event.main", "category": "event", "statement": "客观事实", "subject": "", "relation": "", "value": "", "certainty": "asserted", "operation": "add", "source_text": "用户原文片段"}}], "region": "地区", "time_info": "时间信息"}}"""
+# DeepSeek thinking mode不依赖 tool_choice，直接使用严格 JSON 提示词。
+_ISSUE_EXTRACT_FALLBACK_PROMPT = ISSUE_EXTRACT_PROMPT
 
 
 class IssuesOutput(BaseModel):
@@ -34,8 +37,121 @@ class IssuesOutput(BaseModel):
     domain: str = Field(description="推断的法律领域代码，如 labor_social_security")
     facts: list[str] = Field(default_factory=list, description="用户明确说出的客观案情事实")
     case_updates: list[CaseFactUpdate] = Field(default_factory=list, description="带用户原文锚点的原子案情更新")
+    evidence_details: list[dict] = Field(default_factory=list, description="带用户原文锚点的证据基础属性")
     region: str = Field(default="", description="用户明确提到的地区")
     time_info: str = Field(default="", description="用户明确提到的时间信息")
+    degraded: bool = Field(default=False, description="是否由非生成式降级路径产生")
+
+
+_INTAKE_SECTIONS = (
+    ("事情经过", "event.summary", "event"),
+    ("对方及双方关系", "relationship.counterparty", "relationship"),
+    ("时间、地点和金额", "case.time_place_amount", "time"),
+    ("希望解决的结果", "claim.requested_outcome", "claim"),
+    ("已经沟通或处理的情况", "procedure.current_status", "procedure"),
+)
+
+
+def _parse_intake_sections(user_input: str) -> dict[str, str]:
+    """Parse only the application-owned first-turn form contract."""
+
+    if "【首次案件材料包】" not in user_input:
+        return {}
+    labels = "|".join(re.escape(item[0]) for item in _INTAKE_SECTIONS)
+    pattern = re.compile(
+        rf"【({labels})】\s*(.+?)(?=\s*【(?:{labels})】|\s*\[本轮附件清单\]|\Z)",
+        re.S,
+    )
+    return {
+        label: " ".join(value.split()).strip()
+        for label, value in pattern.findall(user_input)
+        if " ".join(value.split()).strip()
+    }
+
+
+def _intake_case_updates(sections: dict[str, str]) -> list[CaseFactUpdate]:
+    updates: list[CaseFactUpdate] = []
+    for label, key, category in _INTAKE_SECTIONS:
+        value = sections.get(label, "")
+        if not value:
+            continue
+        updates.append(CaseFactUpdate(
+            key=key,
+            category=category,
+            statement=value,
+            value=value,
+            certainty="asserted",
+            operation="add",
+            source_text=value,
+        ))
+    return updates
+
+
+async def _extract_structured_intake(
+    user_input: str,
+    llm: BaseChatModel,
+) -> IssuesOutput | None:
+    """Use deterministic form facts and a small model call only for routing."""
+
+    sections = _parse_intake_sections(user_input)
+    if not sections:
+        return None
+    case_summary = "\n".join(
+        f"{label}：{sections[label]}"
+        for label, _, _ in _INTAKE_SECTIONS
+        if label in sections
+    )
+    updates = _intake_case_updates(sections)
+    facts = [item.statement for item in updates]
+    try:
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=450),
+            [SystemMessage(content=INTAKE_CLASSIFY_PROMPT.format(
+                case_summary=case_summary,
+            ))],
+            timeout=min(get_settings().GUIDE_LLM_TIMEOUT_EXTRACT, 8.0),
+            stage="intake_classification",
+        )
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        data = json.loads(content)
+        return IssuesOutput(
+            issues=[
+                str(item).strip()
+                for item in data.get("issues", [])
+                if str(item).strip()
+            ],
+            domain=str(data.get("domain") or "other"),
+            facts=facts,
+            case_updates=updates,
+            evidence_details=[],
+            region=str(data.get("region") or "").strip(),
+            time_info=str(
+                data.get("time_info")
+                or sections.get("时间、地点和金额", "")
+            ).strip(),
+        )
+    except Exception as exc:
+        logger.warning(
+            "首轮材料包分类失败，保留表单结构并进入语义降级: {}",
+            exc,
+        )
+        narrative = sections.get("事情经过", "")
+        fallback = _deterministic_issue_fallback(narrative)
+        return IssuesOutput(
+            issues=(
+                list(fallback.issues)
+                if fallback
+                else ([narrative] if narrative else [])
+            ),
+            domain=fallback.domain if fallback else "other",
+            facts=facts,
+            case_updates=updates,
+            evidence_details=[],
+            time_info=sections.get("时间、地点和金额", ""),
+            degraded=True,
+        )
 
 
 def _deterministic_issue_fallback(user_input: str) -> IssuesOutput | None:
@@ -56,11 +172,24 @@ def _deterministic_issue_fallback(user_input: str) -> IssuesOutput | None:
 
 # ── 第一层：LLM 提取 + 粗标准化 ──────────────────────────────────────────────
 
-async def extract_legal_issues(user_input: str, llm: BaseChatModel) -> IssuesOutput:
+async def extract_legal_issues(
+    user_input: str,
+    llm: BaseChatModel,
+    *,
+    fallback_text: str = "",
+) -> IssuesOutput:
     """LLM 提取+标准化法律问题，直接用 JSON prompt（DeepSeek thinking mode 不支持 tool_choice）。"""
+    structured_intake = await _extract_structured_intake(user_input, llm)
+    if structured_intake is not None:
+        return structured_intake
     try:
         prompt = _ISSUE_EXTRACT_FALLBACK_PROMPT.format(user_input=user_input)
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=1400),
+            [SystemMessage(content=prompt)],
+            timeout=get_settings().GUIDE_LLM_TIMEOUT_EXTRACT,
+            stage="issue_extraction",
+        )
         content = response.content.strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
@@ -70,6 +199,10 @@ async def extract_legal_issues(user_input: str, llm: BaseChatModel) -> IssuesOut
             domain=data.get("domain", "other") or "other",
             facts=[item for item in data.get("facts", []) if item],
             case_updates=[CaseFactUpdate.model_validate(item) for item in data.get("case_updates", []) if isinstance(item, dict)],
+            evidence_details=[
+                item for item in data.get("evidence_details", [])
+                if isinstance(item, dict)
+            ],
             region=(data.get("region") or "").strip(),
             time_info=(data.get("time_info") or "").strip(),
         )
@@ -79,11 +212,21 @@ async def extract_legal_issues(user_input: str, llm: BaseChatModel) -> IssuesOut
         return result
     except Exception as e:
         logger.warning(f"法律问题提取失败: {e}")
-        fallback = _deterministic_issue_fallback(user_input)
+        semantic_seed = " ".join(str(fallback_text or user_input or "").split()).strip()
+        fallback = _deterministic_issue_fallback(semantic_seed)
         if fallback:
             logger.info("法律问题提取启用确定性兜底 | issues={} domain={}", fallback.issues, fallback.domain)
+            fallback.degraded = True
             return fallback
-        return IssuesOutput(issues=[], domain="other")
+        # 模型不可用时不丢弃整段案情。原始对话仅作为语义检索种子，
+        # 后续必须经过术语向量库阈值校验；它不是法律结论。
+        if semantic_seed:
+            return IssuesOutput(
+                issues=[semantic_seed],
+                domain="other",
+                degraded=True,
+            )
+        return IssuesOutput(issues=[], domain="other", degraded=True)
 
 
 # ── 第二层：Neo4j LegalConcept 精确匹配 ──────────────────────────────────────
@@ -150,7 +293,7 @@ async def semantic_fallback(
     embedding_model: Embeddings,
     milvus_client: MilvusClient,
     domain: str = "",
-) -> tuple[dict[str, str], list[str]]:
+) -> tuple[dict[str, str], list[str], list[str]]:
     """第三层：legal_term_index 语义兜底，把口语描述吸附到最近的标准法律术语。
 
     一次批量 search（data 传多个查询向量），取 top-K 候选后择优：
@@ -162,13 +305,13 @@ async def semantic_fallback(
         still_unmatched: 无法映射的口语描述（保留原词，仅供 Dense 检索参考）
     """
     if not unmatched_issues:
-        return {}, []
+        return {}, [], []
 
     try:
         query_embeddings = await embedding_model.aembed_documents(unmatched_issues)
     except Exception as e:
         logger.warning("第三层 embedding 失败，全部降级为口语词: {}", e)
-        return {}, list(unmatched_issues)
+        return {}, list(unmatched_issues), []
 
     try:
         results = milvus_client.search(
@@ -184,10 +327,11 @@ async def semantic_fallback(
         # 不再做无意义的 statute_index 可分类性检测，直接全部降级为口语词，
         # 由 node_retrieve 走纯 Dense 检索兜底。
         logger.warning("{} 不可用，第三层整体跳过: {}", TERM_COLLECTION, e)
-        return {}, list(unmatched_issues)
+        return {}, list(unmatched_issues), []
 
     mapped: dict[str, str] = {}
     still_unmatched: list[str] = []
+    mapped_domains: list[str] = []
 
     for issue, cands in zip(unmatched_issues, results or []):
         hits = [
@@ -214,12 +358,15 @@ async def semantic_fallback(
         same_domain = [h for h in passing if domain and h["domain"] == domain]
         pick = max(same_domain or passing, key=lambda h: h["score"])
         mapped[issue] = pick["name"]
+        picked_domain = str(pick.get("domain") or "")
+        if picked_domain and picked_domain not in mapped_domains:
+            mapped_domains.append(picked_domain)
         logger.debug(
             "语义映射: '{}' → '{}' (score={:.3f} domain={} 同域优先={})",
             issue, pick["name"], pick["score"], pick["domain"], bool(same_domain),
         )
 
-    return mapped, still_unmatched
+    return mapped, still_unmatched, mapped_domains
 
 
 # ── 入口函数 ──────────────────────────────────────────────────────────────────
@@ -236,6 +383,8 @@ async def normalize_legal_issues(
     neo4j_driver: AsyncDriver,
     embedding_model: Embeddings,
     milvus_client: MilvusClient,
+    *,
+    fallback_text: str = "",
 ) -> dict:
     """完整三层法律问题标准化入口。
 
@@ -251,7 +400,11 @@ async def normalize_legal_issues(
         domain     : 确认后的法律领域代码
     """
     # ── 第一层：LLM 提取 + domain 推断 ────────────────────────────────────────
-    extracted = await extract_legal_issues(user_input, llm)
+    extracted = await extract_legal_issues(
+        user_input,
+        llm,
+        fallback_text=fallback_text,
+    )
     issues = _dedup([i.strip() for i in extracted.issues if i.strip()])
     raw_domain = extracted.domain
     mapped_domain = DOMAIN_MAPPING.get(raw_domain, raw_domain)
@@ -265,6 +418,7 @@ async def normalize_legal_issues(
             "standard": [], "colloquial": [], "term_map": {}, "domain": domain,
             "collected_facts": extracted.facts,
             "case_updates": [item.model_dump() for item in extracted.case_updates],
+            "evidence_details": extracted.evidence_details,
             "region": extracted.region,
             "time_info": extracted.time_info,
         }
@@ -273,9 +427,12 @@ async def normalize_legal_issues(
     matched, unmatched_after_exact = await match_issues_in_neo4j(issues, neo4j_driver)
 
     # ── 第三层：Milvus 语义最近邻，把口语吸附到标准术语 ───────────────────────
-    term_map, still_unmatched = await semantic_fallback(
+    term_map, still_unmatched, mapped_domains = await semantic_fallback(
         unmatched_after_exact, embedding_model, milvus_client, domain=domain,
     )
+    if (not domain or domain == "other") and len(mapped_domains) == 1:
+        domain = await confirm_domain_in_neo4j(mapped_domains[0], neo4j_driver)
+        logger.info("语义术语映射反推法律领域 | domain={}", domain)
 
     standard = _dedup(matched + list(term_map.values()))
     logger.info(
@@ -289,6 +446,8 @@ async def normalize_legal_issues(
         "domain":     domain,
         "collected_facts": extracted.facts,
         "case_updates": [item.model_dump() for item in extracted.case_updates],
+        "evidence_details": extracted.evidence_details,
         "region": extracted.region,
         "time_info": extracted.time_info,
+        "extraction_degraded": extracted.degraded,
     }

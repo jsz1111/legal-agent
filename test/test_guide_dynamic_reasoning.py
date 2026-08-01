@@ -244,7 +244,10 @@ def test_planner_rejects_a_repeated_semantic_decision_even_with_new_wording():
 
     plan = asyncio.run(plan_next_followup(state, _llm(proposal)))
 
-    assert plan == {"should_ask": False, "planner_mode": "policy_rejected"}
+    assert plan["should_ask"] is True
+    assert plan["planner_mode"] == "deterministic_fallback_invalid_expression"
+    assert plan["decision_key"] == "consumer_transaction"
+    assert plan["decision_trace"]["selected_candidate_id"] == "consumer_transaction"
 
 
 def test_planner_rejects_catalog_dimension_already_covered_by_case_facts():
@@ -267,7 +270,10 @@ def test_planner_rejects_catalog_dimension_already_covered_by_case_facts():
 
     plan = asyncio.run(plan_next_followup(state, _llm(proposal)))
 
-    assert plan == {"should_ask": False, "planner_mode": "policy_rejected"}
+    assert plan["should_ask"] is True
+    assert plan["planner_mode"] == "deterministic_fallback_model_changed_candidate"
+    assert plan["candidate_id"] == "consumer_negotiation_claim"
+    assert plan["decision_trace"]["selected_candidate_id"] == "consumer_negotiation_claim"
 
 
 def test_food_followup_renders_case_specific_question_and_reason():
@@ -314,8 +320,12 @@ def test_evidence_plan_cannot_turn_material_question_into_payment_method_questio
         legal_domain="consumer_market",
         case_facts=[
             _fact("transaction.amount", "消费39元", "花了39元", category="amount"),
+            _fact("transaction.merchant", "在某餐馆消费", "在某餐馆", category="relationship"),
             _fact("food.problem", "饺子中发现苍蝇", "吃到了苍蝇", category="event"),
+            _fact("event.discovery_time", "当场发现问题", "当场发现", category="time"),
+            _fact("claim.refund", "用户希望退款", "我想退款", category="claim"),
         ],
+        time_info="当场发现",
     )
     proposal = _planner_payload(
         ask_type="evidence",
@@ -393,7 +403,7 @@ def test_declarative_detail_is_not_misclassified_as_a_counter_question():
     assert not updates["messages"]
 
 
-def test_generic_planner_question_is_anchored_to_the_users_case_on_render():
+def test_generic_planner_question_uses_scannable_markdown_without_repeating_context():
     state = GuideState(
         round=1,
         legal_domain="consumer_market",
@@ -418,8 +428,13 @@ def test_generic_planner_question_is_anchored_to_the_users_case_on_render():
     reply = updates["messages"][0].content
 
     assert "碗里发现苍蝇" in reply
-    assert "结合您说的" in reply
-    assert "再确认这一点是为了" in reply
+    assert reply.count("碗里发现苍蝇") == 1
+    assert "### 已记录" in reply
+    assert "### 请确认" in reply
+    assert "### 为什么要问" in reply
+    assert "> **这次是在哪家餐馆消费，大约花了多少钱？**" in reply
+    assert "- **用途：**" in reply
+    assert "- **追问依据：**" in reply
     assert "先确认一个关键点" not in reply
 
 
@@ -461,7 +476,7 @@ def test_case_summary_groups_atomic_facts_and_hides_repeated_paraphrases():
         {"user_burden": 0.95},
     ],
 )
-def test_planner_stops_when_the_next_question_is_not_worth_the_burden(updates: dict):
+def test_model_numeric_scores_cannot_change_application_policy(updates: dict):
     state = GuideState(
         round=1,
         legal_domain="other",
@@ -470,8 +485,10 @@ def test_planner_stops_when_the_next_question_is_not_worth_the_burden(updates: d
 
     plan = asyncio.run(plan_next_followup(state, _llm(_planner_payload(**updates))))
 
-    assert plan["should_ask"] is False
-    assert plan["planner_mode"] == "policy_rejected"
+    assert plan["should_ask"] is True
+    assert plan["planner_mode"] == "deterministic_policy"
+    assert plan["information_gain"] != updates.get("information_gain")
+    assert plan["user_burden"] != updates.get("user_burden")
 
 
 def test_null_optional_candidate_id_does_not_abort_a_valid_dynamic_plan():
@@ -487,8 +504,8 @@ def test_null_optional_candidate_id_does_not_abort_a_valid_dynamic_plan():
     ))
 
     assert plan["should_ask"] is True
-    assert plan["candidate_id"] == ""
-    assert plan["planner_mode"] == "dynamic"
+    assert plan["candidate_id"] == "other_event_party"
+    assert plan["planner_mode"] == "deterministic_policy"
 
 
 def test_unresolved_current_safety_is_a_mandatory_first_gate():
@@ -545,7 +562,7 @@ def test_non_safety_criminal_matter_does_not_trigger_the_safety_gate():
 
     llm.ainvoke.assert_awaited_once()
     assert plan["candidate_id"] == "criminal_person_time"
-    assert plan["planner_mode"] == "dynamic"
+    assert plan["planner_mode"] == "deterministic_policy"
 
 
 @pytest.mark.parametrize(
@@ -560,7 +577,12 @@ def test_contextual_reason_cannot_invent_procedural_outcomes(contextual_reason: 
     state = GuideState(
         round=1,
         legal_domain="criminal_public_security",
-        case_facts=[_fact("event.injury", "用户称被他人打伤", "我被人打伤了")],
+        case_facts=[
+            _fact("event.injury", "用户称被他人打伤", "我被人打伤了"),
+            _fact("event.time", "事件发生在昨天", "昨天发生", category="time"),
+            _fact("procedure.report", "用户已经报案", "我已经报案", category="procedure"),
+        ],
+        time_info="昨天",
     )
     payload = _planner_payload(
         candidate_id="criminal_original_clues",
@@ -589,7 +611,8 @@ def test_planner_repairs_multiple_questions_to_one_center_question():
     ))
 
     assert plan["should_ask"] is True
-    assert plan["question"] == "发生时间是什么时候？"
+    assert plan["question"] == "您和对方是什么关系，例如买卖、借贷、劳动或租赁关系？"
+    assert plan["question"].count("？") == 1
 
 
 def test_invalid_law_reference_falls_back_to_official_elements_source():
@@ -626,17 +649,91 @@ def test_planner_never_exposes_an_unsupported_model_citation_in_its_reason():
 
     plan = asyncio.run(plan_next_followup(state, _llm(proposal)))
 
-    assert plan["reason"] == "确定请求类型和范围"
-    assert plan["answer_hint"] == ""
+    assert plan["reason"] == "识别法律关系和责任主体"
+    assert plan["answer_hint"] == "简单说明您和对方是什么关系即可，不确定可以说“不清楚”。"
     assert "第二十四条" not in json.dumps(plan, ensure_ascii=False)
 
 
-def test_planner_failure_converges_instead_of_asking_the_first_catalog_question():
+def test_planner_failure_uses_the_policy_selected_catalog_question():
     state = GuideState(legal_domain="consumer_market")
 
     plan = asyncio.run(plan_next_followup(state, _llm("not-json")))
 
-    assert plan == {"should_ask": False, "planner_mode": "planner_error"}
+    assert plan["should_ask"] is True
+    assert plan["planner_mode"] == "deterministic_fallback_planner_error"
+    assert plan["candidate_id"] == "consumer_transaction"
+    assert plan["question"]
+    assert plan["decision_trace"]["selected_candidate_id"] == "consumer_transaction"
+
+
+def test_catalog_fallback_only_asks_the_uncovered_semantic_dimension():
+    state = GuideState(
+        legal_domain="other",
+        case_facts=[
+            _fact(
+                "event.non_delivery",
+                "用户已经付款但对方没有交付",
+                "已经付款但没有交付",
+                category="event",
+            ),
+        ],
+    )
+
+    plan = asyncio.run(plan_next_followup(state, _llm("not-json")))
+
+    assert plan["candidate_id"] == "other_event_party"
+    assert "关系" in plan["question"]
+    assert "具体发生了什么" not in plan["question"]
+
+
+def test_model_wording_cannot_reintroduce_an_already_covered_dimension():
+    state = GuideState(
+        legal_domain="other",
+        case_facts=[
+            _fact(
+                "event.non_delivery",
+                "用户已经付款但对方没有交付",
+                "已经付款但没有交付",
+                category="event",
+            ),
+        ],
+    )
+    proposal = _planner_payload(
+        candidate_id="other_event_party",
+        decision_key="other_event_party",
+        question="对方是谁，事情具体又是怎么发生的？",
+    )
+
+    plan = asyncio.run(plan_next_followup(state, _llm(proposal)))
+
+    assert "关系" in plan["question"]
+    assert "怎么发生" not in plan["question"]
+    assert "关系" in plan["answer_hint"]
+
+
+def test_answered_event_and_counterparty_remove_repeated_party_event_candidate():
+    state = GuideState(
+        legal_domain="other",
+        case_facts=[
+            _fact(
+                "event.non_delivery",
+                "用户已经付款但对方没有交付",
+                "已经付款但没有交付",
+                category="event",
+            ),
+            _fact(
+                "counterparty.identity",
+                "对方是个人卖家",
+                "对方是个人卖家",
+                category="actor",
+            ),
+        ],
+    )
+
+    plan = asyncio.run(plan_next_followup(state, _llm("not-json")))
+
+    assert plan["candidate_id"] != "other_event_party"
+    assert "对方是个人、公司还是政府机构" not in plan["question"]
 
 
 def test_parse_details_records_blacklist_through_generic_case_updates_only():

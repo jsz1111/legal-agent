@@ -73,3 +73,15 @@ def get_checkpointer_redis() -> redis.Redis:
         client = _new_checkpointer_client()
         _checkpointer_clients[loop] = client
     return client
+
+
+async def set_with_optional_ttl(
+    client: redis.Redis,
+    key: str,
+    value,
+    ttl: int | None,
+):
+    """Persist when ttl is zero/None; otherwise apply the configured lifetime."""
+    if ttl and ttl > 0:
+        return await client.set(key, value, ex=ttl)
+    return await client.set(key, value)

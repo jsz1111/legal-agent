@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 from types import SimpleNamespace
 
@@ -194,3 +195,121 @@ def test_chat_attachments_are_analyzed_once_without_auto_injection(monkeypatch):
     user_content = result[0][0]["content"]
     assert user_content.count("【证据类型】聊天记录") == 1
     assert "原图 SHA-256：hash-value" in user_content
+
+
+def test_intake_message_keeps_only_user_supplied_fields():
+    message = gradio_chat_demo._build_intake_message(
+        "在平台付款后卖家没有发货，并把我拉黑。",
+        "闲鱼个人卖家",
+        "2026年7月，付款800元",
+        "退款",
+        "",
+    )
+
+    assert message.startswith("【首次案件材料包】")
+    assert "未填写的项目表示本轮未提供，不能推测" in message
+    assert "【事情经过】" in message
+    assert "【对方及双方关系】" in message
+    assert "【已经沟通或处理的情况】" not in message
+
+
+def test_txt_attachment_is_extracted_with_fingerprint(tmp_path):
+    path = tmp_path / "聊天记录.txt"
+    path.write_text("卖家承诺三天内发货，但之后将我拉黑。", encoding="utf-8")
+
+    result = gradio_chat_demo._extract_document_attachment(str(path))
+
+    assert "承诺三天内发货" in result["text"]
+    assert result["source_form"] == "native_electronic"
+    assert result["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert result["truncated"] is False
+
+
+def test_document_attachment_is_sent_once_as_evidence_block(monkeypatch, tmp_path):
+    path = tmp_path / "订单.txt"
+    path.write_text("订单号123，付款800元，商品未发货。", encoding="utf-8")
+    captured = {}
+
+    class Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"reply": "已收到材料"}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr(gradio_chat_demo.requests, "post", fake_post)
+
+    result = gradio_chat_demo.send_message(
+        "请结合附件分析",
+        [],
+        "user",
+        "session",
+        [str(path)],
+    )
+
+    content = captured["message"]
+    assert content.count("【文档证据补充") == 1
+    assert content.count("订单号123") == 1
+    assert "原文件 SHA-256：" in content
+    assert result[0][-1]["content"] == "已收到材料"
+
+
+def test_intake_package_uses_normal_chat_and_clears_intake_fields(monkeypatch):
+    captured = {}
+
+    class Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"reply": "开始分析"}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr(gradio_chat_demo.requests, "post", fake_post)
+
+    result = gradio_chat_demo.send_intake_package(
+        "付款后未发货",
+        "个人卖家",
+        "2026年7月，800元",
+        "退款",
+        "平台申诉未回复",
+        [],
+        "user",
+        "",
+        [],
+    )
+
+    assert "【首次案件材料包】" in captured["message"]
+    assert "【希望解决的结果】\n退款" in captured["message"]
+    assert result[-5:] == ("", "", "", "", "")
+
+
+def test_quick_action_buttons_send_only_control_commands(monkeypatch):
+    calls = []
+
+    def fake_send(message, history, user_id, session_id, uploaded_files):
+        calls.append((message, history, user_id, session_id, uploaded_files))
+        return ("sent",)
+
+    monkeypatch.setattr(gradio_chat_demo, "send_message", fake_send)
+    args = ([{"role": "assistant", "content": "方案"}], "user", "session", [])
+
+    assert gradio_chat_demo.send_conclude_action(*args) == ("sent",)
+    assert gradio_chat_demo.send_supplement_action(*args) == ("sent",)
+    assert gradio_chat_demo.send_document_action(*args) == ("sent",)
+    assert [item[0] for item in calls] == [
+        "现在生成方案",
+        "继续补充",
+        "生成文书",
+    ]

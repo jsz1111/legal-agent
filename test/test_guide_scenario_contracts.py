@@ -88,12 +88,12 @@ def test_prepare_turn_detects_user_requested_and_hard_limit_convergence():
     assert concise_updates["wants_conclude"] is True
 
     limited = GuideState(
-        round=11,
-        total_rounds=11,
+        round=guide_graph.settings.GUIDE_MAX_TOTAL_ROUNDS - 1,
+        total_rounds=guide_graph.settings.GUIDE_MAX_TOTAL_ROUNDS - 1,
         messages=[HumanMessage(content="什么是劳动仲裁？")],
     )
     limit_updates = asyncio.run(guide_graph.node_prepare_turn(limited, deps))
-    assert limit_updates["total_rounds"] == 12
+    assert limit_updates["total_rounds"] == guide_graph.settings.GUIDE_MAX_TOTAL_ROUNDS
     assert limit_updates["force_conclude"] is True
 
 
@@ -930,6 +930,58 @@ def test_issue_extraction_uses_high_precision_wage_fallback_on_invalid_json():
     assert result.facts == ["公司欠我工资。"]
 
 
+def test_structured_intake_uses_form_facts_and_compact_domain_classification():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps({
+        "issues": ["网络买卖合同履行"],
+        "domain": "consumer_market",
+        "region": "",
+        "time_info": "2026年7月18日",
+    }, ensure_ascii=False)))
+    intake = (
+        "【首次案件材料包】\n"
+        "【事情经过】\n我在平台付款后卖家没有发货。\n"
+        "【对方及双方关系】\n平台个人卖家\n"
+        "【时间、地点和金额】\n2026年7月18日，800元\n"
+        "【希望解决的结果】\n取消交易并退款\n"
+        "【已经沟通或处理的情况】\n已经向平台投诉\n\n"
+        "[本轮附件清单]\n- 订单.txt"
+    )
+
+    result = asyncio.run(extract_legal_issues(intake, llm))
+
+    assert result.domain == "consumer_market"
+    assert result.issues == ["网络买卖合同履行"]
+    assert [item.key for item in result.case_updates] == [
+        "event.summary",
+        "relationship.counterparty",
+        "case.time_place_amount",
+        "claim.requested_outcome",
+        "procedure.current_status",
+    ]
+    prompt = llm.ainvoke.await_args.args[0][0].content
+    assert "订单.txt" not in prompt
+    assert "evidence_details" not in prompt
+
+
+def test_issue_extraction_timeout_preserves_recent_dialogue_as_semantic_seed():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=TimeoutError("slow model"))
+    recent_dialogue = "我在网上向个人卖家付款购买商品，对方没有交付"
+
+    result = asyncio.run(
+        extract_legal_issues(
+            "包含内部格式要求的长提示词",
+            llm,
+            fallback_text=recent_dialogue,
+        )
+    )
+
+    assert result.issues == [recent_dialogue]
+    assert result.domain == "other"
+    assert result.degraded is True
+
+
 def test_parse_details_accumulates_fact_blackboard_across_turns():
     first = GuideState(
         messages=[HumanMessage(content="我2022年3月入职，月薪8000元")],
@@ -1221,7 +1273,8 @@ def test_worker_persists_complete_short_term_blackboard():
     assert restored.evidence_confirmed == ["劳动合同"]
     assert restored.pending_ask_type == "facts"
     assert redis.data["guide_active:12:s1"] == "1"
-    assert redis.expirations["guide_state:12:s1"] == guide_worker.settings.GUIDE_SESSION_TTL
+    expected_ttl = guide_worker.settings.GUIDE_SESSION_TTL or None
+    assert redis.expirations["guide_state:12:s1"] == expected_ttl
 
 
 def test_worker_persists_end_state_without_matching_invitation_copy():
@@ -1256,7 +1309,8 @@ def test_worker_persists_end_state_without_matching_invitation_copy():
     assert reply == "最终维权方案"
     assert restored.phase == GuidePhase.END
     assert redis.data["guide_active:12:s1"] == "1"
-    assert redis.expirations["guide_state:12:s1"] == guide_worker.settings.GUIDE_SESSION_TTL
+    expected_ttl = guide_worker.settings.GUIDE_SESSION_TTL or None
+    assert redis.expirations["guide_state:12:s1"] == expected_ttl
 
 
 def test_worker_tool_retrieves_long_term_memory_deterministically():

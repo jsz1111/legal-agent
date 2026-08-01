@@ -18,6 +18,10 @@ from src.agents.legal_guide.followup_planner import (
 from src.agents.legal_guide.followup_policy import (
     SLOT_DECISION_EFFECTS,
 )
+from src.agents.legal_guide.evidence_analysis import (
+    coverage_for_rule,
+    evaluate_state_evidence,
+)
 
 
 DECISION_EFFECT_LABELS = {
@@ -71,16 +75,33 @@ def _applicable_rules(
             resolved,
             list(coverage.get("missing") or []),
         ))
-    known_evidence = list(getattr(state, "evidence_confirmed", []) or []) + list(
-        getattr(state, "evidence_unavailable", []) or []
-    )
+    raw_evidence_report = getattr(state, "evidence_coverage", {}) or {}
+    evidence_report = raw_evidence_report or evaluate_state_evidence(state)
     for rule in rules.evidence:
-        resolved = evidence_rule_resolved(rule, known_evidence)
+        coverage = coverage_for_rule(evidence_report, rule.id)
+        if coverage:
+            resolved = coverage.status == "preliminarily_covered"
+            if coverage.status == "partially_covered":
+                missing = [
+                    f"{rule.item}仍需核验{'、'.join(coverage.quality_gaps[:3])}"
+                ]
+            elif coverage.status == "known_missing":
+                missing = [f"缺少{rule.item}"]
+            elif coverage.status == "conflicted":
+                missing = [f"{rule.item}的持有情况前后不一致"]
+            else:
+                missing = [] if resolved else [rule.item]
+        else:
+            known_evidence = list(
+                getattr(state, "evidence_confirmed", []) or []
+            )
+            resolved = evidence_rule_resolved(rule, known_evidence)
+            missing = [] if resolved else [rule.item]
         result.append((
             rule.id,
             ["evidence_gap"],
             resolved,
-            [] if resolved else [rule.item],
+            missing,
         ))
     return result
 
@@ -178,5 +199,8 @@ def unresolved_decision_summary(report: DecisionSufficiencyReport) -> list[str]:
         if item.satisfied:
             continue
         missing = "、".join(item.missing_information) or "相关关键事实"
-        result.append(f"{item.label}：仍缺少{missing}")
+        if item.effect == "evidence_gap":
+            result.append(f"{item.label}：{missing}")
+        else:
+            result.append(f"{item.label}：仍缺少{missing}")
     return result

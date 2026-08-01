@@ -150,6 +150,12 @@ async def get_supervisor_agent():
     return _supervisor_agent
 
 
+async def delete_supervisor_thread(thread_id: str) -> None:
+    """Delete all LangGraph checkpoints associated with one user conversation."""
+    saver = AsyncRedisSaver(redis_client=get_checkpointer_redis())
+    await saver.adelete_thread(thread_id)
+
+
 # FastAPI 路由中使用
 async def chat_endpoint(user_id: str, session_id: str, message: str):
     # 使用单例，不重复初始化。获取 agent

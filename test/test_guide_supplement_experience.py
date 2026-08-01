@@ -12,8 +12,10 @@ from src.agents.legal_guide.followup_catalog import (
     evidence_followups,
     fact_followups,
 )
+from src.agents.legal_guide.followup_planner import _single_question
 from src.agents.legal_guide.graph import (
     GuideDeps,
+    _ensure_post_conclusion_options,
     _format_case_summary,
     _format_followup_reply,
     _with_memory_recall_preface,
@@ -48,6 +50,7 @@ def _deps_with_plan(question: str = "还有哪个事实会明显影响下一步�
         "question": question,
         "reason": "判断是否需要调整处理路径",
         "answer_hint": "没有其他内容时可以直接说没有",
+        "decision_effects": ["procedure"],
         "acknowledgement": "",
         "acknowledged_fact_keys": [],
         "basis_kind": "official_elements",
@@ -75,6 +78,9 @@ def test_followup_explains_reason_and_authoritative_source_without_overclaiming(
     assert "追问依据" in reply
     assert "最高人民法院" in reply
     assert "不是要求您必须提交的固定材料" in reply
+    assert "\n\n### 请确认\n\n" in reply
+    assert "\n\n### 为什么要问\n\n" in reply
+    assert "> **押金是多少，对方为什么不退？**" in reply
 
 
 def test_followup_reason_does_not_repeat_purpose_prepositions():
@@ -92,7 +98,7 @@ def test_followup_reason_does_not_repeat_purpose_prepositions():
 
     assert "为了用于" not in reply
     assert "用于用于" not in reply
-    assert "再确认这一点是为了判断仲裁时效" in reply
+    assert "- **用途：** 再确认这一点是为了判断仲裁时效" in reply
 
 
 def test_high_value_plan_asks_a_specific_question_without_a_choice_menu():
@@ -244,7 +250,104 @@ def test_user_choice_continue_can_cross_soft_limit_but_keeps_hard_limit():
 
     updates = asyncio.run(node_ask_followup(continued, _deps_with_plan()))
     assert updates["ask_rounds"] == settings.GUIDE_SOFT_ASK_ROUNDS + 1
-    assert "直接回复“现在生成方案”" in updates["messages"][0].content
+    assert "直接回复 **“现在生成方案”**" in updates["messages"][0].content
+
+
+def test_post_conclusion_continue_control_is_not_treated_as_case_detail():
+    state = GuideState(
+        phase=GuidePhase.ISSUE_SEARCH,
+        legal_domain="consumer_market",
+        confirmed_issues=["消费退款纠纷"],
+        turn_control_intent="continue_gathering",
+        turn_contains_case_details=False,
+        round=3,
+        total_rounds=3,
+        messages=[HumanMessage(content="继续补充")],
+    )
+
+    prepared = asyncio.run(node_prepare_turn(state, MagicMock(spec=GuideDeps)))
+    continued = state.model_copy(update=prepared)
+
+    assert continued.supplement_choice == "continue"
+    assert continued.supplement_has_details is False
+    assert continued.allow_extra_followups is True
+    assert route_after_urgency(continued) == "assess_retrieve"
+
+    updates = asyncio.run(node_ask_followup(continued, _deps_with_plan()))
+    reply = updates["messages"][0].content
+    assert "好的，我们继续" in reply
+    assert "“继续补充”我已经记下" not in reply
+
+
+def test_conclusion_exposes_same_case_supplement_option_once():
+    reply = "行动方案正文。\n\n---\n📄 **需要参考文书？** 请回复「生成文书」。"
+
+    rendered = _ensure_post_conclusion_options(reply)
+    rendered_again = _ensure_post_conclusion_options(rendered)
+
+    assert "直接发送新的事实或证据" in rendered
+    assert "回复「继续补充」" in rendered
+    assert "同一案件中重新评估、更新方案" in rendered
+    assert rendered_again.count("回复「继续补充」") == 1
+
+
+def test_one_decision_objective_can_bundle_tightly_related_fields():
+    question = "您是向哪家店购买的什么商品，大约支付了多少钱？"
+
+    assert _single_question(question) == question
+    assert _single_question("您支付了多少钱？您保存付款记录了吗？") == "您支付了多少钱？"
+
+
+def test_counter_question_is_answered_before_pending_question_is_restored():
+    parser_payload = {
+        "is_answer": False,
+        "answers_asked_question": False,
+        "new_issues": [],
+        "collected_facts": [],
+        "case_updates": [],
+        "evidence": [],
+        "evidence_unavailable": [],
+        "adverse_facts": [],
+        "region": "",
+        "time_info": "",
+        "user_question": "劳动仲裁收费吗？",
+    }
+    deps = MagicMock(spec=GuideDeps)
+    deps.llm = MagicMock()
+    deps.llm.ainvoke = AsyncMock(side_effect=[
+        AIMessage(content=json.dumps(parser_payload, ensure_ascii=False)),
+        AIMessage(content="劳动争议仲裁依法不收取仲裁费用，其他材料或代理成本需要另行判断。"),
+    ])
+    state = GuideState(
+        legal_domain="labor_social_security",
+        law_context_str="《劳动争议调解仲裁法》第五十三条：劳动争议仲裁不收费。",
+        messages=[HumanMessage(content="劳动仲裁收费吗？")],
+        pending_ask_details=["您实际是为哪家单位工作的？"],
+        pending_ask_type="facts",
+        pending_followup_ids=["labor_employer_relation"],
+    )
+
+    updates = asyncio.run(node_parse_details(state, deps))
+    reply = updates["messages"][0].content
+
+    assert "劳动争议仲裁依法不收取仲裁费用" in reply
+    assert "您实际是为哪家单位工作的" in reply
+    assert "会在最终方案中一并回答" not in reply
+    assert updates.get("pending_ask_details", state.pending_ask_details) == state.pending_ask_details
+    assert updates["deferred_questions"] == []
+
+
+def test_absolute_followup_limit_still_accepts_direct_facts_without_inviting_more_questions():
+    state = GuideState(
+        ask_rounds=settings.GUIDE_MAX_OPT_IN_ASK_ROUNDS,
+        total_rounds=10,
+    )
+
+    rendered = _ensure_post_conclusion_options("行动方案正文。", state)
+
+    assert "已达到主动追问上限" in rendered
+    assert "直接发送新的事实或证据" in rendered
+    assert "回复「继续补充」" not in rendered
 
 
 def test_legacy_unclear_choice_state_is_cleared_without_consuming_a_followup_round():

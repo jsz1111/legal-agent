@@ -130,7 +130,7 @@ def test_user_claimed_evidence_is_not_marked_authentic_or_admissible():
     assert assessment["legal_admissibility"] == "not_determined"
 
 
-def test_two_consecutive_low_information_answers_force_conclusion():
+def test_explicit_evidence_absence_is_progress_not_low_information():
     state = GuideState(
         legal_domain="labor_social_security",
         messages=[HumanMessage(content="没有，找不到了")],
@@ -144,7 +144,29 @@ def test_two_consecutive_low_information_answers_force_conclusion():
         _deps(_parsed(evidence_unavailable=["工资流水"])),
     ))
 
-    assert result["consecutive_low_info_answers"] == 2
+    assert result["consecutive_low_info_answers"] == 0
+    assert result["force_conclude"] is False
+    assert result["pending_followup_ids"] == []
+
+
+def test_three_consecutive_ambiguous_answers_force_conclusion():
+    state = GuideState(
+        legal_domain="labor_social_security",
+        messages=[HumanMessage(content="这个需要怎么确认？")],
+        pending_ask_details=["是否签有书面劳动合同？"],
+        pending_ask_type="facts",
+        pending_followup_ids=["labor_employer_relation"],
+        consecutive_low_info_answers=2,
+    )
+    result = asyncio.run(guide_graph.node_parse_details(
+        state,
+        _deps(_parsed(
+            answers_asked_question=True,
+            collected_facts=[],
+        )),
+    ))
+
+    assert result["consecutive_low_info_answers"] == 3
     assert result["force_conclude"] is True
     assert result["pending_followup_ids"] == []
 

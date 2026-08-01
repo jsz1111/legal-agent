@@ -14,6 +14,7 @@
 
 import uuid
 import html
+import hashlib
 import mimetypes
 import requests
 import gradio as gr
@@ -38,6 +39,10 @@ _ARTIFACT_CACHE_DIR = Path(tempfile.gettempdir()) / "legal-agent-gradio-download
 _GRADIO_CACHE_DIR = Path(
     os.getenv("GRADIO_TEMP_DIR") or (Path(tempfile.gettempdir()) / "gradio")
 )
+_MAX_INTAKE_FILES = 8
+_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_MAX_ATTACHMENT_TEXT = 8_000
+_MAX_ATTACHMENT_TEXT_TOTAL = 16_000
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────
@@ -520,6 +525,76 @@ def show_official_template_source(template_id: str | None):
     )
 
 
+def _extract_document_attachment(file_path: str) -> dict:
+    """Extract bounded, auditable text from a supported document attachment."""
+
+    from src.agents.legal_guide.attachment_parser import extract_document_bytes
+
+    path = Path(file_path)
+    if not path.is_file():
+        raise ValueError("文件不存在或已失效")
+    return extract_document_bytes(
+        path.name,
+        path.read_bytes(),
+        max_bytes=_MAX_ATTACHMENT_BYTES,
+        max_text=_MAX_ATTACHMENT_TEXT,
+    )
+
+
+def _build_intake_message(
+    overview: str,
+    counterparty: str,
+    time_place_amount: str,
+    goal: str,
+    prior_actions: str,
+) -> str:
+    """Build one grounded first-turn package without inventing empty fields."""
+
+    sections = [
+        ("事情经过", overview),
+        ("对方及双方关系", counterparty),
+        ("时间、地点和金额", time_place_amount),
+        ("希望解决的结果", goal),
+        ("已经沟通或处理的情况", prior_actions),
+    ]
+    supplied = [
+        f"【{label}】\n{str(value).strip()}"
+        for label, value in sections
+        if str(value or "").strip()
+    ]
+    if not supplied:
+        return ""
+    return (
+        "【首次案件材料包】\n"
+        "以下内容由用户一次性提交；未填写的项目表示本轮未提供，不能推测。\n\n"
+        + "\n\n".join(supplied)
+    )
+
+
+def send_intake_package(
+    overview: str,
+    counterparty: str,
+    time_place_amount: str,
+    goal: str,
+    prior_actions: str,
+    history: list,
+    user_id: str,
+    session_id: str,
+    uploaded_files: list,
+) -> tuple:
+    """Submit the structured first-turn package through the normal chat flow."""
+
+    message = _build_intake_message(
+        overview,
+        counterparty,
+        time_place_amount,
+        goal,
+        prior_actions,
+    )
+    result = send_message(message, history, user_id, session_id, uploaded_files)
+    return (*result, "", "", "", "", "")
+
+
 def send_message(
     user_message: str,
     history: list,
@@ -548,10 +623,12 @@ def send_message(
 
     history = history or []
 
-    # 处理上传的文件（图片优先分析）
+    # 处理上传的文件。所有材料都保留摘要指纹，供证据子系统区分
+    # “用户说有”与“系统实际收到副本”。
     files_info = []
+    extracted_text_total = 0
     if uploaded_files:
-        for file_path in uploaded_files:
+        for file_path in uploaded_files[:_MAX_INTAKE_FILES]:
             try:
                 file_name = os.path.basename(file_path)
                 file_ext = os.path.splitext(file_name)[1].lower()
@@ -567,7 +644,7 @@ def send_message(
                         auto_inject=False,
                     )
                     if result.get("success"):
-                        analysis = result.get("analysis", "")
+                        analysis = str(result.get("analysis", ""))[:6_000]
                         digest = result.get("image_sha256", "")
                         files_info.append(
                             "【图片证据补充（视觉模型识别，需与原图核对）】\n"
@@ -577,15 +654,43 @@ def send_message(
                         files_info.append(
                             f"📷 {file_name}: {result.get('message') or '分析失败'}"
                         )
+                elif file_ext in {".pdf", ".docx", ".txt"}:
+                    extracted = _extract_document_attachment(file_path)
+                    remaining = max(0, _MAX_ATTACHMENT_TEXT_TOTAL - extracted_text_total)
+                    if not remaining:
+                        files_info.append(
+                            f"📎 {file_name}: 已收到，但本轮材料文字总量已达上限；"
+                            "请下一轮补充该文件的关键页或关键内容。"
+                        )
+                        continue
+                    extracted_text = extracted["text"][:remaining]
+                    extracted_text_total += len(extracted_text)
+                    truncation_note = (
+                        "\n（内容较长，本轮仅提取前部文字。）"
+                        if extracted["truncated"] or len(extracted["text"]) > remaining
+                        else ""
+                    )
+                    files_info.append(
+                        "【文档证据补充（程序提取，需与原文件核对）】\n"
+                        f"文件：{file_name}\n"
+                        f"来源形式：{extracted['source_form']}\n"
+                        f"原文件 SHA-256：{extracted['sha256']}\n"
+                        "【提取文字】\n"
+                        f"{extracted_text}{truncation_note}"
+                    )
                 else:
                     files_info.append(f"📎 {file_name}: 暂不支持此格式")
             except Exception as e:
                 files_info.append(f"❌ {file_name}: {str(e)}")
+        if len(uploaded_files) > _MAX_INTAKE_FILES:
+            files_info.append(
+                f"本轮最多处理 {_MAX_INTAKE_FILES} 个附件，"
+                f"其余 {len(uploaded_files) - _MAX_INTAKE_FILES} 个请下一轮提交。"
+            )
 
-    # 组合用户消息：文字 + 图片分析结果
-    combined_message = user_message
-    if files_info:
-        combined_message = user_message + "\n\n" + "\n\n".join(files_info)
+    # 组合用户陈述和附件提取结果，避免纯附件消息产生空白前缀。
+    message_parts = [part for part in [user_message.strip(), *files_info] if part]
+    combined_message = "\n\n".join(message_parts)
 
     history.append({"role": "user", "content": combined_message})
 
@@ -672,6 +777,39 @@ def send_message(
         *_statistics_updates(statistics),
         *_document_updates(document),
     )
+
+
+def send_conclude_action(
+    history: list,
+    user_id: str,
+    session_id: str,
+    uploaded_files: list,
+) -> tuple:
+    """快捷按钮：按当前案件状态生成行动方案。"""
+
+    return send_message("现在生成方案", history, user_id, session_id, uploaded_files)
+
+
+def send_supplement_action(
+    history: list,
+    user_id: str,
+    session_id: str,
+    uploaded_files: list,
+) -> tuple:
+    """快捷按钮：在同一案件中恢复补充流程。"""
+
+    return send_message("继续补充", history, user_id, session_id, uploaded_files)
+
+
+def send_document_action(
+    history: list,
+    user_id: str,
+    session_id: str,
+    uploaded_files: list,
+) -> tuple:
+    """快捷按钮：基于当前案件状态进入独立文书服务。"""
+
+    return send_message("生成文书", history, user_id, session_id, uploaded_files)
 
 
 def new_session() -> tuple[list, str]:
@@ -990,18 +1128,74 @@ def build_demo() -> gr.Blocks:
 
             # ── 右侧对话区 ────────────────────────────────────────────
             with gr.Column(scale=3, elem_id="workspace"):
+                with gr.Accordion(
+                    "首次提交案件信息（可选，但建议尽量完整）",
+                    open=True,
+                ):
+                    gr.Markdown(
+                        "一次说清可以减少重复追问；不确定的内容可以留空。"
+                        "上传前请遮挡与争议无关的身份证号、银行卡号和详细住址。"
+                    )
+                    intake_overview = gr.Textbox(
+                        label="事情经过",
+                        placeholder="按时间顺序说明发生了什么、对方做了什么、现在是什么状态",
+                        lines=3,
+                    )
+                    with gr.Row():
+                        intake_counterparty = gr.Textbox(
+                            label="对方及双方关系",
+                            placeholder="个人、公司、商家、用人单位等",
+                        )
+                        intake_time_place_amount = gr.Textbox(
+                            label="时间、地点和金额",
+                            placeholder="可以填写大概时间和金额",
+                        )
+                    with gr.Row():
+                        intake_goal = gr.Textbox(
+                            label="希望解决的结果",
+                            placeholder="退款、赔偿、履行合同、投诉等",
+                        )
+                        intake_prior_actions = gr.Textbox(
+                            label="已经沟通或处理的情况",
+                            placeholder="协商、报警、投诉、仲裁、诉讼等",
+                        )
+                    intake_submit_btn = gr.Button(
+                        "提交案件材料包并开始分析",
+                        variant="primary",
+                    )
+
                 chatbot = gr.Chatbot(
                     label="咨询对话",
                     height=480,
                     elem_classes=["chatbot"],
                 )
+                gr.Markdown(
+                    "**快捷操作**｜按钮和文字口令效果相同，"
+                    "不会作为新的案情事实保存。"
+                )
+                with gr.Row():
+                    conclude_action_btn = gr.Button(
+                        "✅ 现在生成方案",
+                        size="sm",
+                        variant="secondary",
+                    )
+                    supplement_action_btn = gr.Button(
+                        "🔄 继续补充",
+                        size="sm",
+                        variant="secondary",
+                    )
+                    document_action_btn = gr.Button(
+                        "📄 生成参考文书",
+                        size="sm",
+                        variant="secondary",
+                    )
                 # 文件暂存提示
                 files_status = gr.Markdown("", visible=True)
 
                 with gr.Row():
                     file_upload_btn = gr.UploadButton(
                         "📎",
-                        file_types=["image", ".pdf", ".docx", ".doc", ".txt"],
+                        file_types=["image", ".pdf", ".docx", ".txt"],
                         file_count="multiple",
                         size="sm",
                         scale=0,
@@ -1097,25 +1291,69 @@ def build_demo() -> gr.Blocks:
         # ── 事件绑定 ──────────────────────────────────────────────────
         _debug_outputs = [debug_meta_box, debug_statute_box, debug_case_box, debug_graph_box, fallback_guide_box]
 
+        _send_outputs = [
+            chatbot,
+            session_id_box,
+            msg_box,
+            *_debug_outputs,
+            uploaded_files_state,
+            statistics_plot,
+            statistics_table,
+            statistics_source,
+            document_download,
+            generated_docx_file,
+            matched_official_blank_file,
+        ]
         send_kwargs = dict(
             fn=send_message,
             inputs=[msg_box, chatbot, user_id_box, session_id_box, uploaded_files_state],
-            outputs=[
-                chatbot,
-                session_id_box,
-                msg_box,
-                *_debug_outputs,
-                uploaded_files_state,
-                statistics_plot,
-                statistics_table,
-                statistics_source,
-                document_download,
-                generated_docx_file,
-                matched_official_blank_file,
-            ],
+            outputs=_send_outputs,
         )
         send_btn.click(**send_kwargs)
         msg_box.submit(**send_kwargs)
+        quick_action_inputs = [
+            chatbot,
+            user_id_box,
+            session_id_box,
+            uploaded_files_state,
+        ]
+        conclude_action_btn.click(
+            fn=send_conclude_action,
+            inputs=quick_action_inputs,
+            outputs=_send_outputs,
+        )
+        supplement_action_btn.click(
+            fn=send_supplement_action,
+            inputs=quick_action_inputs,
+            outputs=_send_outputs,
+        )
+        document_action_btn.click(
+            fn=send_document_action,
+            inputs=quick_action_inputs,
+            outputs=_send_outputs,
+        )
+        intake_submit_btn.click(
+            fn=send_intake_package,
+            inputs=[
+                intake_overview,
+                intake_counterparty,
+                intake_time_place_amount,
+                intake_goal,
+                intake_prior_actions,
+                chatbot,
+                user_id_box,
+                session_id_box,
+                uploaded_files_state,
+            ],
+            outputs=[
+                *_send_outputs,
+                intake_overview,
+                intake_counterparty,
+                intake_time_place_amount,
+                intake_goal,
+                intake_prior_actions,
+            ],
+        )
 
         # 文件上传按钮：只暂存文件，不发送
         def store_files(files, current_files):
@@ -1153,7 +1391,23 @@ def build_demo() -> gr.Blocks:
             fn=clear_files_status,
             outputs=[files_status]
         )
+        conclude_action_btn.click(
+            fn=clear_files_status,
+            outputs=[files_status],
+        )
+        supplement_action_btn.click(
+            fn=clear_files_status,
+            outputs=[files_status],
+        )
+        document_action_btn.click(
+            fn=clear_files_status,
+            outputs=[files_status],
+        )
         msg_box.submit(
+            fn=clear_files_status,
+            outputs=[files_status]
+        )
+        intake_submit_btn.click(
             fn=clear_files_status,
             outputs=[files_status]
         )
@@ -1170,6 +1424,11 @@ def build_demo() -> gr.Blocks:
                 gr.update(value="", visible=True),
                 gr.update(value="", visible=True),
                 gr.update(value="", visible=True),
+                "",
+                "",
+                "",
+                "",
+                "",
             ),
             outputs=[
                 chatbot,
@@ -1182,6 +1441,11 @@ def build_demo() -> gr.Blocks:
                 document_download,
                 generated_docx_file,
                 matched_official_blank_file,
+                intake_overview,
+                intake_counterparty,
+                intake_time_place_amount,
+                intake_goal,
+                intake_prior_actions,
             ]
         )
         check_btn.click(fn=check_health, outputs=health_box)

@@ -4,7 +4,7 @@ import json
 from src.agents.legal_guide.graph import run_guide, build_guide_deps
 from src.agents.legal_guide.state import GuidePhase
 from src.core.config import get_settings
-from src.infra.redis_cache import get_checkpointer_redis
+from src.infra.redis_cache import get_checkpointer_redis, set_with_optional_ttl
 from src.infra.database import AsyncSessionLocal
 
 _DEBUG_TTL = 120  # 调试信息保留 2 分钟，供路由层读取后展示
@@ -73,15 +73,26 @@ async def call_guide_agent_impl(
     active_key = f"guide_active:{user_id}:{session_id}"
     ttl = settings.GUIDE_SESSION_TTL
 
-    # 已识别具体法律问题的终态仍需保留，下一轮可生成或重生成参考文书。
+    # 即使首轮模型降级后尚未形成标准问题，只要已有用户案情也必须保留，
+    # 否则下一条短回答会脱离上下文重新开始。
     if new_state.phase == GuidePhase.END:
-        if new_state.confirmed_issues:
-            await redis.set(state_key, new_state.model_dump_json(), ex=ttl)
-            await redis.set(active_key, "1", ex=ttl)
+        if (
+            new_state.confirmed_issues
+            or new_state.unmatched_issues
+            or new_state.case_facts
+            or new_state.safety_pause_active
+        ):
+            await set_with_optional_ttl(
+                redis,
+                state_key,
+                new_state.model_dump_json(),
+                ttl,
+            )
+            await set_with_optional_ttl(redis, active_key, "1", ttl)
         return reply
 
     # 指引未结束：保存状态，设置活跃标记，等待后续轮次
-    await redis.set(state_key, new_state.model_dump_json(), ex=ttl)
-    await redis.set(active_key, "1", ex=ttl)
+    await set_with_optional_ttl(redis, state_key, new_state.model_dump_json(), ttl)
+    await set_with_optional_ttl(redis, active_key, "1", ttl)
 
     return reply
