@@ -1,15 +1,17 @@
 # src/api/routers/chat.py
 
 from __future__ import annotations
+import asyncio
 import hashlib
 import io
 import json
 import re
 import traceback
+from typing import Literal
 from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 from pathlib import Path
@@ -21,8 +23,15 @@ from src.infra.redis_cache import get_checkpointer_redis, set_with_optional_ttl
 from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.legal_guide.graph import run_guide, build_guide_deps
 from src.agents.legal_guide.state import GuideState, GuidePhase
+from src.agents.legal_guide.debug_view import guide_debug_payload
+from src.agents.legal_guide.progress import (
+    emit_guide_progress,
+    guide_progress_scope,
+)
 from src.agents.legal_guide.case_lifecycle import (
+    CaseBoundaryDecision,
     CaseRelation,
+    TurnControlIntent,
     boundary_audit_entry,
     boundary_confirmation_reply,
     decide_case_boundary,
@@ -35,10 +44,48 @@ settings = get_settings()
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
 
+def _sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _start_progress_task(awaitable, *, stage: str, label: str, detail: str):
+    """Start work in a progress-aware context and return its event queue."""
+
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+    with guide_progress_scope(queue.put_nowait):
+        emit_guide_progress(stage, label, detail)
+        task = asyncio.create_task(awaitable)
+    return task, queue
+
+
+async def _stream_progress_until_done(task: asyncio.Task, queue: asyncio.Queue):
+    """Yield queued milestones while ``task`` runs, without a polling timeout."""
+
+    while True:
+        if task.done():
+            while not queue.empty():
+                yield _sse_event(queue.get_nowait())
+            return
+        queue_get = asyncio.create_task(queue.get())
+        done, _pending = await asyncio.wait(
+            {task, queue_get},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if queue_get in done:
+            yield _sse_event(queue_get.result())
+        else:
+            queue_get.cancel()
+
+
 class ChatRequest(BaseModel):
     user_id: str
     session_id: str
     message: str
+    mode: Literal["auto", "qa", "case"] = "auto"
+    action: Literal["message", "submit_evidence", "regenerate_solution"] = "message"
+    target_case_id: str = ""
+    regenerate_solution: bool = False
+    evidence_requirement_ids: list[str] = Field(default_factory=list)
 
 
 class DeleteConversationRequest(BaseModel):
@@ -54,11 +101,23 @@ class DebugInfo(BaseModel):
     case_hits: str = ""
     graph_laws: list = []
     graph_channels: list = []
+    followup_basis_refs: list = []
+    followup_basis_error: str = ""
     fallback_guide: dict | None = None  # 案例检索兜底指引
+    detail_store: list = []
+    followup_form: dict | None = None
+    evidence_checklist: list = []
+    evidence_requirement_version: int = 0
+    evidence_evaluation_version: int = 0
+    solution_version: int = 0
+    solution_evidence_version: int = 0
+    convergence: dict | None = None
 
 class ChatResponse(BaseModel):
     reply: str
     session_id: str
+    resolved_mode: Literal["auto", "qa", "case"] = "auto"
+    mode_locked: bool = False
     debug: DebugInfo | None = None
     statistics: dict | None = None
     document: dict | None = None
@@ -68,6 +127,79 @@ def _make_keys(user_id: str, session_id: str) -> tuple[str, str]:
     """生成 Redis 键名。thread_id 与 Supervisor checkpointer 保持一致。"""
     thread_id = f"{user_id}:{session_id}"
     return f"guide_active:{thread_id}", f"guide_state:{thread_id}"
+
+
+def _conversation_mode_key(user_id: str, session_id: str) -> str:
+    return f"conversation_mode:{user_id}:{session_id}"
+
+
+async def _read_text(redis, key: str) -> str:
+    raw = await redis.get(key)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    return str(raw or "").strip()
+
+
+async def _resolve_conversation_mode(
+    redis,
+    req: ChatRequest,
+    *,
+    active_key: str,
+    state_key: str,
+) -> Literal["auto", "qa", "case"]:
+    """Keep one server-side route per conversation so worker state cannot mix."""
+
+    if await _has_guide_session(redis, active_key, state_key):
+        return "case"
+    stored = await _read_text(
+        redis,
+        _conversation_mode_key(req.user_id, req.session_id),
+    )
+    if stored in {"qa", "case"}:
+        return stored
+    # Backfill the type of Q&A conversations created before mode persistence.
+    if await redis.exists(f"legal_qa_history:{req.user_id}:{req.session_id}"):
+        return "qa"
+    return req.mode
+
+
+async def _persist_conversation_mode(
+    redis,
+    *,
+    user_id: str,
+    session_id: str,
+    mode: str,
+) -> None:
+    if mode not in {"qa", "case"}:
+        return
+    await set_with_optional_ttl(
+        redis,
+        _conversation_mode_key(user_id, session_id),
+        mode,
+        settings.GUIDE_SESSION_TTL,
+    )
+
+
+async def _run_legal_qa_turn(
+    message: str,
+    *,
+    user_id: str,
+    session_id: str,
+    redis,
+) -> tuple[str, dict | None]:
+    """Run a locked Q&A conversation without letting Supervisor change modes."""
+
+    from src.agents.tools.worker_tools import call_legal_qa_agent_impl
+
+    reply = await call_legal_qa_agent_impl(
+        message,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    # The artifact is only needed when the same worker was called by Supervisor.
+    await redis.delete(f"legal_qa_last_reply:{user_id}:{session_id}")
+    statistics = await _pop_statistics_artifact(redis, user_id, session_id)
+    return reply, statistics
 
 
 async def _has_guide_session(redis, active_key: str, state_key: str) -> bool:
@@ -87,20 +219,7 @@ def _should_keep_guide_state(state: GuideState) -> bool:
 
 def _guide_debug(state: GuideState) -> DebugInfo:
     """Expose the current case identity and retrieval state for UI/debugging."""
-
-    return DebugInfo(
-        case_id=state.case_id,
-        case_boundary_status=(
-            "awaiting_confirmation" if state.awaiting_case_boundary else "resolved"
-        ),
-        domain=state.legal_domain or "",
-        confidence_tier=state.confidence_tier or "GATHERING",
-        statute_hits=state.law_context_str or "",
-        case_hits=state.case_context_str or "",
-        graph_laws=state.candidate_laws or [],
-        graph_channels=state.relevant_channels or [],
-        fallback_guide=state.fallback_guide,
-    )
+    return DebugInfo.model_validate(guide_debug_payload(state))
 
 
 async def _prepare_case_turn(
@@ -112,10 +231,67 @@ async def _prepare_case_turn(
     llm,
     redis,
     state_key: str,
+    action: str = "message",
+    target_case_id: str = "",
+    regenerate_solution: bool = False,
+    evidence_requirement_ids: list[str] | None = None,
 ) -> tuple[str, GuideState, str | None]:
     """Resolve case ownership before any message can mutate the guide state."""
 
-    if existing_state.safety_pause_active:
+    if action != "message":
+        if target_case_id and target_case_id != existing_state.case_id:
+            raise HTTPException(
+                status_code=409,
+                detail="当前操作指定的案件与已打开案件不一致，请刷新后重试。",
+            )
+        if action == "submit_evidence":
+            requested_requirement_ids = {
+                str(item).strip()
+                for item in (evidence_requirement_ids or [])
+                if str(item).strip()
+            }
+            active_requirement_ids = {
+                str(item.get("id") or "").strip()
+                for item in (existing_state.evidence_requirements or [])
+                if isinstance(item, dict) and item.get("active", True)
+            }
+            stale_requirement_ids = sorted(
+                requested_requirement_ids - active_requirement_ids
+            )
+            if stale_requirement_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail="证据清单已更新，请刷新后重新选择要关联的证明目标。",
+                )
+            has_attachment = bool(re.search(
+                r"【(?:文档|图片)证据补充[^】]*】[\s\S]{0,600}?"
+                r"(?:原文件|原图) SHA-256：[0-9a-fA-F]{16,}",
+                message,
+            ))
+            if not has_attachment:
+                raise HTTPException(
+                    status_code=400,
+                    detail="证据提交缺少系统生成的文件指纹，请重新选择文件上传。",
+                )
+        control_intent = (
+            TurnControlIntent.CONCLUDE_NOW
+            if action == "regenerate_solution" or regenerate_solution
+            else TurnControlIntent.CASE_DETAIL
+        )
+        decision = CaseBoundaryDecision(
+            relation=CaseRelation.CONTINUE,
+            confidence=1.0,
+            reason=(
+                "客户端将操作绑定到当前案件并请求更新方案"
+                if control_intent == TurnControlIntent.CONCLUDE_NOW
+                else "客户端将证据提交绑定到当前案件"
+            ),
+            carries_case_detail=action == "submit_evidence",
+            control_intent=control_intent,
+            decision_source="structured_case_action",
+        )
+        case_message = message
+    elif existing_state.safety_pause_active:
         # 现实危险是可恢复中断。危险状态没有被明确解除前，下一条消息必须先回到
         # 同一状态机重新做安全判断，不能因为首轮尚未提取法律问题而丢失案件。
         decision = await decide_case_boundary(existing_state, message, llm)
@@ -125,8 +301,7 @@ async def _prepare_case_turn(
         existing_state.turn_control_intent = decision.control_intent.value
         existing_state.turn_contains_case_details = decision.carries_case_detail
         return message, existing_state, None
-
-    if existing_state.awaiting_case_boundary:
+    elif existing_state.awaiting_case_boundary:
         decision = await resolve_pending_boundary(existing_state, message, llm)
         case_message = existing_state.pending_case_message
     else:
@@ -217,18 +392,20 @@ async def _pop_supervisor_reply_artifacts(
     user_id: str,
     session_id: str,
     supervisor_reply: str,
-) -> tuple[str, DebugInfo | None]:
+) -> tuple[str, DebugInfo | None, Literal["qa", "case"] | None]:
     """Return only a worker's public reply, excluding Supervisor tool events."""
     reply_key = f"guide_last_reply:{user_id}:{session_id}"
     debug_key = f"guide_last_debug:{user_id}:{session_id}"
     legal_qa_reply_key = f"legal_qa_last_reply:{user_id}:{session_id}"
     reply = supervisor_reply
     debug = None
+    worker_mode = None
     try:
         raw_reply = await redis.get(reply_key)
         raw_debug = await redis.get(debug_key)
         raw_legal_qa_reply = await redis.get(legal_qa_reply_key)
         if raw_reply:
+            worker_mode = "case"
             reply = (
                 raw_reply.decode("utf-8")
                 if isinstance(raw_reply, bytes)
@@ -236,6 +413,7 @@ async def _pop_supervisor_reply_artifacts(
             )
             await redis.delete(reply_key)
         elif raw_legal_qa_reply:
+            worker_mode = "qa"
             reply = (
                 raw_legal_qa_reply.decode("utf-8")
                 if isinstance(raw_legal_qa_reply, bytes)
@@ -246,15 +424,7 @@ async def _pop_supervisor_reply_artifacts(
             if isinstance(raw_debug, bytes):
                 raw_debug = raw_debug.decode("utf-8")
             value = json.loads(raw_debug)
-            debug = DebugInfo(
-                domain=value.get("domain", ""),
-                confidence_tier=value.get("confidence_tier", "") or "GATHERING",
-                statute_hits=value.get("statute_hits", ""),
-                case_hits=value.get("case_hits", ""),
-                graph_laws=value.get("graph_laws", []),
-                graph_channels=value.get("graph_channels", []),
-                fallback_guide=value.get("fallback_guide"),
-            )
+            debug = DebugInfo.model_validate(value)
             await redis.delete(debug_key)
     except Exception:
         logger.warning(
@@ -262,7 +432,7 @@ async def _pop_supervisor_reply_artifacts(
             user_id,
             session_id,
         )
-    return reply, debug
+    return reply, debug, worker_mode
 
 
 async def _run_statistics_followup_if_needed(
@@ -310,6 +480,11 @@ async def _run_guide_turn(
     thread_id: str,
     redis,
     db,
+    *,
+    action: str = "message",
+    target_case_id: str = "",
+    regenerate_solution: bool = False,
+    evidence_requirement_ids: list[str] | None = None,
 ) -> tuple[str, DebugInfo, dict | None]:
     """
     执行一轮法律指引对话（路由层直接调用，绕过 Supervisor）。
@@ -325,6 +500,12 @@ async def _run_guide_turn(
 
     raw = await redis.get(state_key)
     existing_state = GuideState.model_validate_json(raw) if raw else None
+
+    if action != "message" and existing_state is None:
+        raise HTTPException(
+            status_code=409,
+            detail="请先建立案件，再提交证据或更新方案。",
+        )
 
     # 从 thread_id 提取 user_id（格式：user_id:session_id）
     user_id = thread_id.split(":")[0] if ":" in thread_id else None
@@ -344,6 +525,11 @@ async def _run_guide_turn(
             or list(existing_state.unmatched_issues)
         )
         if document_issues:
+            emit_guide_progress(
+                "document_generation",
+                "正在生成参考文书",
+                "使用当前已确认事实、证据状态和法律依据填写文书。",
+            )
             logger.info("检测到文书生成请求，直接调用独立文书生成服务")
             doc_type = requested_doc_type(
                 message,
@@ -443,6 +629,10 @@ async def _run_guide_turn(
             llm=deps.llm,
             redis=redis,
             state_key=state_key,
+            action=action,
+            target_case_id=target_case_id,
+            regenerate_solution=regenerate_solution,
+            evidence_requirement_ids=evidence_requirement_ids,
         )
         if boundary_reply is not None:
             await set_with_optional_ttl(
@@ -501,17 +691,60 @@ async def chat(
         thread_id = f"{req.user_id}:{req.session_id}"
         active_key = f"guide_active:{thread_id}"
         state_key = f"guide_state:{thread_id}"
+        resolved_mode = await _resolve_conversation_mode(
+            redis,
+            req,
+            active_key=active_key,
+            state_key=state_key,
+        )
 
-        # ── 指引进行中：直接走 GuideGraph ──
-        if await _has_guide_session(redis, active_key, state_key):
+        # Explicitly selected modes bypass Supervisor.  This is the actual
+        # isolation boundary; the frontend tabs are only a visual affordance.
+        if resolved_mode == "case":
             reply, debug, document = await _run_guide_turn(
-                req.message, thread_id, redis, db
+                req.message,
+                thread_id,
+                redis,
+                db,
+                action=req.action,
+                target_case_id=req.target_case_id,
+                regenerate_solution=req.regenerate_solution,
+                evidence_requirement_ids=req.evidence_requirement_ids,
+            )
+            await _persist_conversation_mode(
+                redis,
+                user_id=req.user_id,
+                session_id=req.session_id,
+                mode="case",
             )
             return ChatResponse(
                 reply=reply,
                 session_id=req.session_id,
+                resolved_mode="case",
+                mode_locked=True,
                 debug=debug,
                 document=document,
+            )
+
+        if resolved_mode == "qa":
+            reply, statistics = await _run_legal_qa_turn(
+                req.message,
+                user_id=req.user_id,
+                session_id=req.session_id,
+                redis=redis,
+            )
+            await _persist_conversation_mode(
+                redis,
+                user_id=req.user_id,
+                session_id=req.session_id,
+                mode="qa",
+            )
+            return ChatResponse(
+                reply=reply,
+                session_id=req.session_id,
+                resolved_mode="qa",
+                mode_locked=True,
+                statistics=statistics,
             )
 
         statistics_followup = await _run_statistics_followup_if_needed(
@@ -547,11 +780,19 @@ async def chat(
 
         # Keep the HTTP and SSE paths aligned with Gradio: only return the
         # selected worker's public reply, never Supervisor tool events.
-        reply, debug = await _pop_supervisor_reply_artifacts(
+        reply, debug, worker_mode = await _pop_supervisor_reply_artifacts(
             redis,
             req.user_id,
             req.session_id,
             supervisor_reply,
+        )
+
+        resolved_mode = worker_mode or "auto"
+        await _persist_conversation_mode(
+            redis,
+            user_id=req.user_id,
+            session_id=req.session_id,
+            mode=resolved_mode,
         )
 
         statistics = await _pop_statistics_artifact(
@@ -560,6 +801,8 @@ async def chat(
         return ChatResponse(
             reply=reply,
             session_id=req.session_id,
+            resolved_mode=resolved_mode,
+            mode_locked=resolved_mode in {"qa", "case"},
             debug=debug,
             statistics=statistics,
         )
@@ -584,6 +827,7 @@ async def chat_stream(
     Supervisor 回复以流式推送。
 
     客户端接收格式：
+        data: {"type": "progress", "stage": "...", "label": "..."}
         data: {"type": "token",  "content": "..."}
         data: {"type": "done",   "session_id": "..."}
         data: {"type": "error",  "message": "..."}
@@ -594,18 +838,65 @@ async def chat_stream(
             thread_id = f"{req.user_id}:{req.session_id}"
             active_key = f"guide_active:{thread_id}"
             state_key = f"guide_state:{thread_id}"
+            resolved_mode = await _resolve_conversation_mode(
+                redis,
+                req,
+                active_key=active_key,
+                state_key=state_key,
+            )
 
-            # ── 指引进行中：GuideGraph 非流式执行，结果整体推送 ──
-            if await _has_guide_session(redis, active_key, state_key):
-                reply, debug, document = await _run_guide_turn(
-                    req.message, thread_id, redis, db
+            # ── 案件模式：始终进入同一案件状态机 ──
+            if resolved_mode == "case":
+                restoring_case = await _has_guide_session(
+                    redis,
+                    active_key,
+                    state_key,
                 )
-                data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
+                guide_task, progress_queue = _start_progress_task(
+                    _run_guide_turn(
+                        req.message,
+                        thread_id,
+                        redis,
+                        db,
+                        action=req.action,
+                        target_case_id=req.target_case_id,
+                        regenerate_solution=req.regenerate_solution,
+                        evidence_requirement_ids=req.evidence_requirement_ids,
+                    ),
+                    stage="routing",
+                    label="正在恢复案件进度" if restoring_case else "正在建立案件档案",
+                    detail=(
+                        "读取事实细节库、证据清单和上一版方案状态。"
+                        if restoring_case
+                        else "本次对话将作为独立维权案件保存，并开始梳理事实。"
+                    ),
+                )
+                async for progress_chunk in _stream_progress_until_done(
+                    guide_task,
+                    progress_queue,
+                ):
+                    yield progress_chunk
+                reply, debug, document = await guide_task
+                await _persist_conversation_mode(
+                    redis,
+                    user_id=req.user_id,
+                    session_id=req.session_id,
+                    mode="case",
+                )
+                yield _sse_event({
+                    "type": "progress",
+                    "stage": "response_ready",
+                    "label": "本轮处理完成",
+                    "detail": "正在展示结果，案件状态已保留，可继续补充。",
+                    "status": "completed",
+                })
+                yield _sse_event({"type": "token", "content": reply})
                 done_data = json.dumps(
                     {
                         "type": "done",
                         "session_id": req.session_id,
+                        "resolved_mode": "case",
+                        "mode_locked": True,
                         "debug": debug.model_dump(),
                         "document": document,
                     },
@@ -614,41 +905,94 @@ async def chat_stream(
                 yield f"data: {done_data}\n\n"
                 return
 
-            else:
-                statistics_followup = await _run_statistics_followup_if_needed(
-                    req.message,
-                    req.user_id,
-                    req.session_id,
+            # ── 问答模式：不创建事实库、证据清单或维权案件 ──
+            if resolved_mode == "qa":
+                qa_task, progress_queue = _start_progress_task(
+                    _run_legal_qa_turn(
+                        req.message,
+                        user_id=req.user_id,
+                        session_id=req.session_id,
+                        redis=redis,
+                    ),
+                    stage="legal_qa",
+                    label="正在检索法律依据",
+                    detail="在当前独立问答中查询法条、权威资料或统计数据。",
+                )
+                async for progress_chunk in _stream_progress_until_done(
+                    qa_task,
+                    progress_queue,
+                ):
+                    yield progress_chunk
+                reply, statistics = await qa_task
+                await _persist_conversation_mode(
                     redis,
+                    user_id=req.user_id,
+                    session_id=req.session_id,
+                    mode="qa",
                 )
-                if statistics_followup is not None:
-                    token_data = json.dumps(
-                        {"type": "token", "content": statistics_followup.answer},
-                        ensure_ascii=False,
-                    )
-                    yield f"data: {token_data}\n\n"
-                    done_data = json.dumps(
-                        {
-                            "type": "done",
-                            "session_id": req.session_id,
-                            "statistics": statistics_followup.model_dump(mode="json"),
-                        },
-                        ensure_ascii=False,
-                    )
-                    yield f"data: {done_data}\n\n"
-                    return
+                yield _sse_event({
+                    "type": "progress",
+                    "stage": "response_ready",
+                    "label": "法律问答整理完成",
+                    "detail": "正在展示回答，本轮内容不会写入维权案件。",
+                    "status": "completed",
+                })
+                yield _sse_event({"type": "token", "content": reply})
+                done_payload = {
+                    "type": "done",
+                    "session_id": req.session_id,
+                    "resolved_mode": "qa",
+                    "mode_locked": True,
+                }
+                if statistics:
+                    done_payload["statistics"] = statistics
+                yield _sse_event(done_payload)
+                return
 
-                # ── 无活跃指引：Supervisor 流式推送 ──
-                current_message_key = f"current_user_message:{req.user_id}:{req.session_id}"
-                await redis.set(
-                    current_message_key,
-                    req.message,
-                    ex=settings.REDIS_SESSION_TTL,
+            # ── 未选择模式：仅首轮由 Supervisor 自动识别 ──
+            statistics_followup = await _run_statistics_followup_if_needed(
+                req.message,
+                req.user_id,
+                req.session_id,
+                redis,
+            )
+            if statistics_followup is not None:
+                await _persist_conversation_mode(
+                    redis,
+                    user_id=req.user_id,
+                    session_id=req.session_id,
+                    mode="qa",
                 )
-                agent = await get_supervisor_agent()
-                config = {"configurable": {"thread_id": thread_id}}
+                token_data = json.dumps(
+                    {"type": "token", "content": statistics_followup.answer},
+                    ensure_ascii=False,
+                )
+                yield f"data: {token_data}\n\n"
+                done_data = json.dumps(
+                    {
+                        "type": "done",
+                        "session_id": req.session_id,
+                        "resolved_mode": "qa",
+                        "mode_locked": True,
+                        "statistics": statistics_followup.model_dump(mode="json"),
+                    },
+                    ensure_ascii=False,
+                )
+                yield f"data: {done_data}\n\n"
+                return
+
+            current_message_key = f"current_user_message:{req.user_id}:{req.session_id}"
+            await redis.set(
+                current_message_key,
+                req.message,
+                ex=settings.REDIS_SESSION_TTL,
+            )
+            agent = await get_supervisor_agent()
+            config = {"configurable": {"thread_id": thread_id}}
+
+            async def run_supervisor_turn():
                 try:
-                    result = await agent.ainvoke(
+                    return await agent.ainvoke(
                         {"messages": [{"role": "user", "content": req.message}]},
                         config=config,
                         context=UserContext(
@@ -658,29 +1002,64 @@ async def chat_stream(
                     )
                 finally:
                     await redis.delete(current_message_key)
-                supervisor_reply = result["messages"][-1].content
-                reply, debug = await _pop_supervisor_reply_artifacts(
-                    redis,
-                    req.user_id,
-                    req.session_id,
-                    supervisor_reply,
-                )
-                token_data = json.dumps(
-                    {"type": "token", "content": reply},
-                    ensure_ascii=False,
-                )
-                yield f"data: {token_data}\n\n"
+
+            supervisor_task, progress_queue = _start_progress_task(
+                run_supervisor_turn(),
+                stage="routing",
+                label="正在识别服务类型",
+                detail="判断您需要法律知识问答，还是处理一个具体维权案件。",
+            )
+            async for progress_chunk in _stream_progress_until_done(
+                supervisor_task,
+                progress_queue,
+            ):
+                yield progress_chunk
+            result = await supervisor_task
+            supervisor_reply = result["messages"][-1].content
+            reply, debug, worker_mode = await _pop_supervisor_reply_artifacts(
+                redis,
+                req.user_id,
+                req.session_id,
+                supervisor_reply,
+            )
+            resolved_mode = worker_mode or "auto"
+            await _persist_conversation_mode(
+                redis,
+                user_id=req.user_id,
+                session_id=req.session_id,
+                mode=resolved_mode,
+            )
+            yield _sse_event({
+                "type": "progress",
+                "stage": "response_ready",
+                "label": "服务类型已确认" if worker_mode else "需要您确认服务类型",
+                "detail": (
+                    "已进入案件维权，案件与普通问答将分别保存。"
+                    if worker_mode == "case"
+                    else "已进入法律问答，本轮不会创建案件。"
+                    if worker_mode == "qa"
+                    else "请根据提示说明您只想咨询，还是需要处理具体纠纷。"
+                ),
+                "status": "completed",
+            })
+            yield _sse_event({"type": "token", "content": reply})
 
             statistics = await _pop_statistics_artifact(
                 redis, req.user_id, req.session_id
             )
-            done_payload = {"type": "done", "session_id": req.session_id}
-            if "debug" in locals() and debug:
+            done_payload = {
+                "type": "done",
+                "session_id": req.session_id,
+                "resolved_mode": resolved_mode,
+                "mode_locked": worker_mode is not None,
+            }
+            if debug:
                 done_payload["debug"] = debug.model_dump()
             if statistics:
                 done_payload["statistics"] = statistics
             done_data = json.dumps(done_payload, ensure_ascii=False)
             yield f"data: {done_data}\n\n"
+            return
 
         except Exception as e:
             logger.exception("chat/stream 接口异常")
@@ -770,6 +1149,7 @@ async def delete_conversation(
         f"legal_statistics_context:{thread_id}",
         f"legal_statistics_last:{thread_id}",
         f"current_user_message:{thread_id}",
+        f"conversation_mode:{thread_id}",
     ]
     async for archive_key in redis.scan_iter(
         match=f"guide_case_archive:{thread_id}:*",
@@ -999,12 +1379,14 @@ async def upload_image(
         evidence_confirmed = []
         evidence_unavailable = []
         recent_assistant_message = ""
+        active_case_id = ""
 
         # 尝试从 Redis 恢复 GuideState
         try:
             raw = await redis.get(state_key)
             if raw:
                 existing_state = GuideState.model_validate_json(raw)
+                active_case_id = existing_state.case_id
                 legal_domain = existing_state.legal_domain or ""
                 confirmed_issues = existing_state.confirmed_issues or []
                 evidence_confirmed = existing_state.evidence_confirmed or []
@@ -1062,7 +1444,12 @@ async def upload_image(
                 if await _has_guide_session(redis, active_key, state_key):
                     # 直接调用 guide_agent
                     reply, debug, _document = await _run_guide_turn(
-                        evidence_message, thread_id, redis, db
+                        evidence_message,
+                        thread_id,
+                        redis,
+                        db,
+                        action="submit_evidence",
+                        target_case_id=active_case_id,
                     )
                     response["injected"] = True
                     response["assistant_reply"] = reply

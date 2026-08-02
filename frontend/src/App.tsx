@@ -52,6 +52,8 @@ import {
 import {
   DebugInfo,
   DocumentArtifact,
+  EvidenceRequirement,
+  FollowupQuestion,
   HealthResponse,
   OfficialTemplate,
   Statistics,
@@ -82,7 +84,18 @@ type AttachmentItem = {
   file: File
   status: 'ready' | 'processing' | 'done' | 'error'
   note?: string
+  requirementId?: string
+  requirementLabel?: string
 }
+
+type AgentProgressItem = {
+  stage: string
+  label: string
+  detail?: string
+  status: 'active' | 'completed'
+}
+
+type SessionActivity = 'processing' | 'deleting'
 
 type IntakeState = {
   overview: string
@@ -106,6 +119,7 @@ type WorkspaceSnapshot = {
 
 type ConversationRecord = Omit<WorkspaceSnapshot, 'attachments'> & {
   mode: WorkspaceMode
+  modeLocked: boolean
   title: string
   updatedAt: number
 }
@@ -208,8 +222,10 @@ const deriveConversationTitle = (
 const createConversation = (
   mode: WorkspaceMode,
   sessionId: string = uid(),
+  modeLocked = false,
 ): ConversationRecord => ({
   mode,
+  modeLocked,
   sessionId,
   title: defaultTitle(mode),
   updatedAt: Date.now(),
@@ -235,6 +251,12 @@ const loadConversations = (): ConversationRecord[] => {
         && typeof item.sessionId === 'string'
         && Array.isArray(item.messages),
       )
+      .map((item) => ({
+        ...item,
+        modeLocked: typeof item.modeLocked === 'boolean'
+          ? item.modeLocked
+          : item.messages.length > 0,
+      }))
   } catch {
     return []
   }
@@ -311,7 +333,39 @@ function ConfidenceBadge({ tier }: { tier?: string }) {
   return <span className={`confidence-badge ${normalized.toLowerCase()}`}>{label}</span>
 }
 
-function MessageCard({ message }: { message: ChatMessage }) {
+function AgentProgressPanel({ items }: { items: AgentProgressItem[] }) {
+  const visibleItems = items.slice(-6)
+  return (
+    <div className="agent-progress-panel" role="status" aria-live="polite">
+      <div className="agent-progress-title">
+        <LoaderCircle size={15} className="spin" />
+        <strong>案件处理进度</strong>
+        <span>展示可核验步骤，不展示模型内部推理</span>
+      </div>
+      <ol>
+        {visibleItems.map((item) => (
+          <li className={item.status} key={item.stage}>
+            <span className="progress-step-icon">
+              {item.status === 'completed' ? <Check size={12} /> : <LoaderCircle size={12} className="spin" />}
+            </span>
+            <div>
+              <strong>{item.label}</strong>
+              {item.detail ? <p>{item.detail}</p> : null}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  )
+}
+
+function MessageCard({
+  message,
+  progress,
+}: {
+  message: ChatMessage
+  progress?: AgentProgressItem[]
+}) {
   return (
     <article className={`message-card ${message.role}`}>
       <div className="message-avatar" aria-hidden="true">
@@ -343,6 +397,8 @@ function MessageCard({ message }: { message: ChatMessage }) {
           ) : (
             <p className="user-message-text">{message.content}</p>
           )
+        ) : progress?.length ? (
+          <AgentProgressPanel items={progress} />
         ) : (
           <div className="typing-line">
             <span />
@@ -353,6 +409,376 @@ function MessageCard({ message }: { message: ChatMessage }) {
         )}
       </div>
     </article>
+  )
+}
+
+function FollowupFormCard({
+  questions,
+  busy,
+  onSubmit,
+  onUseChat,
+  onConclude,
+}: {
+  questions: FollowupQuestion[]
+  busy: boolean
+  onSubmit: (content: string) => void
+  onUseChat: () => void
+  onConclude: () => void
+}) {
+  const [answers, setAnswers] = useState<Record<string, string | string[]>>({})
+  const [otherAnswers, setOtherAnswers] = useState<Record<string, string>>({})
+  const [panelHeight, setPanelHeight] = useState<number | null>(null)
+  const [collapsed, setCollapsed] = useState(false)
+  const signature = questions.map((item) => item.field_id).join('|')
+
+  useEffect(() => {
+    setAnswers({})
+    setOtherAnswers({})
+  }, [signature])
+
+  const isOtherChoice = (option: string) => option.includes('其他')
+
+  const update = (fieldId: string, value: string | string[]) => {
+    setAnswers((current) => ({ ...current, [fieldId]: value }))
+  }
+  const adjustPanelHeight = (delta: number) => {
+    setPanelHeight((current) => {
+      const base = current || Math.max(320, Math.min(window.innerHeight * 0.46, 520))
+      return Math.max(240, Math.min(base + delta, window.innerHeight * 0.72, 720))
+    })
+  }
+  const submit = () => {
+    const answered = questions.filter((item) => {
+      const value = answers[item.field_id]
+      return Array.isArray(value) ? value.length > 0 : Boolean(value?.trim())
+    })
+    if (!answered.length) return
+    const content = [
+      '【动态追问表单回答】',
+      ...answered.flatMap((item, index) => {
+        const value = answers[item.field_id]
+        const supplement = otherAnswers[item.field_id]?.trim()
+        const attachSupplement = (entry: string) => (
+          supplement && isOtherChoice(entry) ? `${entry}（补充：${supplement}）` : entry
+        )
+        const normalized = Array.isArray(value)
+          ? value.map(attachSupplement).join('、')
+          : attachSupplement(typeof value === 'string' ? value : '')
+        return [
+          `${index + 1}. [${item.field_id}] ${item.question}`,
+          `回答：${normalized}`,
+        ]
+      }),
+    ].join('\n')
+    onSubmit(content)
+  }
+
+  if (collapsed) {
+    return (
+      <div className="collapsed-action-panel">
+        <span><ClipboardList size={15} />动态追问表单已收起 · {questions.length} 项</span>
+        <button type="button" onClick={() => setCollapsed(false)}>
+          展开追问 <ChevronDown size={14} />
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <section
+      className="followup-form-card"
+      aria-label="动态追问表单"
+      style={panelHeight ? { height: `${panelHeight}px` } : undefined}
+    >
+      <div className="followup-form-head">
+        <div>
+          <p className="section-kicker">DYNAMIC FOLLOW-UP</p>
+          <h3>请补充目前尚未明确的信息</h3>
+        </div>
+        <div className="panel-height-tools">
+          <span className="panel-status-badge">{questions.length} 项</span>
+          <button type="button" onClick={() => setCollapsed(true)} aria-label="收起追问面板">收起</button>
+          <button type="button" onClick={() => adjustPanelHeight(-80)} aria-label="缩小追问面板">缩小</button>
+          <button type="button" onClick={() => adjustPanelHeight(100)} aria-label="放大追问面板">放大</button>
+        </div>
+      </div>
+      <p className="followup-form-note">
+        问题根据当前细节库和本轮法律检索实时生成；不清楚的项目可以留空或填写“不清楚”。
+      </p>
+      <div className="followup-fields">
+        {questions.map((item, index) => {
+          const value = answers[item.field_id]
+          return (
+            <fieldset className="followup-field" key={item.field_id} disabled={busy}>
+              <legend><span>{index + 1}</span>{item.question}</legend>
+              {item.input_type === 'single_choice' ? (
+                <>
+                  <div className="followup-options">
+                    {(item.options || []).map((option) => (
+                      <label key={option}>
+                        <input
+                          type="radio"
+                          name={item.field_id}
+                          checked={value === option}
+                          onChange={() => update(item.field_id, option)}
+                        />
+                        <span>{option}</span>
+                      </label>
+                    ))}
+                  </div>
+                  {typeof value === 'string' && isOtherChoice(value) ? (
+                    <input
+                      className="followup-text-input followup-other-input"
+                      value={otherAnswers[item.field_id] || ''}
+                      placeholder="请补充说明其他情况"
+                      onChange={(event) => setOtherAnswers((current) => ({
+                        ...current,
+                        [item.field_id]: event.target.value,
+                      }))}
+                    />
+                  ) : null}
+                </>
+              ) : item.input_type === 'multi_choice' ? (
+                <>
+                  <div className="followup-options multi">
+                    {(item.options || []).map((option) => {
+                      const selected = Array.isArray(value) ? value : []
+                      return (
+                        <label key={option}>
+                          <input
+                            type="checkbox"
+                            checked={selected.includes(option)}
+                            onChange={() => update(
+                              item.field_id,
+                              selected.includes(option)
+                                ? selected.filter((entry) => entry !== option)
+                                : [...selected, option],
+                            )}
+                          />
+                          <span>{option}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                  {Array.isArray(value) && value.some(isOtherChoice) ? (
+                    <input
+                      className="followup-text-input followup-other-input"
+                      value={otherAnswers[item.field_id] || ''}
+                      placeholder="请补充说明其他情况"
+                      onChange={(event) => setOtherAnswers((current) => ({
+                        ...current,
+                        [item.field_id]: event.target.value,
+                      }))}
+                    />
+                  ) : null}
+                </>
+              ) : item.input_type === 'short_text' ? (
+                <input
+                  className="followup-text-input"
+                  value={typeof value === 'string' ? value : ''}
+                  placeholder={item.placeholder || '请填写'}
+                  onChange={(event) => update(item.field_id, event.target.value)}
+                />
+              ) : (
+                <textarea
+                  className="followup-textarea"
+                  value={typeof value === 'string' ? value : ''}
+                  placeholder={item.placeholder || '请按您知道的情况填写'}
+                  rows={6}
+                  onChange={(event) => update(item.field_id, event.target.value)}
+                />
+              )}
+              <div className="followup-field-meta">
+                {item.answer_hint ? <span>{item.answer_hint}</span> : null}
+                {item.reason || item.basis_refs?.length ? (
+                  <details>
+                    <summary>为什么问</summary>
+                    {item.reason ? <p>{item.reason}</p> : null}
+                    {item.basis_refs?.length ? (
+                      <div className="followup-basis-list">
+                        {item.basis_refs.map((basis, basisIndex) => (
+                          <div key={`${basis.title}-${basis.article_no}-${basisIndex}`}>
+                            <strong>
+                              《{basis.title || '本轮检索法律'}》{basis.article_no || '相关规定'}
+                            </strong>
+                            {basis.text ? <p>{basis.source_type === 'statute' ? '条文内容' : '依据内容'}：{basis.text}</p> : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </details>
+                ) : null}
+              </div>
+            </fieldset>
+          )
+        })}
+      </div>
+      <div className="followup-form-actions">
+        <button className="primary-button" onClick={submit} disabled={busy}>提交本轮答案</button>
+        <button className="secondary-button" onClick={onUseChat} disabled={busy}>直接打字回答</button>
+        <button className="text-button" onClick={onConclude} disabled={busy}>按现有信息生成方案</button>
+      </div>
+    </section>
+  )
+}
+
+function EvidenceCenterCard({
+  requirements,
+  version,
+  evaluationVersion,
+  solutionVersion,
+  solutionEvidenceVersion,
+  fallbackBasisRefs,
+  busy,
+  onUpload,
+  onUploadAll,
+  onGenerate,
+}: {
+  requirements: EvidenceRequirement[]
+  version: number
+  evaluationVersion: number
+  solutionVersion: number
+  solutionEvidenceVersion: number
+  fallbackBasisRefs: NonNullable<DebugInfo['followup_basis_refs']>
+  busy: boolean
+  onUpload: (requirement: EvidenceRequirement) => void
+  onUploadAll: () => void
+  onGenerate: () => void
+}) {
+  const [panelHeight, setPanelHeight] = useState<number | null>(null)
+  const [collapsed, setCollapsed] = useState(false)
+  const latestEvidencePending = evaluationVersion > solutionEvidenceVersion
+  const fullBasisRefsFor = (item: EvidenceRequirement) => (
+    (item.basis_refs || []).map((basis) => {
+      const matched = fallbackBasisRefs.find((candidate) => (
+        (candidate.title || '').trim() === (basis.title || '').trim()
+        && (candidate.article_no || '').trim() === (basis.article_no || '').trim()
+      ))
+      return {
+        ...matched,
+        ...basis,
+        text: basis.text || matched?.text || '',
+        issuer: basis.issuer || matched?.issuer || '',
+        url: basis.url || matched?.url || '',
+      }
+    })
+  )
+  const adjustPanelHeight = (delta: number) => {
+    setPanelHeight((current) => {
+      const base = current || Math.max(320, Math.min(window.innerHeight * 0.46, 520))
+      return Math.max(240, Math.min(base + delta, window.innerHeight * 0.72, 720))
+    })
+  }
+
+  if (collapsed) {
+    return (
+      <div className="collapsed-action-panel">
+        <span><FolderOpen size={15} />证据准备清单已收起 · 清单 {version || 1}</span>
+        <button type="button" onClick={() => setCollapsed(false)}>
+          展开证据清单 <ChevronDown size={14} />
+        </button>
+      </div>
+    )
+  }
+  const statusLabels: Record<string, string> = {
+    preliminarily_covered: '已初步覆盖',
+    partially_covered: '部分覆盖',
+    known_missing: '目前缺失',
+    conflicted: '存在冲突',
+    unresolved: '待提交',
+  }
+  return (
+    <section
+      className="evidence-center-card"
+      aria-label="证据中心"
+      style={panelHeight ? { height: `${panelHeight}px` } : undefined}
+    >
+      <div className="evidence-center-head">
+        <div>
+          <p className="section-kicker">EVIDENCE CENTER</p>
+          <h3>证据准备清单</h3>
+        </div>
+        <div className="panel-height-tools">
+          <span className="panel-status-badge">清单 {version || 1} · 评估 {evaluationVersion || 0}</span>
+          <button type="button" onClick={() => setCollapsed(true)} aria-label="收起证据面板">收起</button>
+          <button type="button" onClick={() => adjustPanelHeight(-80)} aria-label="缩小证据面板">缩小</button>
+          <button type="button" onClick={() => adjustPanelHeight(100)} aria-label="放大证据面板">放大</button>
+        </div>
+      </div>
+      <p className="followup-form-note">
+        清单会随事实更新。可补交未提交的材料；同一材料有新版本时也可重新上传，系统会重新评估。
+      </p>
+      {latestEvidencePending ? (
+        <div className="evidence-revision-notice">
+          <RefreshCw size={15} />
+          <span>最新证据评估尚未融入当前方案，提交完成后可更新方案。</span>
+        </div>
+      ) : solutionVersion > 0 ? (
+        <div className="evidence-revision-notice current">
+          <Check size={15} />
+          <span>当前方案已纳入证据评估版本 {solutionEvidenceVersion}。</span>
+        </div>
+      ) : null}
+      <div className="evidence-requirement-list">
+        {requirements.map((item, index) => (
+          <article className="evidence-requirement" key={item.id}>
+            <div className="evidence-requirement-index">{index + 1}</div>
+            <div className="evidence-requirement-body">
+              <div className="evidence-requirement-title">
+                <strong>{item.label}</strong>
+                <span className={`evidence-status ${item.status || 'unresolved'}`}>
+                  {statusLabels[item.status || ''] || item.status || '待提交'}
+                </span>
+              </div>
+              {item.proof_target ? <p>证明目标：{item.proof_target}</p> : null}
+              {item.next_action ? <p>建议：{item.next_action}</p> : null}
+              {item.alternatives?.length ? (
+                <p>替代材料：{item.alternatives.slice(0, 4).join('、')}</p>
+              ) : null}
+              {item.basis_refs?.length ? (
+                <details className="evidence-basis-details">
+                  <summary>查看形成依据</summary>
+                  <div className="evidence-basis-list">
+                    {fullBasisRefsFor(item).map((basis, basisIndex) => (
+                      <article key={`${basis.title}-${basis.article_no}-${basisIndex}`}>
+                        <strong>《{basis.title || '本轮检索依据'}》{basis.article_no || '相关内容'}</strong>
+                        {basis.issuer ? <small>发布机关：{basis.issuer}</small> : null}
+                        {basis.text ? (
+                          <p>{basis.source_type === 'statute' ? '条文内容' : '依据内容'}：{basis.text}</p>
+                        ) : (
+                          <p className="basis-content-missing">本条依据暂未返回正文，请在右侧“检索依据”中核对。</p>
+                        )}
+                        {basis.url ? (
+                          <a href={basis.url} target="_blank" rel="noreferrer">
+                            <Link2 size={12} />查看来源
+                          </a>
+                        ) : null}
+                      </article>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
+            </div>
+            <button
+              className="evidence-upload-button"
+              onClick={() => onUpload(item)}
+              disabled={busy}
+            >
+              <Paperclip size={14} />上传此项
+            </button>
+          </article>
+        ))}
+      </div>
+      <div className="evidence-center-actions">
+        <button className="primary-button" onClick={onUploadAll} disabled={busy}>
+          <FolderOpen size={15} />统一上传材料
+        </button>
+        <button className="secondary-button" onClick={onGenerate} disabled={busy}>
+          <Check size={15} />{solutionVersion > 0 ? '按最新证据更新方案' : '按当前证据生成方案'}
+        </button>
+      </div>
+      <small>支持 PDF、DOCX、TXT 和常见图片；识别结果需与原文件核对。拖动面板右下角可调整高度。</small>
+    </section>
   )
 }
 
@@ -399,6 +825,83 @@ function WelcomeState({
           <span>涉及现实危险时，请优先拨打 110；法律援助可拨打 12348。</span>
         </div>
       )}
+    </div>
+  )
+}
+
+function ServiceWelcome({
+  onSelect,
+  onExample,
+}: {
+  onSelect: (mode: WorkspaceMode) => void
+  onExample: (mode: WorkspaceMode, text: string) => void
+}) {
+  const services = [
+    {
+      mode: 'qa' as const,
+      icon: BookOpen,
+      eyebrow: 'LEGAL Q&A',
+      title: '法律问答',
+      copy: '查询法律规定、权利义务、办理流程、类案和法律统计。作为独立问答保存，不会建立案件。',
+      action: '开始法律问答',
+      examples: QA_SCENARIOS.slice(0, 3),
+    },
+    {
+      mode: 'case' as const,
+      icon: HeartHandshake,
+      eyebrow: 'CASE SUPPORT',
+      title: '案件维权',
+      copy: '针对已经发生的纠纷，持续梳理事实、积累证据、评估材料并生成可更新的维权方案。',
+      action: '开始案件维权',
+      examples: CASE_SCENARIOS.slice(0, 3),
+    },
+  ]
+  return (
+    <div className="service-welcome">
+      <div className="service-welcome-heading">
+        <div className="welcome-mark"><Scale size={25} /></div>
+        <p className="eyebrow">LEGAL SERVICE SUPERVISOR</p>
+        <h1>先告诉我您需要什么，<em>后续由我来协调。</em></h1>
+        <p>
+          您可以选择一项服务，也可以直接在下方描述问题。未选择时，系统会先识别这是法律问答还是具体维权案件；两类记录分别保存，不会混在一起。
+        </p>
+      </div>
+      <div className="service-choice-grid">
+        {services.map((service) => {
+          const ServiceIcon = service.icon
+          return (
+            <article className={`service-choice-card ${service.mode}`} key={service.mode}>
+              <div className="service-choice-title">
+                <span><ServiceIcon size={19} /></span>
+                <div>
+                  <small>{service.eyebrow}</small>
+                  <h2>{service.title}</h2>
+                </div>
+              </div>
+              <p>{service.copy}</p>
+              <div className="service-examples">
+                {service.examples.map((example) => (
+                  <button
+                    key={example.label}
+                    onClick={() => onExample(service.mode, example.text)}
+                    title={example.text}
+                  >
+                    <CircleHelp size={13} />
+                    <span>{example.label}：{example.text}</span>
+                  </button>
+                ))}
+              </div>
+              <button className="service-select-button" onClick={() => onSelect(service.mode)}>
+                {service.action}<ArrowUp size={15} />
+              </button>
+            </article>
+          )
+        })}
+      </div>
+      <div className="service-auto-hint">
+        <Sparkles size={15} />
+        <span>不确定选哪个？直接描述您的问题，Supervisor 会先识别服务类型；无法判断时只会向您确认一次。</span>
+      </div>
     </div>
   )
 }
@@ -450,6 +953,7 @@ function ConversationManager({
   onOpen,
   onCreate,
   onDelete,
+  activities,
 }: {
   mode: WorkspaceMode
   conversations: ConversationRecord[]
@@ -457,9 +961,10 @@ function ConversationManager({
   onOpen: (record: ConversationRecord) => void
   onCreate: () => void
   onDelete: (record: ConversationRecord) => void
+  activities: Record<string, SessionActivity | undefined>
 }) {
   const visible = conversations
-    .filter((record) => record.mode === mode)
+    .filter((record) => record.mode === mode && record.modeLocked)
     .sort((left, right) => right.updatedAt - left.updatedAt)
   return (
     <section className="side-section conversation-manager">
@@ -479,8 +984,9 @@ function ConversationManager({
       <div className="conversation-records">
         {visible.map((record) => {
           const active = record.sessionId === activeSessionId
+          const activity = activities[record.sessionId]
           return (
-            <div className={`conversation-record ${active ? 'active' : ''}`} key={record.sessionId}>
+            <div className={`conversation-record ${active ? 'active' : ''} ${activity ? 'running' : ''}`} key={record.sessionId}>
               <button
                 className="conversation-record-main"
                 onClick={() => onOpen(record)}
@@ -492,9 +998,13 @@ function ConversationManager({
                 <span className="record-copy">
                   <strong title={record.title}>{record.title}</strong>
                   <small>
-                    <Clock3 size={11} />
+                    {activity === 'processing'
+                      ? <LoaderCircle size={11} className="spin" />
+                      : <Clock3 size={11} />}
                     {formatConversationTime(record.updatedAt)}
-                    <span className="record-state">可继续</span>
+                    <span className={`record-state ${activity || ''}`}>
+                      {activity === 'processing' ? '后台处理中' : activity === 'deleting' ? '正在删除' : '可继续'}
+                    </span>
                   </small>
                 </span>
               </button>
@@ -502,6 +1012,7 @@ function ConversationManager({
                 className="record-delete"
                 title={`删除${record.title}`}
                 onClick={() => onDelete(record)}
+                disabled={Boolean(activity)}
               >
                 <Trash2 size={13} />
               </button>
@@ -919,6 +1430,42 @@ function Inspector({
                 )}
               </div>
             </section>
+            {mode === 'case' && debug?.detail_store?.length ? (
+              <section className="inspector-card">
+                <div className="card-title-row">
+                  <h3><ClipboardList size={15} />细节库</h3>
+                  <span className="counter">{debug.detail_store.length} 项</span>
+                </div>
+                <div className="detail-store-list">
+                  {debug.detail_store.slice(-12).map((raw, index) => {
+                    const statement = String(raw.statement || raw.value || '未命名细节')
+                    const status = String(raw.status || 'asserted')
+                    return (
+                      <div key={`${String(raw.key || '')}-${index}`}>
+                        <span>{status === 'conflicted' ? '待核对' : status === 'denied' ? '已否认' : '已记录'}</span>
+                        <p>{statement}</p>
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            ) : null}
+            {mode === 'case' && debug?.evidence_checklist?.length ? (
+              <section className="inspector-card">
+                <div className="card-title-row">
+                  <h3><Paperclip size={15} />证据清单</h3>
+                  <span className="counter">版本 {debug.evidence_requirement_version || 1}</span>
+                </div>
+                <div className="inspector-evidence-list">
+                  {debug.evidence_checklist.map((item) => (
+                    <div key={item.id}>
+                      <strong>{item.label}</strong>
+                      <span>{item.status === 'preliminarily_covered' ? '已初步覆盖' : item.status === 'partially_covered' ? '部分覆盖' : '待完善'}</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
             {statistics ? (
               <section className="inspector-card">
                 <div className="card-title-row">
@@ -936,6 +1483,28 @@ function Inspector({
                 <StatsView statistics={statistics} />
               </section>
             ) : null}
+            <section className="inspector-card source-card">
+              <div className="card-title-row">
+                <h3><Search size={15} />追问阶段依据</h3>
+                <span className="counter">不含类案</span>
+              </div>
+              {debug?.followup_basis_refs?.length ? (
+                <div className="followup-source-list">
+                  {debug.followup_basis_refs.map((basis, index) => (
+                    <article key={`${basis.title}-${basis.article_no}-${index}`}>
+                      <strong>《{basis.title || '本轮检索依据'}》{basis.article_no || '相关内容'}</strong>
+                      {basis.issuer ? <span>{basis.issuer}</span> : null}
+                      {basis.text ? <p>{basis.text}</p> : <p>该依据暂未返回正文。</p>}
+                      {basis.url ? <a href={basis.url} target="_blank" rel="noreferrer">查看来源</a> : null}
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="empty-panel">
+                  {debug?.followup_basis_error || '开始案件追问后，这里会显示本轮法条和其他依据正文。'}
+                </p>
+              )}
+            </section>
             <section className="inspector-card source-card">
               <div className="card-title-row">
                 <h3><BookOpen size={15} />法条命中</h3>
@@ -1077,15 +1646,19 @@ function App() {
   const boot = bootRef.current
   const [userId] = useState(() => readOrCreate('legal-agent:user-id'))
   const [mode, setMode] = useState<WorkspaceMode>(boot.mode)
+  const [modeLocked, setModeLocked] = useState(boot.active.modeLocked)
   const [conversations, setConversations] = useState<ConversationRecord[]>(boot.conversations)
   const [sessionId, setSessionId] = useState(boot.active.sessionId)
   const [messages, setMessages] = useState<ChatMessage[]>(boot.active.messages)
   const [draft, setDraft] = useState(boot.active.draft)
   const [attachments, setAttachments] = useState<AttachmentItem[]>([])
+  const [attachmentTarget, setAttachmentTarget] = useState<EvidenceRequirement | null>(null)
   const [intake, setIntake] = useState<IntakeState>(boot.active.intake)
-  const [busy, setBusy] = useState(false)
-  const [uploading, setUploading] = useState(false)
-  const [error, setError] = useState('')
+  const [sessionActivities, setSessionActivities] = useState<Record<string, SessionActivity | undefined>>({})
+  const [progressBySession, setProgressBySession] = useState<Record<string, AgentProgressItem[]>>({})
+  const [actionPanelHiddenBySession, setActionPanelHiddenBySession] = useState<Record<string, boolean>>({})
+  const [uploadingBySession, setUploadingBySession] = useState<Record<string, boolean>>({})
+  const [errorsBySession, setErrorsBySession] = useState<Record<string, string>>({})
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthLoading, setHealthLoading] = useState(false)
   const [debug, setDebug] = useState<DebugInfo | null>(boot.active.debug)
@@ -1099,6 +1672,35 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textAreaRef = useRef<HTMLTextAreaElement>(null)
   const conversationEndRef = useRef<HTMLDivElement>(null)
+  const activeSessionRef = useRef(boot.active.sessionId)
+  const sessionActivitiesRef = useRef<Record<string, SessionActivity | undefined>>({})
+  const busy = Boolean(sessionActivities[sessionId])
+  const agentProgress = progressBySession[sessionId] || []
+  const actionPanelHidden = Boolean(actionPanelHiddenBySession[sessionId])
+  const uploading = Boolean(uploadingBySession[sessionId])
+  const error = errorsBySession[sessionId] || ''
+
+  const setSessionActivity = (targetSessionId: string, activity?: SessionActivity) => {
+    sessionActivitiesRef.current = {
+      ...sessionActivitiesRef.current,
+      [targetSessionId]: activity,
+    }
+    setSessionActivities(sessionActivitiesRef.current)
+  }
+
+  const setSessionError = (targetSessionId: string, message: string) => {
+    setErrorsBySession((current) => ({ ...current, [targetSessionId]: message }))
+  }
+
+  const setError = (message: string) => setSessionError(activeSessionRef.current, message)
+
+  const setSessionUploading = (targetSessionId: string, value: boolean) => {
+    setUploadingBySession((current) => ({ ...current, [targetSessionId]: value }))
+  }
+
+  const setSessionActionPanelHidden = (targetSessionId: string, value: boolean) => {
+    setActionPanelHiddenBySession((current) => ({ ...current, [targetSessionId]: value }))
+  }
 
   const refreshHealth = useCallback(async () => {
     setHealthLoading(true)
@@ -1122,6 +1724,7 @@ function App() {
   }, [refreshHealth])
 
   useEffect(() => {
+    activeSessionRef.current = sessionId
     window.localStorage.setItem(MODE_KEY, mode)
     window.localStorage.setItem(`legal-agent:session-id:${mode}`, sessionId)
     window.localStorage.setItem(`legal-agent:active-conversation:${mode}`, sessionId)
@@ -1133,6 +1736,7 @@ function App() {
       const lastMessageAt = messages.at(-1)?.createdAt
       const next: ConversationRecord = {
         mode,
+        modeLocked,
         sessionId,
         title: deriveConversationTitle(messages, mode),
         updatedAt: lastMessageAt || existing?.updatedAt || Date.now(),
@@ -1159,6 +1763,7 @@ function App() {
     intake,
     messages,
     mode,
+    modeLocked,
     sessionId,
     statistics,
   ])
@@ -1186,14 +1791,22 @@ function App() {
         id: uid(),
         file,
         status: 'ready' as const,
+        requirementId: attachmentTarget?.id,
+        requirementLabel: attachmentTarget?.label,
       }))
     setAttachments((current) => [...current, ...next].slice(0, 8))
+    setAttachmentTarget(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
     focusComposer()
   }
 
   const removeAttachment = (id: string) =>
     setAttachments((current) => current.filter((item) => item.id !== id))
+
+  const openAttachmentPicker = (requirement: EvidenceRequirement | null = null) => {
+    setAttachmentTarget(requirement)
+    window.requestAnimationFrame(() => fileInputRef.current?.click())
+  }
 
   const buildIntakeMessage = () => {
     const sections = [
@@ -1212,15 +1825,66 @@ function App() {
     ].join('\n').trim()
   }
 
-  const send = async (messageText: string, files = attachments) => {
+  const updateSessionMessages = (
+    targetSessionId: string,
+    updater: (current: ChatMessage[]) => ChatMessage[],
+  ) => {
+    setConversations((current) => current.map((record) => {
+      if (record.sessionId !== targetSessionId) return record
+      const nextMessages = updater(record.messages)
+      return {
+        ...record,
+        messages: nextMessages,
+        title: deriveConversationTitle(nextMessages, record.mode),
+        updatedAt: nextMessages.at(-1)?.createdAt || record.updatedAt,
+      }
+    }))
+    if (activeSessionRef.current === targetSessionId) {
+      setMessages(updater)
+    }
+  }
+
+  const updateSessionRecord = (
+    targetSessionId: string,
+    updater: (record: ConversationRecord) => ConversationRecord,
+  ) => {
+    setConversations((current) => current.map((record) => (
+      record.sessionId === targetSessionId ? updater(record) : record
+    )))
+  }
+
+  const updateVisibleAttachments = (
+    targetSessionId: string,
+    updater: (current: AttachmentItem[]) => AttachmentItem[],
+  ) => {
+    if (activeSessionRef.current === targetSessionId) {
+      setAttachments(updater)
+    }
+  }
+
+  const send = async (
+    messageText: string,
+    files = attachments,
+    options?: {
+      action?: 'message' | 'submit_evidence' | 'regenerate_solution'
+      regenerateSolution?: boolean
+    },
+  ) => {
     const trimmed = messageText.trim()
-    if (busy || (!trimmed && files.length === 0)) return
-    setBusy(true)
-    setError('')
+    const targetSessionId = sessionId
+    const targetMode = mode
+    const targetModeLocked = modeLocked
+    const targetRecord = conversations.find((item) => item.sessionId === targetSessionId)
+    const targetDebug = targetRecord?.debug || debug
+    if (sessionActivitiesRef.current[targetSessionId] || (!trimmed && files.length === 0)) return
+    setSessionActivity(targetSessionId, 'processing')
+    setProgressBySession((current) => ({ ...current, [targetSessionId]: [] }))
+    setSessionActionPanelHidden(targetSessionId, true)
+    setSessionError(targetSessionId, '')
     const visibleFiles = files.map((item) => item.file.name)
     const userMessageId = uid()
     const assistantMessageId = uid()
-    setMessages((current) => [
+    updateSessionMessages(targetSessionId, (current) => [
       ...current,
       {
         id: userMessageId,
@@ -1231,28 +1895,32 @@ function App() {
       },
       { id: assistantMessageId, role: 'assistant', content: '', createdAt: Date.now() },
     ])
-    setDraft('')
-    setAttachments((current) =>
+    updateSessionRecord(targetSessionId, (record) => ({ ...record, draft: '' }))
+    if (activeSessionRef.current === targetSessionId) setDraft('')
+    updateVisibleAttachments(targetSessionId, (current) =>
       current.map((item) =>
         files.some((queued) => queued.id === item.id)
           ? { ...item, status: 'processing' }
           : item,
       ),
     )
-    setUploading(files.length > 0)
+    setSessionUploading(targetSessionId, files.length > 0)
 
     const evidenceBlocks: string[] = []
     try {
       for (const item of files.slice(0, 8)) {
         const file = item.file
         const lower = file.name.toLowerCase()
-        setAttachments((current) =>
+        updateVisibleAttachments(targetSessionId, (current) =>
           current.map((candidate) => candidate.id === item.id ? { ...candidate, status: 'processing' } : candidate),
         )
         if (/\.(pdf|docx|txt)$/i.test(lower)) {
           const result = await uploadDocument(file)
-          evidenceBlocks.push(result.evidence_block)
-          setMessages((current) =>
+          const association = item.requirementId
+            ? `清单项ID：${item.requirementId}\n清单项：${item.requirementLabel || '未命名证据需求'}\n`
+            : ''
+          evidenceBlocks.push(result.evidence_block.replace('\n', `\n${association}`))
+          updateSessionMessages(targetSessionId, (current) =>
             current.map((candidate) =>
               candidate.id === userMessageId
                 ? { ...candidate, content: `${candidate.content}\n\n已提取 ${result.filename} 的可读文字，内容将按待核验证据处理。` }
@@ -1260,44 +1928,105 @@ function App() {
             ),
           )
         } else if (/^image\//.test(file.type) || /\.(png|jpe?g|gif|bmp|webp)$/i.test(lower)) {
-          const result = await uploadImage(file, userId, sessionId)
+          const result = await uploadImage(file, userId, targetSessionId)
           if (!result.enabled) throw new Error(result.message || '多模态功能未启用')
           if (!result.analysis) throw new Error('图片分析未返回可用内容')
           evidenceBlocks.push(
-            `【图片证据补充（视觉模型识别，需与原图核对）】\n文件：${file.name}\n原图 SHA-256：${result.image_sha256 || ''}\n${result.analysis}`,
+            `【图片证据补充（视觉模型识别，需与原图核对）】\n${
+              item.requirementId
+                ? `清单项ID：${item.requirementId}\n清单项：${item.requirementLabel || '未命名证据需求'}\n`
+                : ''
+            }文件：${file.name}\n原图 SHA-256：${result.image_sha256 || ''}\n${result.analysis}`,
           )
         } else {
           throw new Error(`${file.name} 暂不支持，仅支持图片、PDF、DOCX 和 TXT`)
         }
-        setAttachments((current) =>
+        updateVisibleAttachments(targetSessionId, (current) =>
           current.map((candidate) => candidate.id === item.id ? { ...candidate, status: 'done' } : candidate),
         )
       }
-      setUploading(false)
+      setSessionUploading(targetSessionId, false)
       const combinedMessage = [trimmed, ...evidenceBlocks].filter(Boolean).join('\n\n')
       let reply = ''
       await streamChat(
-        { user_id: userId, session_id: sessionId, message: combinedMessage },
+        {
+          user_id: userId,
+          session_id: targetSessionId,
+          message: combinedMessage,
+          mode: targetModeLocked ? targetMode : 'auto',
+          action: options?.action || (files.length ? 'submit_evidence' : 'message'),
+          target_case_id: targetDebug?.case_id || '',
+          regenerate_solution: Boolean(options?.regenerateSolution),
+          evidence_requirement_ids: Array.from(new Set(
+            files.map((item) => item.requirementId).filter((item): item is string => Boolean(item)),
+          )),
+        },
         (event) => {
+          if (event.type === 'progress') {
+            const stage = event.stage || `stage-${Date.now()}`
+            const nextItem: AgentProgressItem = {
+              stage,
+              label: event.label || '正在处理',
+              detail: event.detail || '',
+              status: event.status || 'active',
+            }
+            setProgressBySession((current) => {
+              const progress = current[targetSessionId] || []
+              const settled = progress.map((item) => (
+                item.status === 'active' && item.stage !== stage
+                  ? { ...item, status: 'completed' as const }
+                  : item
+              ))
+              const existingIndex = settled.findIndex((item) => item.stage === stage)
+              const nextProgress = existingIndex < 0
+                ? [...settled, nextItem].slice(-10)
+                : settled.map((item, index) => index === existingIndex ? nextItem : item)
+              return { ...current, [targetSessionId]: nextProgress }
+            })
+          }
           if (event.type === 'token') {
             reply += event.content || ''
-            setMessages((current) =>
+            updateSessionMessages(targetSessionId, (current) =>
               current.map((candidate) =>
                 candidate.id === assistantMessageId ? { ...candidate, content: reply } : candidate,
               ),
             )
           }
           if (event.type === 'done') {
-            if (event.session_id && event.session_id !== sessionId) setSessionId(event.session_id)
-            setDebug(event.debug ?? null)
-            setStatistics(event.statistics ?? null)
-            setDocument(event.document ?? null)
-            if (event.document) {
+            const resolvedMode = event.resolved_mode === 'qa' || event.resolved_mode === 'case'
+              ? event.resolved_mode
+              : targetMode
+            const resolvedLocked = event.resolved_mode === 'qa' || event.resolved_mode === 'case'
+              ? event.mode_locked !== false
+              : targetModeLocked
+            const nextTab: InspectorTab = event.document
+              ? 'documents'
+              : event.statistics
+                ? 'sources'
+                : 'case'
+            updateSessionRecord(targetSessionId, (record) => ({
+              ...record,
+              mode: resolvedMode,
+              modeLocked: resolvedLocked,
+              debug: event.debug ?? null,
+              statistics: event.statistics ?? null,
+              document: event.document ?? null,
+              activeTab: event.document || event.statistics ? nextTab : record.activeTab,
+            }))
+            setSessionActionPanelHidden(targetSessionId, false)
+            if (activeSessionRef.current === targetSessionId) {
+              setMode(resolvedMode)
+              setModeLocked(resolvedLocked)
+              setDebug(event.debug ?? null)
+              setStatistics(event.statistics ?? null)
+              setDocument(event.document ?? null)
+            }
+            if (event.document && activeSessionRef.current === targetSessionId) {
               const sourceTemplateId = event.document.source?.template_id
               if (typeof sourceTemplateId === 'string') setSelectedTemplate(sourceTemplateId)
               setActiveTab('documents')
               setInspectorOpen(true)
-            } else if (event.statistics) {
+            } else if (event.statistics && activeSessionRef.current === targetSessionId) {
               setActiveTab('sources')
               setInspectorOpen(true)
             }
@@ -1306,24 +2035,28 @@ function App() {
         },
       )
       if (!reply) {
-        setMessages((current) =>
+        updateSessionMessages(targetSessionId, (current) =>
           current.map((candidate) =>
             candidate.id === assistantMessageId ? { ...candidate, content: '本轮没有收到可显示的回复，请稍后重试。' } : candidate,
           ),
         )
       }
-      setAttachments([])
+      if (activeSessionRef.current === targetSessionId) {
+        setAttachments([])
+        setAttachmentTarget(null)
+      }
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : '请求失败，请稍后重试'
-      setError(message)
-      setAttachments((current) =>
+      setSessionError(targetSessionId, message)
+      setSessionActionPanelHidden(targetSessionId, false)
+      updateVisibleAttachments(targetSessionId, (current) =>
         current.map((item) =>
           files.some((queued) => queued.id === item.id)
             ? { ...item, status: 'error', note: message }
             : item,
         ),
       )
-      setMessages((current) =>
+      updateSessionMessages(targetSessionId, (current) =>
         current.map((candidate) =>
           candidate.id === assistantMessageId
             ? { ...candidate, content: `连接未完成：${message}` }
@@ -1331,8 +2064,8 @@ function App() {
         ),
       )
     } finally {
-      setUploading(false)
-      setBusy(false)
+      setSessionUploading(targetSessionId, false)
+      setSessionActivity(targetSessionId)
     }
   }
 
@@ -1351,6 +2084,7 @@ function App() {
 
   const currentConversationSnapshot = (): ConversationRecord => ({
     mode,
+    modeLocked,
     sessionId,
     title: deriveConversationTitle(messages, mode),
     updatedAt: messages.at(-1)?.createdAt
@@ -1384,7 +2118,9 @@ function App() {
   }
 
   const loadConversation = (record: ConversationRecord) => {
+    activeSessionRef.current = record.sessionId
     setMode(record.mode)
+    setModeLocked(record.modeLocked)
     setSessionId(record.sessionId)
     setMessages(record.messages)
     setDraft(record.draft || '')
@@ -1394,18 +2130,16 @@ function App() {
     setDocument(record.document || null)
     setActiveTab(record.activeTab || 'case')
     setAttachments([])
-    setUploading(false)
-    setError('')
+    setAttachmentTarget(null)
     setInspectorOpen(false)
     const sourceTemplateId = record.document?.source?.template_id
     if (typeof sourceTemplateId === 'string') setSelectedTemplate(sourceTemplateId)
     window.requestAnimationFrame(focusComposer)
   }
 
-  const startNewConversation = (targetMode = mode) => {
-    if (busy) return
+  const startNewConversation = (targetMode = mode, lockMode = modeLocked) => {
     const current = currentConversationSnapshot()
-    const next = createConversation(targetMode)
+    const next = createConversation(targetMode, undefined, lockMode)
     setConversations((items) => [
       next,
       current,
@@ -1419,16 +2153,22 @@ function App() {
   }
 
   const switchMode = (nextMode: WorkspaceMode) => {
-    if (busy || nextMode === mode) return
+    if (!modeLocked) {
+      setMode(nextMode)
+      setModeLocked(true)
+      window.requestAnimationFrame(focusComposer)
+      return
+    }
+    if (nextMode === mode) return
     const current = currentConversationSnapshot()
     const available = [
       current,
       ...conversations.filter((record) => record.sessionId !== current.sessionId),
     ]
     const target = available
-      .filter((record) => record.mode === nextMode)
+      .filter((record) => record.mode === nextMode && record.modeLocked)
       .sort((left, right) => right.updatedAt - left.updatedAt)[0]
-      || createConversation(nextMode, readModeSession(nextMode))
+      || createConversation(nextMode, readModeSession(nextMode), true)
     setConversations([
       target,
       ...available.filter((record) => record.sessionId !== target.sessionId),
@@ -1437,12 +2177,12 @@ function App() {
   }
 
   const removeConversation = async (record: ConversationRecord) => {
-    if (busy) return
+    if (sessionActivitiesRef.current[record.sessionId]) return
     const confirmed = window.confirm(
       `确定删除“${record.title}”吗？案件状态、对话检查点和本地历史将一并清除，无法恢复。`,
     )
     if (!confirmed) return
-    setBusy(true)
+    setSessionActivity(record.sessionId, 'deleting')
     setError('')
     try {
       const result = await deleteConversation(userId, record.sessionId)
@@ -1452,9 +2192,9 @@ function App() {
       setConversations(remaining)
       if (record.sessionId === sessionId) {
         const next = remaining
-          .filter((item) => item.mode === mode)
+          .filter((item) => item.mode === mode && item.modeLocked)
           .sort((left, right) => right.updatedAt - left.updatedAt)[0]
-          || createConversation(mode)
+          || createConversation(mode, undefined, modeLocked)
         setConversations((items) => [
           next,
           ...items.filter((item) => item.sessionId !== next.sessionId),
@@ -1467,13 +2207,28 @@ function App() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '删除对话失败')
     } finally {
-      setBusy(false)
+      setSessionActivity(record.sessionId)
     }
   }
 
   const setScenario = (text: string) => {
     updateDraft(text)
     focusComposer()
+  }
+
+  const selectInitialService = (nextMode: WorkspaceMode) => {
+    if (busy) return
+    setMode(nextMode)
+    setModeLocked(true)
+    window.requestAnimationFrame(focusComposer)
+  }
+
+  const selectInitialExample = (nextMode: WorkspaceMode, text: string) => {
+    if (busy) return
+    setMode(nextMode)
+    setModeLocked(true)
+    setDraft(text)
+    window.requestAnimationFrame(focusComposer)
   }
 
   const scenarios = mode === 'case' ? CASE_SCENARIOS : QA_SCENARIOS
@@ -1492,20 +2247,18 @@ function App() {
           <div className="mode-switch" role="tablist" aria-label="工作模式">
             <button
               role="tab"
-              aria-selected={mode === 'qa'}
-              className={mode === 'qa' ? 'active' : ''}
+              aria-selected={modeLocked && mode === 'qa'}
+              className={modeLocked && mode === 'qa' ? 'active' : ''}
               onClick={() => switchMode('qa')}
-              disabled={busy}
             >
               <BookOpen size={14} />
               法律问答
             </button>
             <button
               role="tab"
-              aria-selected={mode === 'case'}
-              className={mode === 'case' ? 'active' : ''}
+              aria-selected={modeLocked && mode === 'case'}
+              className={modeLocked && mode === 'case' ? 'active' : ''}
               onClick={() => switchMode('case')}
-              disabled={busy}
             >
               <HeartHandshake size={14} />
               案件维权
@@ -1515,13 +2268,20 @@ function App() {
           <span className="topbar-hint">内容仅供参考，重要决定前请核验来源</span>
         </div>
         <div className="topbar-actions">
-          <button className="secondary-button inspector-toggle" onClick={() => setInspectorOpen(true)}>
-            <PanelRight size={16} />
-            {mode === 'case' ? '案件资料' : '问答资料'}
-          </button>
-          <button className="secondary-button" onClick={() => startNewConversation()} disabled={busy}>
+          {modeLocked ? (
+            <button className="secondary-button" onClick={() => startNewConversation(mode, false)}>
+              <Scale size={15} />选择服务
+            </button>
+          ) : null}
+          {modeLocked ? (
+            <button className="secondary-button inspector-toggle" onClick={() => setInspectorOpen(true)}>
+              <PanelRight size={16} />
+              {mode === 'case' ? '案件资料' : '问答资料'}
+            </button>
+          ) : null}
+          <button className="secondary-button" onClick={() => startNewConversation()}>
             <MessageSquarePlus size={16} />
-            {mode === 'case' ? '新建案件' : '新建问答'}
+            {!modeLocked ? '新建咨询' : mode === 'case' ? '新建案件' : '新建问答'}
           </button>
           <button className="avatar-button" title="当前为匿名工作区"><span>访</span></button>
         </div>
@@ -1532,39 +2292,48 @@ function App() {
           <section className="case-card">
             <div className="case-card-top">
               <div className="case-badge">
-                {mode === 'case' ? <HeartHandshake size={17} /> : <BookOpen size={17} />}
+                {!modeLocked ? <Scale size={17} /> : mode === 'case' ? <HeartHandshake size={17} /> : <BookOpen size={17} />}
               </div>
-              <span className="case-open">{mode === 'case' ? 'CASE' : 'Q&A'}</span>
+              <span className="case-open">{!modeLocked ? 'SELECT' : mode === 'case' ? 'CASE' : 'Q&A'}</span>
             </div>
             <p className="section-kicker">CURRENT WORKSPACE</p>
             <h1>
-              {debug?.domain
+              {!modeLocked
+                ? '请选择需要的服务'
+                : debug?.domain
                 ? DOMAIN_LABELS[debug.domain] || debug.domain
                 : mode === 'case' ? '未命名维权案件' : '法律知识问答'}
             </h1>
             <p className="case-id-note">
-              {mode === 'case'
+              {!modeLocked
+                ? '也可以直接描述问题，由 Supervisor 自动识别。'
+                : mode === 'case'
                 ? '案件长期保留，切换或刷新后可继续。'
                 : '问答独立保存，不会写入维权案件。'}
             </p>
             <div className="case-card-footer">
-              {mode === 'case'
+              {!modeLocked
+                ? <span className="confidence-badge qa">等待选择</span>
+                : mode === 'case'
                 ? <ConfidenceBadge tier={debug?.confidence_tier} />
                 : <span className="confidence-badge qa">知识检索</span>}
               <span className="round-note">{messages.filter((item) => item.role === 'user').length} 轮输入</span>
             </div>
           </section>
 
-          <ConversationManager
-            mode={mode}
-            conversations={conversations}
-            activeSessionId={sessionId}
-            onOpen={loadConversation}
-            onCreate={() => startNewConversation()}
-            onDelete={(record) => void removeConversation(record)}
-          />
+          {modeLocked ? (
+            <ConversationManager
+              mode={mode}
+              conversations={conversations}
+              activeSessionId={sessionId}
+              activities={sessionActivities}
+              onOpen={loadConversation}
+              onCreate={() => startNewConversation()}
+              onDelete={(record) => void removeConversation(record)}
+            />
+          ) : null}
 
-          <section className="side-section quick-section">
+          {modeLocked ? <section className="side-section quick-section">
             <div className="side-section-head">
               <div>
                 <p className="section-kicker">QUICK START</p>
@@ -1580,7 +2349,7 @@ function App() {
                 </button>
               ))}
             </div>
-          </section>
+          </section> : null}
 
           <HealthCard health={health} loading={healthLoading} onRefresh={() => void refreshHealth()} />
 
@@ -1589,7 +2358,9 @@ function App() {
             <div>
               <strong>隐私提示</strong>
               <p>
-                {mode === 'case'
+                {!modeLocked
+                  ? '请选择服务或直接描述问题；系统识别后会分别保存问答和案件。'
+                  : mode === 'case'
                   ? '案件长期保留至手动删除；上传前请遮挡无关的敏感信息。'
                   : '问答记录仅在当前匿名浏览器中管理，重要信息请谨慎输入。'}
               </p>
@@ -1598,26 +2369,88 @@ function App() {
         </aside>
 
         <section className="conversation-column">
-          {mode === 'case' ? (
+          {modeLocked && mode === 'case' ? (
             <IntakePanel intake={intake} setIntake={setIntake} onSubmit={submitIntake} busy={busy} />
           ) : null}
           <div className="conversation-header">
             <div>
               <p className="section-kicker">CONVERSATION</p>
-              <h2>{mode === 'case' ? '案件对话' : '法律问答'}</h2>
+              <h2>{!modeLocked ? '服务导览' : mode === 'case' ? '案件对话' : '法律问答'}</h2>
             </div>
             {busy ? <span className="processing-label"><LoaderCircle size={14} className="spin" />正在处理</span> : null}
           </div>
           <div className="conversation-scroll">
             {messages.length === 0 ? (
-              <WelcomeState mode={mode} scenarios={scenarios} onScenario={setScenario} />
+              modeLocked ? (
+                <WelcomeState mode={mode} scenarios={scenarios} onScenario={setScenario} />
+              ) : (
+                <ServiceWelcome onSelect={selectInitialService} onExample={selectInitialExample} />
+              )
             ) : (
               <div className="message-list">
-                {messages.map((message) => <MessageCard key={message.id} message={message} />)}
+                {messages.map((message, index) => (
+                  <MessageCard
+                    key={message.id}
+                    message={message}
+                    progress={
+                      busy && index === messages.length - 1 && message.role === 'assistant'
+                        ? agentProgress
+                        : undefined
+                    }
+                  />
+                ))}
                 <div ref={conversationEndRef} aria-hidden="true" />
               </div>
             )}
           </div>
+          {!modeLocked && messages.length > 0 ? (
+            <div className="mode-confirmation-bar">
+              <span><CircleHelp size={15} />请确认这次对话的保存类型，选择后继续描述即可。</span>
+              <button onClick={() => selectInitialService('qa')} disabled={busy}>
+                <BookOpen size={14} />只做法律问答
+              </button>
+              <button onClick={() => selectInitialService('case')} disabled={busy}>
+                <HeartHandshake size={14} />作为维权案件
+              </button>
+            </div>
+          ) : null}
+          {modeLocked && mode === 'case'
+            && !actionPanelHidden
+            && debug?.followup_form?.kind === 'followup_form'
+            && debug.followup_form.questions?.length ? (
+              <FollowupFormCard
+                questions={debug.followup_form.questions}
+                busy={busy}
+                onSubmit={(content) => void send(content)}
+                onUseChat={focusComposer}
+                onConclude={() => void send(
+                  '现在生成方案',
+                  [],
+                  { action: 'regenerate_solution' },
+                )}
+              />
+            ) : null}
+          {modeLocked && mode === 'case'
+            && !actionPanelHidden
+            && debug?.followup_form?.kind === 'evidence_collection'
+            && debug.evidence_checklist?.length ? (
+              <EvidenceCenterCard
+                requirements={debug.evidence_checklist}
+                version={debug.evidence_requirement_version || 1}
+                evaluationVersion={debug.evidence_evaluation_version || 0}
+                solutionVersion={debug.solution_version || 0}
+                solutionEvidenceVersion={debug.solution_evidence_version || 0}
+                fallbackBasisRefs={debug.followup_basis_refs || []}
+                busy={busy}
+                onUpload={openAttachmentPicker}
+                onUploadAll={() => openAttachmentPicker(null)}
+                onGenerate={() => void send(
+                  '请根据最新证据评估更新维权方案。',
+                  [],
+                  { action: 'regenerate_solution' },
+                )}
+              />
+            ) : null}
           <div className="composer-area">
             {error ? (
               <div className="error-banner">
@@ -1632,6 +2465,7 @@ function App() {
                   <div className={`pending-file ${item.status}`} key={item.id}>
                     {item.file.type.startsWith('image/') ? <ImagePlus size={14} /> : <FileText size={14} />}
                     <span title={item.file.name}>{item.file.name}</span>
+                    {item.requirementLabel ? <em>关联：{item.requirementLabel}</em> : null}
                     <small>{formatBytes(item.file.size)}</small>
                     {item.status === 'processing' ? <LoaderCircle size={13} className="spin" /> : null}
                     {item.status === 'done' ? <Check size={13} /> : null}
@@ -1649,7 +2483,7 @@ function App() {
                 accept="image/*,.pdf,.docx,.txt"
                 onChange={(event) => handleFileSelection(event.target.files)}
               />
-              <button className="composer-tool" title="添加图片、PDF、DOCX 或 TXT" onClick={() => fileInputRef.current?.click()} disabled={busy}>
+              <button className="composer-tool" title="添加图片、PDF、DOCX 或 TXT" onClick={() => openAttachmentPicker(null)} disabled={busy}>
                 <Paperclip size={19} />
               </button>
               <textarea
@@ -1663,7 +2497,9 @@ function App() {
                   }
                 }}
                 placeholder={
-                  mode === 'case'
+                  !modeLocked
+                    ? '直接描述问题，或先选择“法律问答 / 案件维权”……'
+                    : mode === 'case'
                     ? '描述案件进展、补充事实或上传证据……'
                     : '询问法律规定、办理流程、类案或统计数据……'
                 }
@@ -1679,9 +2515,12 @@ function App() {
               <span><LockIcon /> 当前为匿名会话</span>
             </div>
           </div>
-          {mode === 'case' ? (
+          {modeLocked && mode === 'case' ? (
             <div className="action-rail">
-              <button onClick={() => void send('现在生成方案')} disabled={busy}><Check size={15} />现在生成方案</button>
+              <button
+                onClick={() => void send('现在生成方案', [], { action: 'regenerate_solution' })}
+                disabled={busy}
+              ><Check size={15} />现在生成方案</button>
               <button onClick={() => void send('继续补充')} disabled={busy}><RefreshCw size={15} />继续补充</button>
               <button onClick={() => void send('生成文书')} disabled={busy}><FileText size={15} />生成参考文书</button>
             </div>
@@ -1710,7 +2549,7 @@ function App() {
       </main>
       <footer className="app-footer">
         <span>
-          法护通 · {mode === 'case' ? '案件状态长期保留至手动删除' : '法律问答与维权案件相互隔离'}
+          法护通 · {!modeLocked ? '法律问答与维权案件分别保存' : mode === 'case' ? '案件状态长期保留至手动删除' : '法律问答与维权案件相互隔离'}
         </span>
         <span>法律信息与行动参考，不替代律师或办案机关的正式判断</span>
       </footer>

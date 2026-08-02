@@ -5,9 +5,14 @@ import argparse
 import asyncio
 import json
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.agents.legal_guide.graph import build_guide_deps, run_guide
 from src.agents.legal_guide.state import GuidePhase, GuideState
@@ -598,7 +603,10 @@ async def main() -> int:
     parser.add_argument("--quick", action="store_true", help="只跑信息完整、老人和中途高危三个场景")
     parser.add_argument("--skip-multimodal", action="store_true", help="跳过多模态证据场景")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS))
-    parser.add_argument("--output", default="docs/法律指引多场景测试报告.md")
+    parser.add_argument(
+        "--output",
+        default="test/materials/reports/法律指引多场景测试报告.md",
+    )
     args = parser.parse_args()
 
     if args.scenario:

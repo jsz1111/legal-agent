@@ -32,7 +32,7 @@ async def ainvoke_bounded(
     llm: Any,
     messages: list[Any],
     *,
-    timeout: float,
+    timeout: float | None,
     stage: str,
 ) -> Any:
     """Invoke an LLM within a stage-owned latency budget.
@@ -42,10 +42,12 @@ async def ainvoke_bounded(
     silently retrying and multiplying end-to-end latency.
     """
 
+    if timeout is None or float(timeout) <= 0:
+        return await llm.ainvoke(messages)
     try:
         return await asyncio.wait_for(
             llm.ainvoke(messages),
-            timeout=max(0.1, float(timeout)),
+            timeout=float(timeout),
         )
     except asyncio.TimeoutError:
         logger.warning("LLM阶段超时 | stage={} timeout={}s", stage, timeout)

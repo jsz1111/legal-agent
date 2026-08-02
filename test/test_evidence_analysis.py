@@ -320,6 +320,30 @@ def test_uploaded_document_is_removed_from_case_narrative_but_kept_in_inventory(
     assert observations[0]["content_digest"] == "abcdef0123456789"
 
 
+def test_uploaded_inventory_keeps_conservative_quality_when_model_is_unavailable():
+    user_text = (
+        "【文档证据补充（程序提取，需与原文件核对）】\n"
+        "文件：付款聊天转录.txt\n来源形式：native_electronic\n"
+        "原文件 SHA-256：abcdef0123456789\n"
+        "【提取文字】\n"
+        "测试案件编号：EVAL-01\n付款时间：2026-04-28 15:36\n"
+        "付款金额：人民币1000元\n收款账户：S-01\n"
+        "聊天转录：卖家承诺付款后发货。\n"
+        "来源说明：依据公开案件事实重构，不是平台导出的原始凭证。"
+    )
+
+    _narrative, observations = split_uploaded_evidence_blocks(user_text)
+    item = observations[0]
+
+    assert item["source_form"] == "copy"
+    assert item["completeness"] == "partial"
+    assert item["identity_visibility"] == "clear"
+    assert item["time_visibility"] == "clear"
+    assert item["acquisition_method"] == "third_party"
+    assert item["case_specificity"] == "case_specific"
+    assert {"payment", "communication", "time"}.issubset(item["proof_roles"])
+
+
 def test_blank_reference_material_does_not_cover_case_proof_target():
     report = evaluate_evidence(
         domain="labor_social_security",

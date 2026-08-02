@@ -157,6 +157,12 @@ async def _extract_structured_intake(
 def _deterministic_issue_fallback(user_input: str) -> IssuesOutput | None:
     """Recover only high-precision intents when structured LLM output is unavailable."""
     normalized = "".join((user_input or "").split())
+    if is_high_precision_fraud_report(normalized):
+        return IssuesOutput(
+            issues=["疑似网络诈骗线索"],
+            domain="cyber_data_fraud",
+            facts=[user_input.strip()] if user_input.strip() else [],
+        )
     wage_pattern = re.compile(
         r"(?:欠|拖欠|没发|不发|不给).{0,8}(?:工资|工钱|薪水|劳动报酬)|"
         r"(?:工资|工钱|薪水|劳动报酬).{0,8}(?:欠|拖欠|没发|不发|不给)"
@@ -167,7 +173,49 @@ def _deterministic_issue_fallback(user_input: str) -> IssuesOutput | None:
             domain="labor_social_security",
             facts=[user_input.strip()] if user_input.strip() else [],
         )
+    if re.search(r"(?:交通事故|道路事故|相撞|碰撞).{0,30}(?:受伤|医疗费|误工费|护理费|伤残)", normalized):
+        return IssuesOutput(
+            issues=["交通事故人身损害赔偿争议"],
+            domain="traffic_personal_injury",
+            facts=[user_input.strip()] if user_input.strip() else [],
+        )
+    if re.search(r"(?:租赁|租房|房东|承租).{0,40}(?:押金|租金|退租|解除合同)", normalized):
+        return IssuesOutput(
+            issues=["房屋租赁合同履行与返还争议"],
+            domain="contracts_property_housing",
+            facts=[user_input.strip()] if user_input.strip() else [],
+        )
+    contract_nonperformance = bool(re.search(
+        r"(?:合同|协议|约定|委托|代购).{0,80}(?:未交付|不交付|未退款|不退款|拒绝退款|没有退款)|"
+        r"(?:支付|付款|转账).{0,80}(?:未交付|不交付|未退款|不退款|拒绝退款|没有退款)",
+        normalized,
+    ))
+    if contract_nonperformance:
+        return IssuesOutput(
+            issues=["合同履行与退款争议"],
+            domain="contracts_property_housing",
+            facts=[user_input.strip()] if user_input.strip() else [],
+        )
     return None
+
+
+def is_high_precision_fraud_report(user_input: str) -> bool:
+    """Recognize explicit fraud reports without deciding that a crime is established."""
+
+    normalized = "".join(str(user_input or "").split())
+    if not normalized:
+        return False
+    direct_markers = (
+        "我被骗了", "被骗了", "诈骗了我", "骗我转账", "转账后拉黑",
+        "付款后拉黑", "刷单被骗", "杀猪盘", "冒充客服骗", "冒充公检法骗",
+    )
+    if any(marker in normalized for marker in direct_markers):
+        return True
+    return bool(re.search(
+        r"(?:闲鱼|二手平台|网购|网友|陌生人).{0,20}(?:转账|付款).{0,20}(?:拉黑|失联|不发货)|"
+        r"(?:转账|付款).{0,20}(?:后|以后).{0,12}(?:拉黑|失联|不发货)",
+        normalized,
+    ))
 
 
 # ── 第一层：LLM 提取 + 粗标准化 ──────────────────────────────────────────────
@@ -206,8 +254,14 @@ async def extract_legal_issues(
             region=(data.get("region") or "").strip(),
             time_info=(data.get("time_info") or "").strip(),
         )
-        if not result.issues:
-            result = _deterministic_issue_fallback(user_input) or result
+        deterministic = _deterministic_issue_fallback(user_input)
+        if deterministic and deterministic.domain == "cyber_data_fraud":
+            result.domain = deterministic.domain
+            result.issues = list(dict.fromkeys([*deterministic.issues, *result.issues]))
+            if not result.facts:
+                result.facts = deterministic.facts
+        elif not result.issues:
+            result = deterministic or result
         logger.debug("提取法律问题: {} domain: {}", result.issues, result.domain)
         return result
     except Exception as e:

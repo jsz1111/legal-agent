@@ -485,6 +485,18 @@ def _single_question(question: str) -> str:
     return compact[: marks[0] + 1].strip()
 
 
+def _question_punctuation(question: str) -> str:
+    """Return one clean Chinese question mark without combinations such as `。？`."""
+
+    compact = " ".join(str(question or "").split()).strip()
+    if not compact:
+        return ""
+    if compact.endswith(("？", "?")):
+        stem = re.sub(r"[。；，、：:]+$", "", compact[:-1].rstrip())
+        return stem + "？"
+    return re.sub(r"[。；，、：:]+$", "", compact) + "？"
+
+
 def _stop_plan(
     mode: str,
     *,
@@ -840,3 +852,275 @@ def format_followup_authority(plan: dict[str, Any]) -> str:
     label = f"[{title}]({url})" if url else title
     prefix = f"{issuer}发布的" if issuer else ""
     return f"追问依据：参考{prefix}{label}中的办理或示范文本要素，用于{reason}；它不是官方固定问卷。"
+
+
+BATCH_FOLLOWUP_PROMPT = """你是法律咨询工作流中的动态批量追问规划器。
+
+你必须根据本案已经入库的事实、尚未解决的法律决策维度和本轮真实检索依据，实时生成本轮表单；
+不是从固定问卷挑题，也不得询问已经出现、已经否认、明确不知道或已经问过的信息。
+
+结构化事实库：
+{case_context}
+
+尚未解决的决策维度：
+{unresolved_dimensions}
+
+已经问过的决策键：{asked_keys}
+已经问过的问题：
+{asked_questions}
+
+本轮追问阶段检索依据（不含类案；只能按数组下标引用）：
+{basis_rows}
+
+请一次生成 2 至 {max_fields} 个当前信息增益最高、彼此不重复的事实问题；确实只剩一个高价值缺口时可只生成一个。
+问题之间可以混合以下展示类型：
+- short_text：金额、日期、地点、主体名称等简短确定值；
+- long_text：经过、沟通内容、损失等需要叙述的信息；
+- single_choice：只能有一个状态成立；
+- multi_choice：多个状态可以同时成立。
+
+规则：
+1. 只问用户能够陈述的行为事实，不让用户判断违法、违约、侵权、犯罪、责任或证据效力。
+2. 每题只影响一个主要决策目标；不同目标拆成不同字段。
+3. choice 类型必须给 2 至 6 个互不重叠的案情化选项；不得把法律结论当选项。
+4. 每题都允许用户回答“不清楚/无法确认”，required 必须为 false。
+5. question 必须带入本案具体主体、交易、行为、时间或地点锚点，不能照抄通用问卷。
+6. basis_indices 只能引用上方真实依据；没有直接对应依据时留空，不能编造。
+7. decision_effects 只能使用 responsibility、claim_scope、limitation、jurisdiction、procedure、safety。
+8. field_id 使用稳定英文语义键；不得与已经问过的决策键重复。
+9. 不询问证据是否持有。证据需求由事实变化在后台增量生成，事实收敛后集中展示。
+10. “用户希望实现的结果”和“此前联系、投诉、报警或协商的经过”必须拆成两个字段，禁止一题同时承担 claim_scope 和 procedure。
+
+只输出 JSON：
+{{
+  "should_ask": true,
+  "fields": [
+    {{
+      "field_id": "transaction_total",
+      "question": "本案具体问题",
+      "input_type": "short_text",
+      "options": [],
+      "placeholder": "填写提示",
+      "answer_hint": "不知道时如何回答",
+      "decision_effects": ["claim_scope"],
+      "basis_indices": [0],
+      "acknowledged_fact_keys": []
+    }}
+  ]
+}}"""
+
+
+class DynamicFollowupFieldProposal(BaseModel):
+    field_id: str = ""
+    question: str = ""
+    input_type: str = "long_text"
+    options: list[str] = Field(default_factory=list)
+    placeholder: str = ""
+    answer_hint: str = ""
+    decision_effects: list[str] = Field(default_factory=list)
+    basis_indices: list[int] = Field(default_factory=list)
+    acknowledged_fact_keys: list[str] = Field(default_factory=list)
+    required: bool = False
+
+
+class DynamicFollowupBatchProposal(BaseModel):
+    should_ask: bool = False
+    fields: list[DynamicFollowupFieldProposal] = Field(default_factory=list)
+
+
+_ALLOWED_INPUT_TYPES = {"short_text", "long_text", "single_choice", "multi_choice"}
+_ALLOWED_BATCH_EFFECTS = {
+    "responsibility", "claim_scope", "limitation", "jurisdiction",
+    "procedure", "safety",
+}
+
+
+def _batch_reason(effects: list[str]) -> str:
+    labels = [
+        _DECISION_EFFECT_LABELS[item]
+        for item in effects
+        if item in _DECISION_EFFECT_LABELS
+    ]
+    return "、".join(dict.fromkeys(labels)) or "判断下一步处理方式"
+
+
+def _batch_fallback_fields(state: Any, limit: int) -> list[dict[str, Any]]:
+    """Last-resort compatibility fallback; normal batches are model-generated."""
+    candidates, source = build_followup_candidates(state)
+    fallback_basis = [
+        item for item in (getattr(state, "followup_basis_refs", []) or [])
+        if isinstance(item, dict) and item.get("text")
+    ][:2]
+    scores = rank_followup_candidates(
+        [item for item in candidates if item.get("kind") == "facts"],
+        state,
+    )
+    by_id = {str(item.get("id") or ""): item for item in candidates}
+    fields: list[dict[str, Any]] = []
+    for score in scores:
+        if not score.eligible or len(fields) >= limit:
+            continue
+        if {"claim_scope", "procedure"}.issubset(set(score.decision_effects)):
+            continue
+        candidate = by_id.get(score.candidate_id)
+        if not candidate:
+            continue
+        question, hint = _focused_candidate_copy(candidate)
+        question = _single_question(question or candidate.get("seed_question") or "")
+        if not question or _question_is_duplicate(question, list(getattr(state, "asked_details", []) or [])):
+            continue
+        question = _question_punctuation(question)
+        field_id = str(candidate.get("id") or "").strip()
+        input_type = "long_text"
+        options: list[str] = []
+        if "是否" in question:
+            input_type = "single_choice"
+            options = ["是/已经处理", "否/尚未处理", "不清楚/无法确认"]
+        fields.append({
+            "field_id": field_id,
+            "candidate_id": field_id,
+            "question": question,
+            "input_type": input_type,
+            "options": options,
+            "placeholder": hint or "请按您知道的情况填写",
+            "answer_hint": hint or "不清楚时可填写“不清楚”。",
+            "required": False,
+            "decision_effects": score.decision_effects,
+            "reason": _batch_reason(score.decision_effects),
+            "basis_refs": fallback_basis,
+            "official_source": source.model_dump(),
+            "information_gain": score.information_gain,
+            "policy_score": score.net_score,
+        })
+    return fields
+
+
+async def plan_followup_batch(state: Any, llm: Any) -> dict[str, Any]:
+    """Generate a structured, mixed-input batch from live facts and retrieval."""
+    settings = get_settings()
+    max_fields = max(1, int(settings.GUIDE_FOLLOWUP_BATCH_MAX))
+    sufficiency = getattr(state, "decision_sufficiency", {}) or {}
+    unresolved = [
+        item for item in (sufficiency.get("dimensions") or [])
+        if isinstance(item, dict)
+        and not item.get("satisfied")
+        and item.get("effect") != "evidence_gap"
+    ]
+    if not unresolved:
+        return _stop_plan("fact_dimensions_converged")
+
+    safety_gap = next((item for item in unresolved if item.get("effect") == "safety"), None)
+    if safety_gap and getattr(state, "safety_relevant", False):
+        return {
+            "should_ask": True,
+            "plan_kind": "followup_form",
+            "ask_type": "facts",
+            "questions": [{
+                "field_id": "current_safety",
+                "candidate_id": "current_safety",
+                "question": "您现在是否已经脱离现场并处于安全位置？",
+                "input_type": "single_choice",
+                "options": ["我现在安全", "仍有现实危险", "无法确认"],
+                "placeholder": "",
+                "answer_hint": "仍有危险时请先联系 110 或身边可信任的人。",
+                "required": False,
+                "decision_effects": ["safety"],
+                "reason": _batch_reason(["safety"]),
+                "basis_refs": [],
+                "official_source": {},
+            }],
+            "planner_mode": "mandatory_safety_batch",
+        }
+
+    basis_rows = list(getattr(state, "followup_basis_refs", []) or [])[:8]
+    prompt = BATCH_FOLLOWUP_PROMPT.format(
+        case_context=format_case_context(getattr(state, "case_facts", []) or []),
+        unresolved_dimensions=json.dumps(unresolved, ensure_ascii=False, indent=2),
+        asked_keys=json.dumps(list(getattr(state, "asked_decision_keys", []) or []), ensure_ascii=False),
+        asked_questions="\n".join(
+            f"- {item}" for item in (getattr(state, "asked_details", []) or [])
+        ) or "- 暂无",
+        basis_rows=json.dumps(basis_rows, ensure_ascii=False, indent=2),
+        max_fields=max_fields,
+    )
+    try:
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=1800),
+            [SystemMessage(content=prompt)],
+            timeout=settings.GUIDE_LLM_TIMEOUT_FOLLOWUP,
+            stage="followup_batch_planner",
+        )
+        proposal = DynamicFollowupBatchProposal.model_validate(_json_content(response.content))
+    except Exception as exc:
+        logger.warning("动态批量追问生成失败，使用兼容兜底: {}", exc)
+        fallback = _batch_fallback_fields(state, max_fields)
+        return {
+            "should_ask": bool(fallback),
+            "plan_kind": "followup_form",
+            "ask_type": "facts",
+            "questions": fallback,
+            "planner_mode": "catalog_fallback_batch",
+        }
+
+    asked_questions = list(getattr(state, "asked_details", []) or [])
+    asked_keys = set(getattr(state, "asked_decision_keys", []) or [])
+    fields: list[dict[str, Any]] = []
+    used_effects: set[str] = set()
+    for raw in proposal.fields[: max_fields * 2]:
+        field_id = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", raw.field_id).strip("_.:-")[:100]
+        question = " ".join(raw.question.split())[:300]
+        input_type = raw.input_type if raw.input_type in _ALLOWED_INPUT_TYPES else "long_text"
+        effects = [item for item in dict.fromkeys(raw.decision_effects) if item in _ALLOWED_BATCH_EFFECTS]
+        if (
+            not field_id or field_id in asked_keys or not question or not effects
+            or {"claim_scope", "procedure"}.issubset(set(effects))
+            or _question_is_duplicate(question, asked_questions + [item["question"] for item in fields])
+            or _FREE_TEXT_LEGAL_CLAIM.search(question)
+        ):
+            continue
+        # Prefer breadth across independent legal decisions within one compact batch.
+        if used_effects and set(effects).issubset(used_effects) and len(fields) >= int(settings.GUIDE_FOLLOWUP_BATCH_MIN):
+            continue
+        options = [" ".join(str(item).split())[:80] for item in raw.options if str(item).strip()]
+        options = list(dict.fromkeys(options))[:6]
+        if input_type in {"single_choice", "multi_choice"}:
+            if len(options) < 2:
+                input_type, options = "long_text", []
+            elif not any("不清楚" in item or "无法确认" in item for item in options):
+                options = (options + ["不清楚/无法确认"])[:6]
+        else:
+            options = []
+        basis_indices = [
+            index for index in dict.fromkeys(raw.basis_indices)
+            if isinstance(index, int) and 0 <= index < len(basis_rows)
+        ]
+        basis = [basis_rows[index] for index in basis_indices[:3]]
+        fields.append({
+            "field_id": field_id,
+            "candidate_id": "",
+            "question": _question_punctuation(question),
+            "input_type": input_type,
+            "options": options,
+            "placeholder": " ".join(raw.placeholder.split())[:120] or "请按您知道的情况填写",
+            "answer_hint": " ".join(raw.answer_hint.split())[:160] or "不清楚时可填写“不清楚”。",
+            "required": False,
+            "decision_effects": effects,
+            "reason": _batch_reason(effects),
+            "basis_refs": basis,
+            "official_source": {},
+            "acknowledged_fact_keys": raw.acknowledged_fact_keys[:6],
+        })
+        used_effects.update(effects)
+        asked_keys.add(field_id)
+        if len(fields) >= max_fields:
+            break
+
+    if not fields:
+        fields = _batch_fallback_fields(state, max_fields)
+    return {
+        "should_ask": bool(fields),
+        "plan_kind": "followup_form",
+        "ask_type": "facts",
+        "questions": fields,
+        "planner_mode": "dynamic_retrieval_batch" if fields else "no_valid_batch_fields",
+    }

@@ -10,7 +10,16 @@ class _RedisStub:
         self.values = {
             "guide_last_reply:web-user:case-session": "正式业务回复",
             "guide_last_debug:web-user:case-session": json.dumps(
-                {"domain": "consumer_market"},
+                {
+                    "domain": "consumer_market",
+                    "detail_store": [{"key": "transaction.item", "statement": "购买电脑"}],
+                    "followup_form": {
+                        "kind": "followup_form",
+                        "questions": [{"field_id": "paid_amount", "question": "支付金额？"}],
+                    },
+                    "evidence_checklist": [{"id": "proof_target:order", "label": "订单"}],
+                    "evidence_requirement_version": 1,
+                },
                 ensure_ascii=False,
             ),
         }
@@ -78,8 +87,15 @@ async def test_chat_stream_passes_user_context_to_supervisor(monkeypatch):
     assert [item["content"] for item in payloads if item["type"] == "token"] == [
         "正式业务回复"
     ]
+    progress = [item for item in payloads if item["type"] == "progress"]
+    assert progress
+    assert progress[0]["stage"] == "routing"
+    assert progress[-1]["status"] == "completed"
     assert payloads[-1]["type"] == "done"
     assert payloads[-1]["debug"]["domain"] == "consumer_market"
+    assert payloads[-1]["debug"]["detail_store"][0]["key"] == "transaction.item"
+    assert payloads[-1]["debug"]["followup_form"]["questions"][0]["field_id"] == "paid_amount"
+    assert payloads[-1]["debug"]["evidence_requirement_version"] == 1
 
 
 async def _return(value):

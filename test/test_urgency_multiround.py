@@ -16,6 +16,7 @@ from src.agents.legal_guide.graph import (
     node_check_urgency, node_extract_issues, node_prepare_turn, route_after_urgency,
     URGENCY_CRITICAL_RESPONSE, GuideDeps,
 )
+from src.agents.legal_guide.issue_normalizer import is_high_precision_fraud_report
 from langgraph.graph import END
 
 
@@ -70,6 +71,24 @@ def test_current_danger_overrides_safety_phrase():
 
     assert result["urgency_level"] == "critical"
     assert result["phase"] == GuidePhase.END
+
+
+def test_explicit_fraud_report_triggers_stop_loss_without_declaring_crime():
+    assert is_high_precision_fraud_report("我在闲鱼买手机，转账后被拉黑了") is True
+    deps = _make_deps({
+        "urgency": "NORMAL",
+        "safety_relevant": False,
+        "safety_status": "not_applicable",
+        "time_clue": "",
+    })
+    state = GuideState(messages=[HumanMessage(content="我被骗了")])
+
+    result = asyncio.run(node_check_urgency(state, deps))
+
+    assert result["urgency_level"] == "normal"
+    assert result["fraud_stop_loss_relevant"] is True
+    assert "停止继续转账" in result["fraud_stop_loss_warning"]
+    assert "不等于系统已经认定构成犯罪" in result["fraud_stop_loss_warning"]
 
 
 def test_later_evidence_detail_inherits_recent_explicit_safety():

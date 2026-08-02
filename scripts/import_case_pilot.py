@@ -40,7 +40,7 @@ from src.infra.embedding import get_embedding_model  # noqa: E402
 from src.modules.legal.model import LegalCase  # noqa: E402
 
 
-DEFAULT_INPUT = ROOT / "案例数据包" / "cases_pilot.sqlite3"
+DEFAULT_INPUT = ROOT / "data" / "sources" / "case_pilot" / "cases_pilot.sqlite3"
 SCHEMA_FILE = ROOT / "database" / "case_library" / "schema.sql"
 MODEL_FILE = ROOT / "models" / "bm25_case.json"
 COLLECTION_NAME = "case_index"

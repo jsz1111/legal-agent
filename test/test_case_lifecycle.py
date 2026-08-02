@@ -5,7 +5,9 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage
+from fastapi import HTTPException
 
 from src.agents.legal_guide.case_lifecycle import (
     CaseRelation,
@@ -266,6 +268,90 @@ def test_post_conclusion_detail_reopens_the_same_case():
     assert reopened.phase == GuidePhase.ISSUE_SEARCH
     assert reopened.turn_control_intent == "case_detail"
     assert reopened.turn_contains_case_details is True
+
+
+def test_structured_evidence_action_bypasses_boundary_model_and_updates_same_case():
+    state = _completed_case()
+    redis = _Redis()
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=AssertionError("boundary model must not run"))
+    evidence_message = (
+        "【文档证据补充（程序提取，需与原文件核对）】\n"
+        "文件：工资流水.txt\n来源形式：exported_file\n"
+        "原文件 SHA-256：abcdef0123456789\n"
+        "【提取文字】\n2026年7月工资流水"
+    )
+
+    message, reopened, reply = asyncio.run(_prepare_case_turn(
+        message=evidence_message,
+        existing_state=state,
+        thread_id="u:s",
+        user_id="u",
+        llm=llm,
+        redis=redis,
+        state_key="guide_state:u:s",
+        action="submit_evidence",
+        target_case_id="case-old",
+        regenerate_solution=True,
+    ))
+
+    assert reply is None
+    assert message == evidence_message
+    assert reopened.case_id == "case-old"
+    assert reopened.phase == GuidePhase.ISSUE_SEARCH
+    assert reopened.turn_control_intent == "conclude_now"
+    assert reopened.turn_contains_case_details is True
+    assert reopened.case_boundary_audit[-1]["decision_source"] == "structured_case_action"
+    llm.ainvoke.assert_not_awaited()
+
+
+def test_structured_case_action_rejects_stale_case_id():
+    state = _completed_case()
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_prepare_case_turn(
+            message="现在生成方案",
+            existing_state=state,
+            thread_id="u:s",
+            user_id="u",
+            llm=MagicMock(),
+            redis=_Redis(),
+            state_key="guide_state:u:s",
+            action="regenerate_solution",
+            target_case_id="another-case",
+        ))
+
+    assert exc.value.status_code == 409
+
+
+def test_structured_evidence_action_rejects_stale_requirement_id():
+    state = _completed_case().model_copy(update={
+        "evidence_requirements": [{
+            "id": "proof_target:payment",
+            "active": True,
+        }],
+    })
+    evidence_message = (
+        "【文档证据补充（程序提取，需与原文件核对）】\n"
+        "文件：付款记录.txt\n来源形式：exported_file\n"
+        "原文件 SHA-256：abcdef0123456789\n"
+        "【提取文字】\n付款记录"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_prepare_case_turn(
+            message=evidence_message,
+            existing_state=state,
+            thread_id="u:s",
+            user_id="u",
+            llm=MagicMock(),
+            redis=_Redis(),
+            state_key="guide_state:u:s",
+            action="submit_evidence",
+            target_case_id="case-old",
+            evidence_requirement_ids=["proof_target:expired"],
+        ))
+
+    assert exc.value.status_code == 409
 
 
 def test_safety_pause_resumes_same_state_and_preserves_conclusion_control():

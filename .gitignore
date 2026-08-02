@@ -73,7 +73,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
-docs
+.pytest_tmp/
 
 # PyBuilder
 .pybuilder/
@@ -124,7 +124,7 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs documentation
+# mkdocs generated site
 /site
 
 # mypy
@@ -141,8 +141,18 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# Large data files & datasets (296M+, not committed to git)
+# Large data files & datasets (most remain local). The two formerly tracked
+# source packages stay visible after consolidation under data/sources/.
 data/
+!data/
+data/*
+!data/sources/
+data/sources/*
+!data/sources/README.md
+!data/sources/case_pilot/
+!data/sources/case_pilot/**
+!data/sources/legal_statistics/
+!data/sources/legal_statistics/**
 
 # TruLens / local sqlite artifacts
 default.sqlite

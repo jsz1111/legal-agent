@@ -25,7 +25,7 @@ legal_qa_agent
 
 ## 一、数据源
 
-**数据包**：`nl2sql数据包/`
+**数据包**：`data/sources/legal_statistics/`
 
 | 项目 | 值 |
 |---|---|

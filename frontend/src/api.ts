@@ -2,6 +2,48 @@ export const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') ||
   'http://127.0.0.1:8085'
 
+export type FollowupQuestion = {
+  field_id: string
+  question: string
+  input_type: 'short_text' | 'long_text' | 'single_choice' | 'multi_choice'
+  options?: string[]
+  placeholder?: string
+  answer_hint?: string
+  required?: boolean
+  reason?: string
+  decision_effects?: string[]
+  basis_refs?: Array<{
+    title?: string
+    article_no?: string
+    source_type?: string
+    text?: string
+    issuer?: string
+    url?: string
+  }>
+}
+
+export type EvidenceRequirement = {
+  id: string
+  label: string
+  proof_target?: string
+  priority?: string
+  status?: string
+  alternatives?: string[]
+  quality_gaps?: string[]
+  next_action?: string
+  trigger_fact_keys?: string[]
+  basis_refs?: Array<{
+    title?: string
+    article_no?: string
+    source_type?: string
+    text?: string
+    issuer?: string
+    url?: string
+    law_id?: string
+  }>
+  version?: number
+}
+
 export type DebugInfo = {
   case_id?: string
   case_boundary_status?: string
@@ -11,10 +53,38 @@ export type DebugInfo = {
   case_hits?: string
   graph_laws?: Array<Record<string, unknown> | string>
   graph_channels?: Array<Record<string, unknown> | string>
+  followup_basis_refs?: Array<{
+    title?: string
+    article_no?: string
+    source_type?: string
+    text?: string
+    issuer?: string
+    url?: string
+  }>
+  followup_basis_error?: string
   fallback_guide?: {
     platform?: string
     url?: string
     search_tips?: string
+  } | null
+  detail_store?: Array<Record<string, unknown>>
+  followup_form?: {
+    kind?: 'followup_form' | 'evidence_collection'
+    questions?: FollowupQuestion[]
+    planner_mode?: string
+    can_answer_in_chat?: boolean
+    can_conclude_now?: boolean
+  } | null
+  evidence_checklist?: EvidenceRequirement[]
+  evidence_requirement_version?: number
+  evidence_evaluation_version?: number
+  solution_version?: number
+  solution_evidence_version?: number
+  convergence?: {
+    facts_converged?: boolean
+    unresolved_dimensions?: Array<Record<string, unknown>>
+    reason?: string
+    user_can_conclude_now?: boolean
   } | null
 }
 
@@ -63,16 +133,27 @@ export type DocumentArtifact = {
 export type ChatResult = {
   reply: string
   session_id: string
+  resolved_mode?: 'auto' | 'qa' | 'case'
+  mode_locked?: boolean
   debug?: DebugInfo | null
   statistics?: Statistics | null
   document?: DocumentArtifact | null
 }
 
 export type ChatEvent =
+  | {
+      type: 'progress'
+      stage?: string
+      label?: string
+      detail?: string
+      status?: 'active' | 'completed'
+    }
   | { type: 'token'; content?: string }
   | {
       type: 'done'
       session_id?: string
+      resolved_mode?: 'auto' | 'qa' | 'case'
+      mode_locked?: boolean
       debug?: DebugInfo | null
       statistics?: Statistics | null
       document?: DocumentArtifact | null
@@ -137,6 +218,11 @@ type ChatRequest = {
   user_id: string
   session_id: string
   message: string
+  mode?: 'auto' | 'qa' | 'case'
+  action?: 'message' | 'submit_evidence' | 'regenerate_solution'
+  target_case_id?: string
+  regenerate_solution?: boolean
+  evidence_requirement_ids?: string[]
 }
 
 export async function getHealth(): Promise<HealthResponse> {

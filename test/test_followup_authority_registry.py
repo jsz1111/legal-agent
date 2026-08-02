@@ -59,7 +59,7 @@ def test_every_domain_has_sources_and_every_rule_has_a_citation():
     assert set(DOMAIN_SOURCE_KEYS) == set(catalog.domains)
     assert expected_rule_ids == citation_rule_ids
     assert len(sources) == 18
-    assert len(citations) == 115
+    assert len(citations) == 116
 
 
 def test_official_local_files_pass_integrity_check_without_claiming_legal_review():
@@ -86,8 +86,8 @@ def test_mapping_status_distinguishes_file_level_and_system_guidance():
 
 def test_authority_index_rows_keep_traceability_fields():
     rows = build_authority_index_rows()
-    assert len(rows) == 115
-    assert len({row["id"] for row in rows}) == 115
+    assert len(rows) == 116
+    assert len({row["id"] for row in rows}) == 116
     assert all(row["rule_id"] and row["source_key"] and row["source_url"] for row in rows if row["domain"] != "other")
     assert all("依据来源：" in row["text"] for row in rows)
 

@@ -156,21 +156,13 @@ async def _persist_legal_qa_turn(
     )
 
 
-@tool
-async def call_legal_qa_agent(
+async def call_legal_qa_agent_impl(
     message: str,
-    runtime: ToolRuntime[UserContext],
+    *,
+    user_id: str,
+    session_id: str,
 ) -> str:
-    """
-    调用法律知识问答Agent，回答法律知识类问题。
-    适用场景：询问法律概念、法条含义、制度性知识、维权流程等通用法律知识时。
-    示例："劳动仲裁的流程是什么"、"什么是诉讼时效"、"合同解除需要哪些条件"
-
-    Args:
-        message: 用户的法律知识问题
-    """
-    user_id = runtime.context.user_id
-    session_id = runtime.context.session_id
+    """Run one isolated legal-Q&A turn outside the Supervisor when mode is locked."""
     redis = get_checkpointer_redis()
     original_message_key = f"current_user_message:{user_id}:{session_id}"
     raw_original_message = await redis.get(original_message_key)
@@ -253,6 +245,26 @@ async def call_legal_qa_agent(
         artifact=artifact,
     )
     return reply
+
+
+@tool
+async def call_legal_qa_agent(
+    message: str,
+    runtime: ToolRuntime[UserContext],
+) -> str:
+    """
+    调用法律知识问答Agent，回答法律知识类问题。
+    适用场景：询问法律概念、法条含义、制度性知识、维权流程等通用法律知识时。
+    示例："劳动仲裁的流程是什么"、"什么是诉讼时效"、"合同解除需要哪些条件"
+
+    Args:
+        message: 用户的法律知识问题
+    """
+    return await call_legal_qa_agent_impl(
+        message,
+        user_id=runtime.context.user_id,
+        session_id=runtime.context.session_id,
+    )
 
 
 @tool

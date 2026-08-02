@@ -23,6 +23,7 @@ from langchain_core.messages import SystemMessage
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from src.agents.legal_guide.case_model import active_case_facts
 from src.agents.legal_guide.followup_catalog import (
     EvidenceFollowup,
     evidence_rule_resolved,
@@ -309,6 +310,102 @@ def _comes_from_uploaded_block(source_excerpt: str, user_text: str) -> bool:
     return False
 
 
+def _deterministic_uploaded_quality(
+    *,
+    file_name: str,
+    source_form: str,
+    content: str,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Conservatively retain visible attachment qualities when the LLM fails.
+
+    These rules only describe observable document features.  They never decide
+    authenticity, admissibility, liability or whether a stated event is true.
+    """
+
+    normalized = "\n".join(line.strip() for line in content.splitlines() if line.strip())
+    compact = "".join(normalized.split())
+    lower_name = file_name.lower()
+    copy_markers = (
+        "转录", "重构", "节选", "复制件", "复印件", "不是原始", "不是银行",
+        "不是平台", "不是微信原始", "不是合同原件", "不是事故认定书",
+    )
+    visible_source_form = source_form
+    if any(marker in compact for marker in copy_markers):
+        visible_source_form = "copy"
+    elif "截图" in compact or lower_name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        visible_source_form = "screenshot"
+
+    is_partial = truncated or any(
+        marker in compact
+        for marker in (*copy_markers, "仅提取前部文字", "部分内容", "摘要")
+    )
+    date_visible = bool(re.search(
+        r"(?:19|20)\d{2}(?:[-年/.]\d{1,2})?(?:[-月/.]\d{1,2})?",
+        normalized,
+    ))
+    identity_visible = bool(re.search(
+        r"(?:账号|账户|主体|卖家|买家|委托人|代购人|员工|主管|出租人|承租人|"
+        r"驾驶人|收款方|付款方|用人单位)[^\n：:]{0,12}[：:]",
+        normalized,
+    )) or bool(re.search(r"\b(?:U|S|M|L|E)-\d{2}\b", normalized))
+
+    if re.search(r"(?:公开原型|公开案例|公开裁判|公开典型案例|公开案件).{0,20}(?:来源|重构)", compact):
+        acquisition = "third_party"
+    elif re.search(r"(?:平台|银行|支付机构|医院|交管部门|鉴定机构).{0,12}(?:导出|出具)", compact):
+        acquisition = "platform_or_institution_export"
+    elif any(marker in compact for marker in ("本人整理", "用户整理", "自行制作")):
+        acquisition = "user_created"
+    else:
+        acquisition = "unknown"
+
+    reference_only = any(
+        marker in compact
+        for marker in ("空白模板", "空白表格", "纯参考资料", "办事指南", "示范文本")
+    )
+    specific_signals = sum((
+        date_visible,
+        bool(re.search(r"(?:人民币)?\d+(?:\.\d+)?元|金额[：:]|费用[：:]", normalized)),
+        bool(re.search(r"(?:流水号|订单号|案件编号|票据编号|账号|账户)[：:]", normalized)),
+        identity_visible,
+    ))
+    case_specificity = (
+        "blank_or_reference"
+        if reference_only and specific_signals < 2
+        else "case_specific"
+        if specific_signals >= 2
+        else "unclear"
+    )
+
+    role_patterns = {
+        "relationship": r"劳动关系|劳务关系|租赁关系|雇佣关系|双方关系|用人单位",
+        "transaction": r"订单|购买|交易|商品|票款",
+        "agreement": r"合同|协议|约定|委托|承诺",
+        "payment": r"付款|支付|转账|金额|流水|工资|押金|票款|佣金",
+        "event": r"事故|发货|交付|搬离|退租|到岗|解除|相撞",
+        "problem": r"未发货|未交付|未支付|未退款|拒绝|拖欠|损坏|失联",
+        "identity": r"账号|账户|主体|卖家|买家|委托人|代购人|员工|主管|出租人|承租人|驾驶人",
+        "communication": r"聊天|微信|短信|沟通|回复|承诺",
+        "procedure": r"报警|投诉|仲裁|事故认定|鉴定意见|调解|起诉",
+        "harm": r"受伤|伤情|医疗|病历|护理|营养|误工",
+        "loss": r"损失|费用|金额|工资|押金|医疗费|误工费|护理费|营养费",
+    }
+    roles = [role for role, pattern in role_patterns.items() if re.search(pattern, normalized)]
+    if date_visible:
+        roles.append("time")
+    anchor = next((line for line in normalized.splitlines() if line), file_name)[:240]
+    return {
+        "source_form": visible_source_form,
+        "completeness": "partial" if is_partial else "unknown",
+        "identity_visibility": "clear" if identity_visible else "unknown",
+        "time_visibility": "clear" if date_visible else "unknown",
+        "acquisition_method": acquisition,
+        "case_specificity": case_specificity,
+        "proof_roles": _unique(roles)[:8],
+        "source_text": anchor,
+    }
+
+
 def split_uploaded_evidence_blocks(
     user_text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -343,6 +440,10 @@ def split_uploaded_evidence_blocks(
             continue
         file_name = file_match.group(1).strip()[:180]
         source_match = re.search(r"(?m)^来源形式：([a-z_]+)\s*$", stripped)
+        requirement_match = re.search(r"(?m)^清单项ID：([^\s]+)\s*$", stripped)
+        requirement_label_match = re.search(r"(?m)^清单项：(.+?)\s*$", stripped)
+        requirement_id = requirement_match.group(1).strip() if requirement_match else ""
+        rule_id = requirement_id.split("proof_target:", 1)[-1] if requirement_id else ""
         source_form = (
             source_match.group(1)
             if source_match and source_match.group(1) in ALLOWED_SOURCE_FORMS
@@ -355,19 +456,25 @@ def split_uploaded_evidence_blocks(
             content_excerpt = stripped.split("【提取文字】", 1)[1].strip()
         else:
             content_excerpt = stripped[digest_match.end():].strip()
+        deterministic_quality = _deterministic_uploaded_quality(
+            file_name=file_name,
+            source_form=source_form,
+            content=content_excerpt,
+            truncated=truncated,
+        )
         observations.append({
             "name": file_name,
-            "source_form": source_form,
-            "completeness": "partial" if truncated else "unknown",
-            "identity_visibility": "unknown",
-            "time_visibility": "unknown",
-            "acquisition_method": "unknown",
-            "proof_roles": [],
-            "source_text": file_name,
+            **deterministic_quality,
             "uploaded_copy": True,
             "content_digest": digest_match.group(1).lower(),
             "content_excerpt": content_excerpt[:1_200],
             "material_claims": _structured_material_claims(content_excerpt),
+            "requirement_id": requirement_id,
+            "requirement_label": (
+                requirement_label_match.group(1).strip()[:180]
+                if requirement_label_match else ""
+            ),
+            "rule_id": rule_id,
         })
     narrative = "\n\n".join(narrative_parts).strip()
     return narrative, observations
@@ -596,7 +703,33 @@ def merge_evidence_observations(
     rules = get_domain_followups(domain).evidence
     for observation in observations:
         matched_key = ""
+        explicit_rule = next(
+            (
+                item for item in rules
+                if item.id == str(observation.get("rule_id") or "")
+            ),
+            None,
+        )
+        if explicit_rule:
+            matched_key = explicit_rule.id
+            if matched_key not in result:
+                result[matched_key] = {
+                    "rule_id": explicit_rule.id,
+                    "evidence_key": explicit_rule.evidence_key,
+                    "canonical_item": explicit_rule.item,
+                    "availability": "uploaded_copy",
+                    "authenticity": "not_verified",
+                    "relevance": "potentially_relevant",
+                    "legal_admissibility": "not_determined",
+                    "purpose": explicit_rule.purpose,
+                    "alternatives": list(explicit_rule.alternatives),
+                    "limitations": [],
+                    "answer_excerpt": observation.get("source_text", ""),
+                    "requirement_id": observation.get("requirement_id", ""),
+                }
         for key, record in result.items():
+            if matched_key:
+                break
             rule = next(
                 (
                     item for item in rules
@@ -645,6 +778,7 @@ def merge_evidence_observations(
             "case_specificity",
             "content_digest",
             "material_claims",
+            "requirement_id",
         ):
             value = observation.get(field, "unknown")
             if value != "unknown":
@@ -794,9 +928,16 @@ def evaluate_evidence(
         basis_by_item: dict[str, str] = {}
         for item in items:
             record = records_by_id.get(item.id, {})
+            bound_target_id = str(record.get("requirement_id") or "")
+            if bound_target_id and bound_target_id != target.id:
+                # A user-selected upload channel is an explicit scope choice.
+                # Do not broaden that material to other proof targets merely
+                # because generic keywords or model-proposed roles overlap.
+                continue
             direct_rule_match = (
                 record.get("rule_id") == rule.id
                 or record.get("evidence_key") == rule.evidence_key
+                or bound_target_id == target.id
             )
             catalog_match = evidence_rule_resolved(rule, [item.name])
             target_roles = EVIDENCE_KEY_PROOF_ROLES.get(
@@ -927,6 +1068,105 @@ def evaluate_state_evidence(state: Any) -> EvidenceEvaluationReport:
         confirmed_items=getattr(state, "evidence_confirmed", []) or [],
         unavailable_items=getattr(state, "evidence_unavailable", []) or [],
     )
+
+
+def merge_evidence_requirements(
+    state: Any,
+    report: EvidenceEvaluationReport,
+    *,
+    basis_refs: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Incrementally version the user-facing evidence checklist.
+
+    The coverage engine owns the current proof targets.  This function adds
+    case-fact provenance, legal/official basis and stable version semantics so
+    the checklist can evolve without recreating duplicate rows every turn.
+    """
+
+    previous = {
+        str(item.get("id") or ""): dict(item)
+        for item in (getattr(state, "evidence_requirements", []) or [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    current_round = int(getattr(state, "round", 0) or 0)
+    active_facts = [
+        item for item in active_case_facts(getattr(state, "case_facts", []) or [])
+        if item.get("status") in {"asserted", "uncertain", "conflicted"}
+    ]
+    fact_keys = [str(item.get("key") or "") for item in active_facts if item.get("key")]
+    coverage_by_target = {item.target_id: item for item in report.coverage}
+    rules = {
+        rule.id: rule
+        for rule in get_domain_followups(str(getattr(state, "legal_domain", "") or "other")).evidence
+    }
+    normalized_basis = []
+    for item in basis_refs or []:
+        if not isinstance(item, dict):
+            continue
+        ref = {
+            "title": str(item.get("title") or "").strip(),
+            "article_no": str(item.get("article_no") or "").strip(),
+            "source_type": str(item.get("source_type") or "statute").strip(),
+            "text": str(item.get("text") or "").strip()[:1_200],
+            "issuer": str(item.get("issuer") or "").strip()[:200],
+            "url": str(item.get("url") or "").strip()[:1_000],
+            "law_id": str(item.get("law_id") or "").strip()[:200],
+        }
+        if ref["title"] or ref["article_no"]:
+            normalized_basis.append(ref)
+    normalized_basis.sort(key=lambda ref: (
+        0
+        if ref["source_type"] in {"official_process", "official_evidence_guidance"}
+        and ref["url"]
+        else 1,
+        0 if ref["text"] else 1,
+    ))
+    normalized_basis = normalized_basis[:3]
+
+    rows: list[dict[str, Any]] = []
+    changed = False
+    active_ids: set[str] = set()
+    for target in report.targets:
+        requirement_id = target.id
+        active_ids.add(requirement_id)
+        coverage = coverage_by_target.get(requirement_id)
+        rule = rules.get(target.rule_id)
+        old = previous.get(requirement_id, {})
+        row = {
+            "id": requirement_id,
+            "rule_id": target.rule_id,
+            "label": target.label,
+            "proof_target": target.purpose,
+            "priority": "required" if target.required_for_planning else "recommended",
+            "status": coverage.status if coverage else "unresolved",
+            "supporting_evidence_ids": list(coverage.supporting_evidence_ids) if coverage else [],
+            "quality_gaps": list(coverage.quality_gaps) if coverage else [],
+            "next_action": coverage.next_action if coverage else "先确认是否持有该类材料。",
+            "alternatives": list(rule.alternatives[:4]) if rule else [],
+            "trigger_fact_keys": fact_keys[-12:],
+            "basis_refs": normalized_basis,
+            "active": True,
+            "created_round": int(old.get("created_round") or current_round),
+            "updated_round": current_round,
+        }
+        comparable = {key: value for key, value in row.items() if key not in {"updated_round"}}
+        old_comparable = {key: value for key, value in old.items() if key not in {"updated_round", "version"}}
+        if comparable != old_comparable:
+            changed = True
+        rows.append(row)
+
+    for requirement_id, old in previous.items():
+        if requirement_id in active_ids or not old.get("active", True):
+            continue
+        changed = True
+        rows.append({**old, "active": False, "updated_round": current_round})
+
+    version = int(getattr(state, "evidence_requirement_version", 0) or 0)
+    if changed or not version:
+        version += 1
+    for row in rows:
+        row["version"] = version
+    return rows[-80:], version
 
 
 def coverage_for_rule(

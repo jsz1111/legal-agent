@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     GUIDE_MAX_LOW_INFO_ANSWERS: int = 3   # 连续三次真正无进展后停止盘问
     GUIDE_MAX_COUNTER_QUESTIONS: int = 3  # 连续只反问 3 次后按现有信息收敛
     GUIDE_MAX_TOTAL_ROUNDS: int = 20      # 仅作异常循环保险，不作为普通收敛依据
+    GUIDE_FOLLOWUP_BATCH_MIN: int = 2     # 普通轮次尽量批量询问的最少问题数
+    GUIDE_FOLLOWUP_BATCH_MAX: int = 5     # 单轮动态表单最多问题数
     GUIDE_SESSION_TTL: int = 0             # 案件状态保留秒数；0 表示仅由用户手动删除
     GUIDE_DOCUMENT_TTL: int = 86400        # 生成文书下载对象保留 24 小时
     GUIDE_CASE_BOUNDARY_CONFIDENCE: float = 0.72  # 低于该置信度时不继承旧案，先向用户确认
@@ -45,7 +47,7 @@ class Settings(BaseSettings):
     GUIDE_LLM_TIMEOUT_URGENCY: float = 10.0
     GUIDE_LLM_TIMEOUT_EXTRACT: float = 15.0
     GUIDE_LLM_TIMEOUT_PARSE: float = 15.0
-    GUIDE_LLM_TIMEOUT_FOLLOWUP: float = 8.0
+    GUIDE_LLM_TIMEOUT_FOLLOWUP: float = 0.0  # 0 表示动态追问生成暂不设置超时
     GUIDE_LLM_TIMEOUT_CONCLUDE: float = 35.0
     GUIDE_LLM_TIMEOUT_AUDIT: float = 8.0
     GUIDE_LLM_TIMEOUT_BOUNDARY: float = 10.0

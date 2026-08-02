@@ -1,0 +1,312 @@
+{
+  "run_id": "20260802-003900-614189",
+  "user_id": "codex-evidence-concurrency-20260802-003900-614189",
+  "base_url": "http://127.0.0.1:8085",
+  "health": {
+    "status": "ok",
+    "dependencies": {
+      "postgres": {
+        "ok": true,
+        "error": ""
+      },
+      "redis": {
+        "ok": true,
+        "error": ""
+      },
+      "minio": {
+        "ok": true,
+        "error": ""
+      },
+      "milvus": {
+        "ok": true,
+        "error": ""
+      },
+      "neo4j": {
+        "ok": true,
+        "error": ""
+      }
+    }
+  },
+  "wall_seconds": 123.306,
+  "sum_case_seconds": 491.14,
+  "parallelism_factor": 3.983,
+  "session_ids": {
+    "01_secondhand_phone": "01_secondhand_phone-20260802-003900-614189",
+    "02_concert_ticket": "02_concert_ticket-20260802-003900-614189",
+    "03_overtime_wage": "03_overtime_wage-20260802-003900-614189",
+    "04_rental_deposit": "04_rental_deposit-20260802-003900-614189",
+    "05_traffic_injury": "05_traffic_injury-20260802-003900-614189"
+  },
+  "unique_case_ids": true,
+  "cases": [
+    {
+      "group": "01_secondhand_phone",
+      "case_id": "e46388b2ea9441fea95d394ec2a26d6d",
+      "domain": "criminal_public_security",
+      "elapsed_seconds": 122.927,
+      "evidence_evaluation_version": 1,
+      "solution_version": 1,
+      "solution_evidence_version": 0,
+      "evidence_items": [
+        {
+          "id": "evidence_b8d4e950b8eb",
+          "name": "evidence_payment_and_chat.txt",
+          "availability": "uploaded_copy",
+          "source_form": "native_electronic",
+          "completeness": "unknown",
+          "identity_visibility": "unknown",
+          "time_visibility": "unknown",
+          "acquisition_method": "unknown",
+          "case_specificity": "unknown",
+          "proof_roles": [],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "evidence_payment_and_chat.txt",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "unresolved": 2
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 2
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 0
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": false,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": false
+      },
+      "passed": false
+    },
+    {
+      "group": "02_concert_ticket",
+      "case_id": "d0234041f1ca4b5f8960d5cdc23f4e99",
+      "domain": "other",
+      "elapsed_seconds": 52.071,
+      "evidence_evaluation_version": 0,
+      "solution_version": 1,
+      "solution_evidence_version": 0,
+      "evidence_items": [],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "unresolved": 2
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 2
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 0
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": false,
+        "evaluation_version_incremented": false,
+        "uploaded_material_retained_in_state": false,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": false
+    },
+    {
+      "group": "03_overtime_wage",
+      "case_id": "6eb473186373471e98523e5dd5f5f631",
+      "domain": "labor_social_security",
+      "elapsed_seconds": 82.589,
+      "evidence_evaluation_version": 0,
+      "solution_version": 1,
+      "solution_evidence_version": 0,
+      "evidence_items": [],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "unresolved": 2
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 2
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 0
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": false,
+        "evaluation_version_incremented": false,
+        "uploaded_material_retained_in_state": false,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": false
+    },
+    {
+      "group": "04_rental_deposit",
+      "case_id": "10c1bcdde6eb4da38ca65c65d6e16cb8",
+      "domain": "contracts_property_housing",
+      "elapsed_seconds": 121.496,
+      "evidence_evaluation_version": 1,
+      "solution_version": 1,
+      "solution_evidence_version": 0,
+      "evidence_items": [
+        {
+          "id": "evidence_0ddaaaae54d8",
+          "name": "evidence_contract_handover.txt",
+          "availability": "uploaded_copy",
+          "source_form": "native_electronic",
+          "completeness": "partial",
+          "identity_visibility": "unclear",
+          "time_visibility": "clear",
+          "acquisition_method": "unknown",
+          "case_specificity": "case_specific",
+          "proof_roles": [
+            "relationship",
+            "payment",
+            "event",
+            "communication"
+          ],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "evidence_contract_handover.txt",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "unresolved": 0
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 0
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 0
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": false,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": false
+      },
+      "passed": false
+    },
+    {
+      "group": "05_traffic_injury",
+      "case_id": "03bac1aedbc24e28b43f39e0390ebc2f",
+      "domain": "traffic_personal_injury",
+      "elapsed_seconds": 112.057,
+      "evidence_evaluation_version": 1,
+      "solution_version": 1,
+      "solution_evidence_version": 0,
+      "evidence_items": [
+        {
+          "id": "evidence_389352127fbc",
+          "name": "evidence_accident_medical.txt",
+          "availability": "uploaded_copy",
+          "source_form": "native_electronic",
+          "completeness": "unknown",
+          "identity_visibility": "unknown",
+          "time_visibility": "unknown",
+          "acquisition_method": "unknown",
+          "case_specificity": "unknown",
+          "proof_roles": [],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "evidence_accident_medical.txt",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "unresolved": 2
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 0,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 2
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 0
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": true,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": false
+      },
+      "passed": false
+    }
+  ],
+  "passed": false
+}

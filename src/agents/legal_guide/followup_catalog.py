@@ -135,6 +135,7 @@ def assess_fact_answer(
         previous
         and previous.get("value")
         and previous.get("value") != value
+        and previous.get("status") not in {"ambiguous", "unknown"}
         and status not in {"unknown", "corrected"}
     ):
         status = "conflicted"

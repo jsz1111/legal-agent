@@ -53,12 +53,22 @@ class GuideState(BaseModel):
     followup_plan: dict = Field(default_factory=dict)             # assess_retrieve 动态生成，ask_followup 负责展示
     followup_decision_trace: list[dict] = Field(default_factory=list)
     decision_sufficiency: dict = Field(default_factory=dict)
+    followup_basis_refs: list[dict] = Field(default_factory=list)  # 追问阶段轻量检索依据；明确不含类案
+    followup_basis_graph: list[dict] = Field(default_factory=list)
+    followup_basis_fingerprint: str = ""
+    followup_basis_error: str = ""
+    evidence_collection_offered: bool = False
     issue_refresh_needed: bool = False                            # 主动补充超出原追问范围时重跑问题/领域识别
     asked_decision_keys: list[str] = Field(default_factory=list)  # 已追问的法律决策点，跨问法去重
     fact_records: dict[str, dict] = Field(default_factory=dict)   # 用户陈述的清晰度/冲突状态，不代表已查证
     evidence_assessments: dict[str, dict] = Field(default_factory=dict) # 存在性、相关性、真实性和可采性分层
     evidence_items: list[dict] = Field(default_factory=list)      # 结构化证据项及其来源、完整性等基础属性
     proof_targets: list[dict] = Field(default_factory=list)       # 当前领域需要覆盖的证明目标
+    evidence_requirements: list[dict] = Field(default_factory=list) # 随事实增量维护的证据准备清单
+    evidence_requirement_version: int = 0
+    evidence_evaluation_version: int = 0  # 每次收到附件后递增；重复提交也形成新评估版本
+    solution_version: int = 0              # 每次生成或更新维权方案后递增
+    solution_evidence_version: int = 0     # 当前方案已纳入的证据评估版本
     evidence_links: list[dict] = Field(default_factory=list)      # 证据项与证明目标之间的可解释关联
     evidence_coverage: dict = Field(default_factory=dict)         # 证明目标覆盖、缺口和补强建议
     evidence_unavailable: list[str] = Field(default_factory=list) # 用户明确表示没有的证据
@@ -95,6 +105,9 @@ class GuideState(BaseModel):
     current_safety_status: str = "not_applicable"  # danger / safe / unknown / not_applicable
     safety_pause_active: bool = False     # 现实危险处理中暂停普通流程；确认安全后恢复同一案件
     safety_pause_case_message: str = ""   # 暂停前的原始危险陈述，恢复后归入同一案件
+    fraud_stop_loss_relevant: bool = False  # 高确定性诈骗表述需要展示紧急止损提示
+    fraud_stop_loss_warning: str = ""       # 尚未向用户展示的止付、冻结、报警提示
+    fraud_stop_loss_offered: bool = False   # 同一案件已展示过止损提示，避免每轮重复
     time_warning: str = ""             # 时效提醒文案（由 check_urgency 生成）
     clarify_rounds: int = 0            # 澄清轮数（上限 2 轮）
     ask_rounds: int = 0                # 事实+证据追问总轮数

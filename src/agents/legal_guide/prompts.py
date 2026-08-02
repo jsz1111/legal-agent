@@ -181,6 +181,7 @@ PARSE_DETAILS_PROMPT = """从用户回答中提取关键信息，并形成可跨
 {{
   "is_answer": true,
   "answers_asked_question": true,
+  "answered_question_ids": ["本轮确实得到回答的问题ID；普通单问题无ID时留空"],
   "user_question": "用户的反问原文，无则空字符串",
   "collected_facts": ["本轮回答中可用于案件分析的客观事实，如金额、时间、身份关系、行为经过"],
   "case_updates": [
@@ -229,7 +230,8 @@ PARSE_DETAILS_PROMPT = """从用户回答中提取关键信息，并形成可跨
 9. 本节点只解析回答中的事实和证据，不新增或升级法律问题；违法、违约、侵权、犯罪及责任成立与否均交给检索后的法律判断。
 10. 用户即使同时说“不要再问”“现在生成方案”，只要还提供了事实或证据，is_answer 仍为 true，并照常提取这些内容；流程控制指令不等于没有回答。
 11. evidence_details 只结构化用户明确说出的材料属性和 proof_roles，不得根据材料类型自行猜测。proof_roles 只能从 relationship/transaction/agreement/payment/event/problem/identity/time/communication/procedure/harm/loss/liability/ownership/infringement 中选择。没有逐字 source_text 锚点的属性一律填 unknown；不要在这里判断真实性、合法性、可采性或证明力。
-12. 每份材料只生成一条 evidence_details 和一条 category=evidence 的 case_update；材料里能看到的名称、金额、日期、是否裁剪等是材料属性，不得拆成新的证据项。"""
+12. 每份材料只生成一条 evidence_details 和一条 category=evidence 的 case_update；材料里能看到的名称、金额、日期、是否裁剪等是材料属性，不得拆成新的证据项。
+13. 批量问题带有方括号问题ID时，answered_question_ids 只列出用户本轮实际回答的ID；未回答、留空或只反问的ID不得列入。"""
 
 
 # ── 6. 生成行动方案（conclude节点用） ──────────────────────────────────────
@@ -550,7 +552,7 @@ EVIDENCE_TEMPLATES: dict[str, list[str]] = {
         "伤情诊断证明 / 医疗费票据",
         "对方保险信息",
     ],
-    # ── 以下 3 领域为通用兜底清单（待权威化，见项目说明.md）────────────
+    # ── 以下 3 领域为通用兜底清单（待权威化，见法律智能体项目说明书.md）──
     "intellectual_property": [
         "权属证明（商标注册证/著作权登记/专利证书）",
         "侵权实物或页面截图并公证",

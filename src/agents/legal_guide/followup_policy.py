@@ -26,7 +26,7 @@ SLOT_DECISION_EFFECTS: dict[str, tuple[str, ...]] = {
     "employment_status": ("limitation", "procedure", "claim_scope"),
     "legal_relationship": ("responsibility", "jurisdiction", "procedure"),
     "transaction": ("responsibility", "claim_scope", "jurisdiction"),
-    "claim": ("claim_scope", "procedure"),
+    "claim": ("claim_scope",),
     "procedure": ("procedure", "jurisdiction"),
     "event_and_liability": ("responsibility", "procedure"),
     "insurance_and_claim": ("responsibility", "claim_scope", "procedure"),

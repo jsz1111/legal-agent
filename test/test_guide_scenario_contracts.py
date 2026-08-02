@@ -301,7 +301,7 @@ def test_statute_citation_whitelist_does_not_treat_document_title_as_law():
 
 
 def test_evaluator_only_reads_titles_inside_law_section():
-    from scripts.evaluate_guide_scenarios import _reply_law_names
+    from test.evaluate_guide_scenarios import _reply_law_names
 
     reply = (
         "**【法律依据】**\n"
@@ -928,6 +928,20 @@ def test_issue_extraction_uses_high_precision_wage_fallback_on_invalid_json():
     assert result.issues == ["拖欠劳动报酬"]
     assert result.domain == "labor_social_security"
     assert result.facts == ["公司欠我工资。"]
+
+
+def test_issue_extraction_uses_contract_nonperformance_fallback_on_invalid_json():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content="not-json"))
+
+    result = asyncio.run(extract_legal_issues(
+        "我委托对方代购门票并支付4000元，双方约定未交付就退款，但对方没有退款。",
+        llm,
+    ))
+
+    assert result.issues == ["合同履行与退款争议"]
+    assert result.domain == "contracts_property_housing"
+    assert result.degraded is True
 
 
 def test_structured_intake_uses_form_facts_and_compact_domain_classification():

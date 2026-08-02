@@ -3,6 +3,7 @@ import json
 
 from src.agents.legal_guide.graph import run_guide, build_guide_deps
 from src.agents.legal_guide.state import GuidePhase
+from src.agents.legal_guide.debug_view import guide_debug_payload
 from src.core.config import get_settings
 from src.infra.redis_cache import get_checkpointer_redis, set_with_optional_ttl
 from src.infra.database import AsyncSessionLocal
@@ -46,15 +47,7 @@ async def call_guide_agent_impl(
 
     # 保存调试信息 + guide_agent原始回复（供路由层透传，短TTL）
     try:
-        debug_data = {
-            "domain":           new_state.legal_domain or "",
-            "confidence_tier":  new_state.confidence_tier or "",
-            "statute_hits":     new_state.law_context_str or "",
-            "case_hits":        new_state.case_context_str or "",
-            "graph_laws":       new_state.candidate_laws or [],
-            "graph_channels":   new_state.relevant_channels or [],
-            "fallback_guide":   new_state.fallback_guide,
-        }
+        debug_data = guide_debug_payload(new_state)
         await redis.set(
             _save_debug_key(user_id, session_id),
             json.dumps(debug_data, ensure_ascii=False),

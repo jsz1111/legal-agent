@@ -1,0 +1,396 @@
+{
+  "run_id": "20260802-011632-0c01f7",
+  "user_id": "codex-evidence-concurrency-20260802-011632-0c01f7",
+  "base_url": "http://127.0.0.1:8085",
+  "health": {
+    "status": "ok",
+    "dependencies": {
+      "postgres": {
+        "ok": true,
+        "error": ""
+      },
+      "redis": {
+        "ok": true,
+        "error": ""
+      },
+      "minio": {
+        "ok": true,
+        "error": ""
+      },
+      "milvus": {
+        "ok": true,
+        "error": ""
+      },
+      "neo4j": {
+        "ok": true,
+        "error": ""
+      }
+    }
+  },
+  "wall_seconds": 205.992,
+  "sum_case_seconds": 929.819,
+  "parallelism_factor": 4.514,
+  "session_ids": {
+    "01_secondhand_phone": "01_secondhand_phone-20260802-011632-0c01f7",
+    "02_concert_ticket": "02_concert_ticket-20260802-011632-0c01f7",
+    "03_overtime_wage": "03_overtime_wage-20260802-011632-0c01f7",
+    "04_rental_deposit": "04_rental_deposit-20260802-011632-0c01f7",
+    "05_traffic_injury": "05_traffic_injury-20260802-011632-0c01f7"
+  },
+  "unique_case_ids": true,
+  "cases": [
+    {
+      "group": "01_secondhand_phone",
+      "case_id": "2943e4dc75d94073a722a37ef00064db",
+      "domain": "cyber_data_fraud",
+      "elapsed_seconds": 200.433,
+      "evidence_evaluation_version": 1,
+      "solution_version": 2,
+      "solution_evidence_version": 1,
+      "evidence_items": [
+        {
+          "id": "evidence_b8d4e950b8eb",
+          "name": "evidence_payment_and_chat.txt",
+          "availability": "uploaded_copy",
+          "source_form": "copy",
+          "completeness": "partial",
+          "identity_visibility": "clear",
+          "time_visibility": "clear",
+          "acquisition_method": "third_party",
+          "case_specificity": "case_specific",
+          "proof_roles": [
+            "transaction",
+            "payment",
+            "agreement",
+            "communication",
+            "event",
+            "identity",
+            "loss",
+            "time"
+          ],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "【脱敏重构材料，仅用于系统测试】",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "unresolved": 0
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 0
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 2
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": true,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "basis_has_official_url": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": true
+    },
+    {
+      "group": "02_concert_ticket",
+      "case_id": "211b9f138ccb438bb069ef6003ebcb1c",
+      "domain": "contracts_property_housing",
+      "elapsed_seconds": 200.437,
+      "evidence_evaluation_version": 1,
+      "solution_version": 2,
+      "solution_evidence_version": 1,
+      "evidence_items": [
+        {
+          "id": "evidence_70263775dc06",
+          "name": "evidence_agreement_payment.txt",
+          "availability": "uploaded_copy",
+          "source_form": "copy",
+          "completeness": "partial",
+          "identity_visibility": "clear",
+          "time_visibility": "clear",
+          "acquisition_method": "third_party",
+          "case_specificity": "case_specific",
+          "proof_roles": [
+            "transaction",
+            "agreement",
+            "payment",
+            "event",
+            "problem",
+            "identity",
+            "communication",
+            "time"
+          ],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "【脱敏重构材料，仅用于系统测试】",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "unresolved": 0
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 0
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 2
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": true,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "basis_has_official_url": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": true
+    },
+    {
+      "group": "03_overtime_wage",
+      "case_id": "4e7bb4d1e55343979f31b7cb82bb5c2e",
+      "domain": "labor_social_security",
+      "elapsed_seconds": 168.945,
+      "evidence_evaluation_version": 1,
+      "solution_version": 2,
+      "solution_evidence_version": 1,
+      "evidence_items": [
+        {
+          "id": "evidence_b03924aa5c07",
+          "name": "evidence_work_chat.txt",
+          "availability": "uploaded_copy",
+          "source_form": "copy",
+          "completeness": "partial",
+          "identity_visibility": "clear",
+          "time_visibility": "clear",
+          "acquisition_method": "third_party",
+          "case_specificity": "case_specific",
+          "proof_roles": [
+            "relationship",
+            "agreement",
+            "time",
+            "communication",
+            "payment",
+            "identity",
+            "loss"
+          ],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "【脱敏重构材料，仅用于系统测试】",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "unresolved": 0
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 0
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 2
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": true,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "basis_has_official_url": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": true
+    },
+    {
+      "group": "04_rental_deposit",
+      "case_id": "c1d469a99984456cb7ab9501795adfe6",
+      "domain": "contracts_property_housing",
+      "elapsed_seconds": 159.568,
+      "evidence_evaluation_version": 1,
+      "solution_version": 2,
+      "solution_evidence_version": 1,
+      "evidence_items": [
+        {
+          "id": "evidence_0ddaaaae54d8",
+          "name": "evidence_contract_handover.txt",
+          "availability": "uploaded_copy",
+          "source_form": "copy",
+          "completeness": "partial",
+          "identity_visibility": "clear",
+          "time_visibility": "clear",
+          "acquisition_method": "third_party",
+          "case_specificity": "case_specific",
+          "proof_roles": [
+            "relationship",
+            "agreement",
+            "payment",
+            "event",
+            "identity",
+            "communication",
+            "loss",
+            "time"
+          ],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "【脱敏重构材料，仅用于系统测试】",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "unresolved": 0
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 0
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 2
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": true,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "basis_has_official_url": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": true
+    },
+    {
+      "group": "05_traffic_injury",
+      "case_id": "e337529e08984d3f93ad3bbf469089d0",
+      "domain": "traffic_personal_injury",
+      "elapsed_seconds": 200.436,
+      "evidence_evaluation_version": 1,
+      "solution_version": 2,
+      "solution_evidence_version": 1,
+      "evidence_items": [
+        {
+          "id": "evidence_389352127fbc",
+          "name": "evidence_accident_medical.txt",
+          "availability": "uploaded_copy",
+          "source_form": "copy",
+          "completeness": "partial",
+          "identity_visibility": "clear",
+          "time_visibility": "clear",
+          "acquisition_method": "third_party",
+          "case_specificity": "case_specific",
+          "proof_roles": [
+            "event",
+            "harm",
+            "loss",
+            "identity",
+            "procedure",
+            "time"
+          ],
+          "authenticity_status": "not_verified",
+          "inspection_basis": "uploaded_copy",
+          "source_excerpt": "【脱敏重构材料，仅用于系统测试】",
+          "content_conflicts": [],
+          "limitations": [
+            "真实性、完整性、取得方式和证明力尚未由系统核验",
+            "复制件或转述内容应尽量与原件、原始载体和形成时间相互核对"
+          ]
+        }
+      ],
+      "coverage_counts": {
+        "target_count": 2,
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "unresolved": 0
+      },
+      "checklist_status_counts": {
+        "preliminarily_covered": 0,
+        "partially_covered": 2,
+        "known_missing": 0,
+        "conflicted": 0,
+        "unresolved": 0
+      },
+      "basis": {
+        "reference_count": 6,
+        "with_body": 6,
+        "with_url": 2
+      },
+      "foreign_markers": [],
+      "checks": {
+        "domain_reasonable": true,
+        "evaluation_version_incremented": true,
+        "uploaded_material_retained_in_state": true,
+        "checklist_has_basis": true,
+        "basis_has_body_text": true,
+        "basis_has_official_url": true,
+        "no_cross_case_marker": true,
+        "solution_includes_latest_evaluation": true
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}
