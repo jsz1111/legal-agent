@@ -5,26 +5,41 @@ import asyncio
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
+from langchain_openai import ChatOpenAI
 from loguru import logger
+
+from src.core.config import get_settings
+
+
+def build_chat_llm(*, temperature: float = 0.3, model: str | None = None) -> Any:
+    """数据驱动构造聊天模型：DashScope OpenAI 兼容模式。
+
+    供应商/模型切换只需改 .env 的 CHAT_MODEL / BASE_URL_CHAT / DASHSCOPE_API_KEY。
+    """
+    settings = get_settings()
+    return ChatOpenAI(
+        model=model or settings.CHAT_MODEL,
+        api_key=settings.DASHSCOPE_API_KEY,
+        base_url=settings.BASE_URL_CHAT,
+        temperature=temperature,
+    )
 
 
 def llm_for_stage(
     llm: Any,
     *,
     max_tokens: int,
-    reasoning_effort: str = "low",
 ) -> Any:
     """Configure short structured stages without changing test doubles.
 
-    The production model otherwise spends most of a small stage's latency and
-    token budget on hidden reasoning, which can truncate the JSON body.
+    Only a token cap is bound here.  Vendor switching is handled by
+    build_chat_llm; no vendor-specific reasoning parameters (e.g. DeepSeek's
+    reasoning_effort) are bound, since DashScope's OpenAI-compatible mode does
+    not recognize them.
     """
 
     if isinstance(llm, BaseChatModel):
-        return llm.bind(
-            max_tokens=max(int(max_tokens), 1),
-            reasoning_effort=reasoning_effort,
-        )
+        return llm.bind(max_tokens=max(int(max_tokens), 1))
     return llm
 
 

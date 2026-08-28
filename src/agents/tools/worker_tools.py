@@ -1,6 +1,7 @@
 # src/agents/tools/worker_tools.py
 
 import json
+import re
 from dataclasses import dataclass
 
 from langchain_core.tools import tool
@@ -122,6 +123,127 @@ def _extract_statistics_artifact(messages: list) -> dict | None:
     return None
 
 
+def _display_article_no(value: object) -> str:
+    article = str(value or "").strip()
+    if not article:
+        return "条号未标注"
+    if article.startswith("第") and "条" in article:
+        return article
+    if re.fullmatch(
+        r"[零〇一二三四五六七八九十百千万两\d]+(?:之[零〇一二三四五六七八九十百千万两\d]+)?",
+        article,
+    ):
+        main, *sub = article.split("之", 1)
+        return f"第{main}条" + (f"之{sub[0]}" if sub else "")
+    return article
+
+
+def _legal_qa_retrieval_debug(artifacts: list[dict]) -> dict | None:
+    """Project Q&A tool traces onto the inspector's shared retrieval schema."""
+
+    statute_contexts: list[str] = []
+    case_contexts: list[str] = []
+    graph_results: list[str] = []
+    channel_results: list[str] = []
+    basis_refs: list[dict] = []
+    seen_statutes: set[tuple[str, str, str]] = set()
+
+    for artifact in artifacts:
+        source_type = str(artifact.get("source_type") or "")
+        content = str(artifact.get("content") or "").strip()
+        if source_type == "statute":
+            context = str(artifact.get("context") or "").strip()
+            if context:
+                statute_contexts.append(context)
+            for hit in artifact.get("hits") or []:
+                if not isinstance(hit, dict):
+                    continue
+                title = str(hit.get("title") or "").strip()
+                article_no = _display_article_no(hit.get("article_no"))
+                text = str(hit.get("text") or "").strip()
+                key = (title, article_no, text)
+                if not text or key in seen_statutes:
+                    continue
+                seen_statutes.add(key)
+                basis_refs.append({
+                    "law_id": str(hit.get("law_id") or ""),
+                    "title": title or "入库法律",
+                    "article_no": article_no,
+                    "source_type": "statute_index",
+                    "text": text[:2000],
+                })
+        elif source_type == "case" and content:
+            case_contexts.append(content)
+        elif source_type == "graph" and content:
+            graph_results.append(content)
+        elif source_type == "channel" and content:
+            channel_results.append(content)
+        elif source_type == "document" and content:
+            basis_refs.append({
+                "title": "法律文书知识库检索结果",
+                "article_no": "相关内容",
+                "source_type": "knowledge_docs",
+                "text": content[:3000],
+            })
+
+    if not any((statute_contexts, case_contexts, graph_results, channel_results, basis_refs)):
+        return None
+    return {
+        "domain": "",
+        "confidence_tier": "HIGH" if basis_refs else "",
+        "statute_hits": "\n\n".join(statute_contexts),
+        "case_hits": "\n\n".join(case_contexts),
+        "graph_laws": graph_results,
+        "graph_channels": channel_results,
+        "followup_basis_refs": basis_refs,
+        "followup_basis_error": "",
+    }
+
+
+def _append_retrieved_statute_text(reply: str, retrieval_debug: dict | None) -> str:
+    """Guarantee that a Q&A citation includes the retrieved statutory text."""
+
+    if not retrieval_debug or "## 检索法条原文" in reply:
+        return reply
+    refs = [
+        item for item in retrieval_debug.get("followup_basis_refs") or []
+        if isinstance(item, dict)
+        and item.get("source_type") == "statute_index"
+        and str(item.get("text") or "").strip()
+    ][:3]
+    if not refs:
+        return reply
+
+    # The agent is instructed to quote the retrieved provision in its source
+    # section.  Keep the deterministic fallback for incomplete answers, but do
+    # not repeat the same provision when that instruction already succeeded.
+    normalized_reply = re.sub(r"\s+", "", reply)
+    for item in refs:
+        statute_text = re.sub(r"\s+", "", str(item.get("text") or ""))
+        if statute_text and statute_text in normalized_reply:
+            return reply
+        body = re.sub(
+            r"^第[零〇一二三四五六七八九十百千万两\d]+条(?:之[零〇一二三四五六七八九十百千万两\d]+)?[：:]?",
+            "",
+            statute_text,
+        )
+        if body and body in normalized_reply:
+            return reply
+        fragments = [part for part in re.split(r"[，。；：]", body) if len(part) >= 16]
+        if any(fragment in normalized_reply for fragment in fragments):
+            return reply
+
+    lines = [reply.rstrip(), "", "## 检索法条原文", ""]
+    for item in refs:
+        lines.extend([
+            f"- **《{item.get('title') or '入库法律'}》{item.get('article_no') or '相关条文'}**",
+            "",
+            f"  > {str(item.get('text') or '').strip()}",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
+
+
 async def _persist_legal_qa_turn(
     redis,
     *,
@@ -173,10 +295,11 @@ async def call_legal_qa_agent_impl(
         await redis.delete(original_message_key)
     history_key = f"legal_qa_history:{user_id}:{session_id}"
     reply_key = f"legal_qa_last_reply:{user_id}:{session_id}"
+    debug_key = f"legal_qa_last_debug:{user_id}:{session_id}"
     statistics_key = f"legal_statistics_last:{user_id}:{session_id}"
     statistics_context_key = f"legal_statistics_context:{user_id}:{session_id}"
 
-    await redis.delete(statistics_key, reply_key)
+    await redis.delete(statistics_key, reply_key, debug_key)
     history = _decode_redis_json(await redis.get(history_key))[-6:]
     raw_context = await redis.get(statistics_context_key)
     if isinstance(raw_context, bytes):
@@ -219,13 +342,27 @@ async def call_legal_qa_agent_impl(
         )
         return reply
 
-    agent = create_legal_qa_agent(
-        user_id=user_id,
-        statistics_previous_sql=previous_sql,
+    # A turn-local client avoids reusing a gRPC channel that Milvus (or an
+    # intervening network layer) may have closed while the service was idle.
+    # It also isolates concurrent Q&A turns from one another.
+    from pymilvus import MilvusClient
+
+    retrieval_artifacts: list[dict] = []
+    turn_milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
     )
-    result = await agent.ainvoke(
-        {"messages": messages}
-    )
+    try:
+        agent = create_legal_qa_agent(
+            user_id=user_id,
+            statistics_previous_sql=previous_sql,
+            retrieval_artifacts=retrieval_artifacts,
+            milvus_client=turn_milvus_client,
+        )
+        result = await agent.ainvoke(
+            {"messages": messages}
+        )
+    finally:
+        turn_milvus_client.close()
     reply = str(result["messages"][-1].content)
 
     artifact = _extract_statistics_artifact(result.get("messages", []))
@@ -233,6 +370,14 @@ async def call_legal_qa_agent_impl(
         # 统计回答已经在受约束的 ChatBI 回答阶段生成。外层 Agent 的二次改写
         # 可能引入无数据支撑的原因分析，因此这里强制透传原始 answer。
         reply = str(artifact.get("answer") or reply)
+    retrieval_debug = _legal_qa_retrieval_debug(retrieval_artifacts)
+    reply = _append_retrieved_statute_text(reply, retrieval_debug)
+    if retrieval_debug:
+        await redis.set(
+            debug_key,
+            json.dumps(retrieval_debug, ensure_ascii=False),
+            ex=settings.REDIS_SESSION_TTL,
+        )
     await _persist_legal_qa_turn(
         redis,
         history_key=history_key,

@@ -3,7 +3,6 @@ from functools import lru_cache
 import math
 from urllib.parse import quote_plus
 
-from langchain_deepseek import ChatDeepSeek
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings
 
@@ -37,9 +36,11 @@ class Settings(BaseSettings):
     GUIDE_SESSION_TTL: int = 0             # 案件状态保留秒数；0 表示仅由用户手动删除
     GUIDE_DOCUMENT_TTL: int = 86400        # 生成文书下载对象保留 24 小时
     GUIDE_CASE_BOUNDARY_CONFIDENCE: float = 0.72  # 低于该置信度时不继承旧案，先向用户确认
+    # 固定阶段：按领域题库先一次性问完必问事实，再进入动态补充（两阶段追问）
+    GUIDE_FIXED_STAGE_ENABLED: bool = True
     # 检索超时配置（秒）
     GUIDE_RETRIEVE_TIMEOUT_STATUTE: float = 8.0   # 法条检索超时
-    GUIDE_RETRIEVE_TIMEOUT_CASE: float = 5.0      # 案例检索超时
+    GUIDE_RETRIEVE_TIMEOUT_CASE: float = 12.0     # 案例检索超时
     GUIDE_RETRIEVE_TIMEOUT_GRAPH: float = 3.0     # 图谱查询超时
     GUIDE_RETRIEVE_TIMEOUT_AUX: float = 5.0       # PG补充、标题、渠道等辅助查询
     GUIDE_RETRIEVE_TIMEOUT_RERANK: float = 6.0    # 法条候选统一精排
@@ -51,6 +52,8 @@ class Settings(BaseSettings):
     GUIDE_LLM_TIMEOUT_CONCLUDE: float = 35.0
     GUIDE_LLM_TIMEOUT_AUDIT: float = 8.0
     GUIDE_LLM_TIMEOUT_BOUNDARY: float = 10.0
+    GUIDE_LLM_TIMEOUT_SITUATION: float = 8.0  # 结论前"用户处境审视"短阶段；失败降级为默认无风险判定
+    GUIDE_LLM_TIMEOUT_DOC: float = 90.0  # 参考文书草稿生成超时；超时回退模板骨架底稿
 
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
@@ -98,9 +101,8 @@ class Settings(BaseSettings):
     DASHSCOPE_API_KEY: str = ""
        # 聊天模型
     BASE_URL_CHAT: str = ""
-    DEEPSEEK_API_KEY: str = ""
-    CHAT_MODEL: str = "deepseek-v4-flash"
-    DEEPSEEK_MODEL: str = "deepseek-v4-flash"
+    CHAT_MODEL: str = "qwen-max"
+    CHAT_MODEL_FAST: str = "qwen-turbo"
 
     # Embedding 配置
     EMBEDDING_PROVIDER: str = "ollama"  # "ollama" | "dashscope" | "volcengine"
@@ -163,6 +165,3 @@ class Settings(BaseSettings):
 @lru_cache  # lru 把对象实例保存到内存中。这是一种单例的实现
 def get_settings() -> Settings:
     return Settings()
-
-def get_llm():
-    return "deepseek-v4-flash"

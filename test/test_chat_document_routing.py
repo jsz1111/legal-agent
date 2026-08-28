@@ -45,16 +45,16 @@ def test_document_request_bypasses_guide_graph_and_does_not_become_case_fact(
     redis = _FakeRedis({state_key: state.model_dump_json()})
     captured = {}
 
-    async def fake_generate(**kwargs):
+    def fake_export_plan_word(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(
-            text="消费者投诉信参考稿",
+            text="消费者投诉方案",
             docx_bytes=b"PK-test",
-            filename="消费者投诉信.docx",
-            doc_type="消费者投诉信",
+            filename="维权行动方案_法护通.docx",
+            doc_type="维权行动方案（Word 版）",
             official_template=None,
             related_official_template=None,
-            missing_fields=["姓名"],
+            missing_fields=[],
         )
 
     async def fail_run_guide(**_kwargs):
@@ -67,8 +67,8 @@ def test_document_request_bypasses_guide_graph_and_does_not_become_case_fact(
     )
     monkeypatch.setattr(chat_router, "run_guide", fail_run_guide)
     monkeypatch.setattr(
-        "src.agents.legal_guide.doc_generator.generate_legal_document",
-        fake_generate,
+        "src.agents.legal_guide.doc_generator.export_plan_word",
+        fake_export_plan_word,
     )
 
     reply, _debug, document = asyncio.run(
@@ -81,11 +81,13 @@ def test_document_request_bypasses_guide_graph_and_does_not_become_case_fact(
     )
 
     saved = GuideState.model_validate_json(redis.values[state_key])
-    assert reply == "消费者投诉信参考稿"
-    assert document and document["doc_type"] == "消费者投诉信"
+    assert reply == "消费者投诉方案"
+    assert document and document["doc_type"] == "维权行动方案（Word 版）"
+    assert captured["legal_domain"] == state.legal_domain
+    assert captured["confirmed_issues"] == state.confirmed_issues
     assert captured["collected_facts"] == state.draftable_facts
     assert saved.phase == GuidePhase.DETAIL_GATHER
-    assert saved.doc_draft == "消费者投诉信参考稿"
+    assert saved.doc_draft == "消费者投诉方案"
     assert all(
         "生成文书" not in str(message.content)
         for message in saved.messages

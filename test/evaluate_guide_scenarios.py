@@ -216,7 +216,7 @@ def _reply_law_names(text: str) -> set[str]:
         return set()
     legal_section = text.split("【法律依据】", 1)[1]
     legal_section = re.split(
-        r"【(?:初步方向建议|类似案例(?:参考)?|维权路径(?:比较)?|维权胜算评估|行动清单|常见误区)】",
+        r"【(?:初步方向建议|类似案例(?:参考)?|维权路径(?:比较)?|优势与劣势|行动清单|常见误区)】",
         legal_section,
         maxsplit=1,
     )[0]
@@ -240,7 +240,7 @@ def _evaluate_final_reply(result: ScenarioResult, scenario: Scenario, state: Gui
         _add_error(result, f"在 {scenario.max_turns} 轮内没有收敛，最终阶段为 {state.phase}")
         return
 
-    required_sections = ["法律依据", "维权路径", "维权胜算评估", "行动清单"]
+    required_sections = ["法律依据", "维权路径", "优势与劣势", "行动清单"]
     for section in required_sections:
         if section not in reply:
             _add_error(result, f"最终方案缺少“{section}”")
@@ -499,7 +499,7 @@ async def check_api_redis_milvus_flow() -> dict:
             "retrieval_reached_reply": bool(
                 second_debug.statute_hits
                 and "法律依据" in second_reply
-                and "维权胜算评估" in second_reply
+                and "优势与劣势" in second_reply
             ),
             "law_titles_resolved": bool(
                 "法律ID:" not in second_debug.statute_hits

@@ -158,7 +158,7 @@ def test_ask_node_persists_all_batch_fields_in_one_round():
         "planner_mode": "dynamic_retrieval_batch",
     })
     deps = MagicMock(spec=GuideDeps)
-
+    deps.fast_llm = None
     updates = asyncio.run(node_ask_followup(state, deps))
 
     assert updates["ask_rounds"] == 1
@@ -222,8 +222,8 @@ def test_followup_basis_retrieval_does_not_query_similar_cases():
 
 def test_bound_upload_is_linked_to_the_selected_evidence_requirement():
     user_text = """【文档证据补充（程序提取，需与原文件核对）】
-清单项ID：proof_target:consumer_transaction_evidence
-清单项：消费关系和付款材料
+清单项ID：proof_target:consumer_order_payment
+清单项：订单/付款记录
 文件：订单.pdf
 来源形式：exported_file
 原文件 SHA-256：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -232,9 +232,9 @@ def test_bound_upload_is_linked_to_the_selected_evidence_requirement():
     _narrative, observations = split_uploaded_evidence_blocks(user_text)
     merged = merge_evidence_observations({}, observations, domain="consumer_market")
 
-    record = merged["consumer_transaction_evidence"]
+    record = merged["consumer_order_payment"]
     assert record["availability"] == "uploaded_copy"
-    assert record["requirement_id"] == "proof_target:consumer_transaction_evidence"
+    assert record["requirement_id"] == "proof_target:consumer_order_payment"
     report = evaluate_evidence(
         domain="consumer_market",
         assessments=merged,
@@ -243,15 +243,15 @@ def test_bound_upload_is_linked_to_the_selected_evidence_requirement():
     )
     linked_targets = {
         item.target_id for item in report.links
-        if item.evidence_id == "consumer_transaction_evidence"
+        if item.evidence_id == "consumer_order_payment"
     }
-    assert linked_targets == {"proof_target:consumer_transaction_evidence"}
+    assert linked_targets == {"proof_target:consumer_order_payment"}
 
 
 def test_evidence_only_upload_never_enters_the_case_fact_store():
     user_text = """【文档证据补充（程序提取，需与原文件核对）】
-清单项ID：proof_target:consumer_transaction_evidence
-清单项：消费关系和付款材料
+清单项ID：proof_target:consumer_order_payment
+清单项：订单/付款记录
 文件：订单.txt
 来源形式：native_electronic
 原文件 SHA-256：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -284,14 +284,15 @@ def test_evidence_only_upload_never_enters_the_case_fact_store():
         "adverse_facts": [],
     })
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = llm
 
     updates = asyncio.run(node_parse_details(state, deps))
 
     assert updates["case_facts"] == []
     assert updates["collected_facts"] == []
-    assert updates["evidence_assessments"]["consumer_transaction_evidence"]["requirement_id"] == (
-        "proof_target:consumer_transaction_evidence"
+    assert updates["evidence_assessments"]["consumer_order_payment"]["requirement_id"] == (
+        "proof_target:consumer_order_payment"
     )
     assert updates["evidence_evaluation_version"] == 3
 
@@ -346,6 +347,7 @@ def test_partial_structured_form_answer_is_not_mistaken_for_question_repetition(
         followup_plan={"plan_kind": "followup_form", "questions": questions},
     )
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = _llm({
         "is_answer": True,
         "answers_asked_question": True,
@@ -523,6 +525,7 @@ def test_structured_form_assesses_only_text_after_answer_marker():
         },
     )
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = _llm({
         "is_answer": True,
         "answers_asked_question": True,
@@ -582,6 +585,7 @@ def test_structured_form_keeps_each_answer_atomic_when_parser_json_is_broken():
         followup_plan={"plan_kind": "followup_form", "questions": questions},
     )
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(return_value=AIMessage(content='{"is_answer": true, "collected_facts": ["broken'))
 

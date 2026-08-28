@@ -24,8 +24,8 @@ from neo4j import GraphDatabase
 from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
 from sqlalchemy import select
 from langchain_core.messages import SystemMessage
-from langchain_deepseek import ChatDeepSeek
 
+from src.agents.legal_guide.llm_runtime import build_chat_llm
 from src.core.config import get_settings
 from src.infra.database import AsyncSessionLocal
 from src.infra.embedding import get_embedding_model
@@ -261,11 +261,7 @@ async def write_to_milvus(domain_terms: dict[str, list[str]], col: Collection, e
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 async def main(rebuild: bool = False):
-    llm = ChatDeepSeek(
-        model=settings.DEEPSEEK_MODEL,
-        api_key=settings.DEEPSEEK_API_KEY,
-        temperature=0.1,  # 低温度保证术语提取稳定
-    )
+    llm = build_chat_llm(temperature=0.1)  # 低温度保证术语提取稳定
     embed_model = get_embedding_model()
 
     by_domain = await fetch_articles_by_domain()

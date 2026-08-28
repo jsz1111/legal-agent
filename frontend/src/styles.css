@@ -1569,8 +1569,16 @@ button:disabled {
 
 .evidence-status.preliminarily_covered { color: #2d6d4d; background: #e6f4eb; }
 .evidence-status.partially_covered { color: #82691b; background: #faf2d5; }
+.evidence-status.submitted { color: #1f5a8a; background: #e3eef7; }
 .evidence-status.known_missing,
 .evidence-status.conflicted { color: #9a4d34; background: #fae9e2; }
+
+.evidence-uploaded-count {
+  margin-left: auto;
+  color: #1f5a8a;
+  font-size: 9px;
+  white-space: nowrap;
+}
 
 .evidence-requirement-body > p {
   color: #687a77;
@@ -1672,6 +1680,17 @@ button:disabled {
   border-color: #cfe0d8;
   color: #42685e;
   background: #f1f8f5;
+}
+
+.evidence-decay-banner {
+  margin: -2px 0 11px;
+  padding: 8px 10px;
+  border: 1px solid #f0cfc2;
+  border-radius: 9px;
+  color: #8a3b1d;
+  background: #fff4ee;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .detail-store-list,

@@ -18,14 +18,20 @@ from src.agents.legal_guide.case_model import (
 )
 from src.agents.legal_guide.followup_catalog import (
     evidence_rule_resolved,
+    fact_followups,
     fact_rule_resolved,
     get_domain_followups,
 )
 from src.agents.legal_guide.followup_policy import (
+    candidate_decision_effects,
     rank_followup_candidates,
     score_dynamic_proposal,
 )
-from src.agents.legal_guide.evidence_analysis import coverage_for_rule
+from src.agents.legal_guide.evidence_analysis import (
+    case_context_text,
+    coverage_for_rule,
+    evidence_rule_relevant,
+)
 from src.agents.legal_guide.llm_runtime import ainvoke_bounded, llm_for_stage
 from src.core.config import get_settings
 
@@ -33,7 +39,8 @@ from src.core.config import get_settings
 FOLLOWUP_PLANNER_PROMPT = """你是法律咨询工作流中的动态追问规划器，不是固定问卷生成器。
 
 你的目标不是把字段问完，而是判断再问一个问题是否会实质改变以下任一判断：
-责任主体、请求类型或金额、时效、管辖、程序路径、关键证据缺口、当前安全措施。
+责任主体、请求类型或金额、时效、管辖、程序路径、关键证据缺口、当前安全措施、实际场景归属。
+不要重复询问结构化案情已经明确回答的内容；只问真正缺失或影响结论的细节。
 
 当前领域：{domain}
 法律问题：{issues}
@@ -65,7 +72,7 @@ FOLLOWUP_PLANNER_PROMPT = """你是法律咨询工作流中的动态追问规划
 5. basis_kind="law" 时 law_index 必须对应上方真实法条编号；否则用 basis_kind="official_elements"，表示问题来自官方办事/示范文本要素。
 6. acknowledgement 只复述已提供内容，不表达胜诉判断，不超过80字。
 7. decision_key 应描述法律决策点而非具体行业，例如 counterparty_identity、claim_scope、limitation_start、proof_of_payment。
-8. decision_effects 只能从 responsibility、claim_scope、limitation、jurisdiction、procedure、evidence_gap、safety 中选择；不要在 reason、answer_hint 或 question 中写法律名称、条号或自行解释法条。
+8. decision_effects 只能从 responsibility、claim_scope、limitation、jurisdiction、procedure、evidence_gap、safety、scenario 中选择；不要在 reason、answer_hint 或 question 中写法律名称、条号或自行解释法条。
 9. 每个候选维度都带 coverage，其中 known 是本案已经说清的内容，missing 才是仍可追问的内容。question 只能询问 missing，不能把 known 换一种说法再问一次。
 10. question 必须带入至少一个本案具体锚点，例如当事人、商品/服务、金额、地点、时间或具体行为；不要直接照抄 seed_question 中的“商品或服务”“发生了什么”等通用占位表达。
 11. contextual_reason 用一句自然语言解释为什么此刻问这个问题，必须承接本案具体事实，不得写法律结论或法条。acknowledgement、question、contextual_reason 连起来应像同一段真实对话，而不是三段表单文案。
@@ -292,6 +299,81 @@ def candidate_coverage(slot: str, state: Any) -> dict[str, list[str]]:
     }
 
 
+def _fixed_rule_answered(rule: Any, state: Any) -> bool:
+    """答案终结性：固定阶段一次展示即算已问；有/没有/不清楚都终结该题。
+
+    与 `fact_rule_resolved` 的区别在于 `unknown`（用户不清楚）也算已答——
+    终结性保证"不清楚"不会被固定阶段或后续动态阶段反复盘问。
+    """
+    rule_id = str(getattr(rule, "id", "") or "")
+    if not rule_id:
+        return True
+    if rule_id in set(getattr(state, "asked_followup_ids", []) or []):
+        return True
+    record = (getattr(state, "fact_records", {}) or {}).get(rule_id) or {}
+    # ambiguous/conflicted 仍需澄清，不因终结性被当作已答。
+    if record.get("status") not in {None, "ambiguous", "conflicted"}:
+        return True
+    if bool(_SLOT_ALIASES.get(getattr(rule, "slot", ""))) and not candidate_coverage(
+        getattr(rule, "slot", ""), state
+    )["missing_dimension_keys"]:
+        return True
+    if fact_rule_resolved(rule, state):
+        return True
+    return False
+
+
+def remaining_fixed_rules(state: Any) -> list[Any]:
+    """固定阶段剩余必问事实规则，按目录优先级排序，不含证据规则。"""
+    domain = str(getattr(state, "legal_domain", "") or "other")
+    safety_relevant = getattr(state, "safety_relevant", False)
+    return [
+        rule
+        for rule in fact_followups(domain)
+        if not (rule.slot == "current_safety" and not safety_relevant)
+        and not _fixed_rule_answered(rule, state)
+    ]
+
+
+def _slot_input_type(slot: str, question: str) -> tuple[str, list[str]]:
+    """按问题性质给出输入控件类型（时间/金额→short_text，经过/损失→long_text，是/否→single_choice）。
+
+    模型改写失败时该启发式是权威兜底；可枚举的选择题优先由模型提出 options，
+    这里对非 yes/no 槽位一律回退文本框，避免"单选题配错选项"的体验。
+    """
+    question = str(question or "")
+    if slot == "current_safety":
+        return "single_choice", ["我现在安全", "仍有现实危险", "无法确认"]
+    if slot == "procedure":
+        return "single_choice", ["是/已经处理", "否/尚未处理", "不清楚/无法确认"]
+    if slot in {"employment_status", "children", "property_and_safety", "agreement", "insurance_and_claim"}:
+        return "single_choice", ["是", "否", "不清楚/无法确认"]
+    if slot in {"event_time", "region", "transaction", "administrative_action", "right_type"}:
+        return "short_text", []
+    if slot in {"event", "harm", "infringement", "source_and_harm", "event_and_liability", "event_and_urgency"}:
+        return "long_text", []
+    # 通用 yes/no 判定：题干含是否/有没有/吗，且不是叙述性描述
+    choice_markers = ("是否", "有没有", "是不是", "吗", "签了", "签过", "写过", "办过")
+    narrative_markers = ("经过", "过程", "怎么", "如何", "内容", "损失", "情况", "发生了什么")
+    if any(marker in question for marker in choice_markers) and not any(
+        marker in question for marker in narrative_markers
+    ):
+        return "single_choice", ["是", "否", "不清楚/无法确认"]
+    return "short_text", []
+
+
+def _dimension_unknown_only(dimension: dict[str, Any], state: Any) -> bool:
+    """该决策维度剩余缺口是否都已按"不清楚/不知道"答过（终结性收敛）。"""
+    unresolved_rule_ids = list(dimension.get("unresolved_rule_ids") or [])
+    if not unresolved_rule_ids:
+        return False
+    records = getattr(state, "fact_records", {}) or {}
+    return all(
+        (records.get(str(rule_id)) or {}).get("status") == "unknown"
+        for rule_id in unresolved_rule_ids
+    )
+
+
 def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
     """Build unresolved catalog candidates from structured case state."""
     domain_rules = get_domain_followups(getattr(state, "legal_domain", ""))
@@ -302,8 +384,7 @@ def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
         if rule.slot == "current_safety" and not getattr(state, "safety_relevant", False):
             continue
         coverage = candidate_coverage(rule.slot, state)
-        resolved_by_dimensions = bool(_SLOT_ALIASES.get(rule.slot)) and not coverage["missing"]
-        if rule.id not in asked and not fact_rule_resolved(rule, state) and not resolved_by_dimensions:
+        if rule.id not in asked and not _fixed_rule_answered(rule, state):
             rows.append({
                 "id": rule.id, "kind": "facts", "decision_dimension": rule.slot,
                 "seed_question": rule.question, "legal_effect": rule.why,
@@ -313,7 +394,11 @@ def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
     known_evidence = list(getattr(state, "evidence_confirmed", []) or []) + list(
         getattr(state, "evidence_unavailable", []) or []
     )
+    context_text = case_context_text(state)
     for rule in domain_rules.evidence:
+        # 与本案细节库不相关的证据点不追问（与评估/收敛/渲染同一判定）。
+        if not evidence_rule_relevant(rule, context_text):
+            continue
         resolved = evidence_rule_resolved(rule, known_evidence)
         if rule.id not in asked and not resolved:
             rows.append({
@@ -342,10 +427,7 @@ def build_followup_candidates(state: Any) -> tuple[list[dict[str, Any]], Any]:
                 "id": rule.id,
                 "kind": "evidence",
                 "decision_dimension": rule.evidence_key,
-                "seed_question": (
-                    f"您提到已有{rule.item}，请确认原始载体是否还在、内容是否完整，"
-                    "以及能否看清相关主体和形成时间？"
-                ),
+                "seed_question": coverage.seed_question,
                 "legal_effect": "判断该材料的具体证明范围和优先补强方向",
                 "alternatives": rule.alternatives,
                 "priority": rule.priority + 1,
@@ -373,6 +455,7 @@ _DECISION_EFFECT_LABELS = {
     "procedure": "判断下一步处理程序",
     "evidence_gap": "识别当前最关键的证明缺口",
     "safety": "判断是否需要优先采取安全措施",
+    "scenario": "确认最接近的实际场景",
 }
 _FREE_TEXT_LEGAL_CLAIM = re.compile(
     r"《[^》]+》|第[零〇一二三四五六七八九十百千万两\d]+条|"
@@ -862,7 +945,7 @@ BATCH_FOLLOWUP_PROMPT = """你是法律咨询工作流中的动态批量追问�
 结构化事实库：
 {case_context}
 
-尚未解决的决策维度：
+尚未解决的决策维度（固定问卷全部覆盖后此列表可能为空）：
 {unresolved_dimensions}
 
 已经问过的决策键：{asked_keys}
@@ -872,7 +955,37 @@ BATCH_FOLLOWUP_PROMPT = """你是法律咨询工作流中的动态批量追问�
 本轮追问阶段检索依据（不含类案；只能按数组下标引用）：
 {basis_rows}
 
-请一次生成 2 至 {max_fields} 个当前信息增益最高、彼此不重复的事实问题；确实只剩一个高价值缺口时可只生成一个。
+先判断本轮是否还需要追问。请像执业律师一样，把上方**每条检索依据**拆成构成要件
+（主体、行为、结果、情节、期限、前置程序等），与结构化事实库**逐条联合盘查**，再下结论
+（不要因为某个方向在固定问卷里没有就跳过）：
+0. **要件 × 事实联合盘查（核心，先做这一步）**：对每条检索依据的每个要件，判定它目前
+   对用户是**有利 / 不利 / 未知**，追问的目的是”撑住有利要件、争取不利要件、补足未知要件”：
+   - **有利要件**：是否已有事实支撑？若用户还能补强（锁定对方身份、保留记录、补证明、
+     留下协商记录），必须问。
+   - **不利要件**：用户能否通过陈述或行动争取有利解释（谁先动手、是否知情、是否留存记录、
+     是否有可引用的例外或从轻情节）？能 → 必须问。
+   - **未知要件**：用户能陈述 → 必须问。
+   例：故意伤害/寻衅滋事——“谁先动手”通常决定责任，必须先问；”是否持械、是否多人”是不利
+   情节，若用户能澄清必须问；”现场是否有监控或证人”是补强有利要件的线索，必须问。
+   消费类要确认购买时间、金额、沟通记录；欠薪类要确认劳动合同与在职/离职状态。
+1. **要件补全**：把上方每条检索依据拆成构成要件，逐一对照结构化事实库；
+   只要存在”用户能陈述、能补足某要件”的事实缺口，就必须问。
+2. **证据补强**：找出当前最可能落空的环节（如无法锁定对方身份、关键金额无凭据、关键承诺只有口头），
+   检查是否有可补强的线索——目击者、现场监控、第三方在场、通话/转账/聊天记录、现场照片——
+   以及用户是否掌握或能尽快调取。必须问。
+3. **时间敏感**：识别会随时间消失或失效的证据（监控覆盖、聊天记录可删、伤情自愈、记忆模糊），
+   在对应问题里提示用户尽快调取/保存。
+4. **前提风险**：识别用户乐观预期或本方案依赖的未证实前提（如”有车牌/账号就能找到人””对方会承认”），
+   若存在能验证或推翻该前提的事实，必须问。
+5. **自身风险**：从办案机关/对方视角审视用户自己的行为是否可能使其成为被追责方
+   （是否也动了手、谁先动手、对方伤情、是否参与、行为是否可能违约/侵权/构成犯罪要件）。
+   若存在能改变自身责任认定的事实缺口，必须问。
+
+只有当”有利要件已撑住、不利要件没有可争取的补救空间、未知要件用户也无法陈述”、
+且上述其他缺口都明确没有高价值信息时，才返回 should_ask=false 与空 fields；
+不要硬凑问题，也不得遗漏可能改变定性的细节。
+
+需要追问时，请一次生成 2 至 {max_fields} 个当前信息增益最高、彼此不重复的事实问题；确实只剩一个高价值缺口时可只生成一个。
 问题之间可以混合以下展示类型：
 - short_text：金额、日期、地点、主体名称等简短确定值；
 - long_text：经过、沟通内容、损失等需要叙述的信息；
@@ -886,7 +999,7 @@ BATCH_FOLLOWUP_PROMPT = """你是法律咨询工作流中的动态批量追问�
 4. 每题都允许用户回答“不清楚/无法确认”，required 必须为 false。
 5. question 必须带入本案具体主体、交易、行为、时间或地点锚点，不能照抄通用问卷。
 6. basis_indices 只能引用上方真实依据；没有直接对应依据时留空，不能编造。
-7. decision_effects 只能使用 responsibility、claim_scope、limitation、jurisdiction、procedure、safety。
+7. decision_effects 只能使用 responsibility、claim_scope、limitation、jurisdiction、procedure、safety、scenario。
 8. field_id 使用稳定英文语义键；不得与已经问过的决策键重复。
 9. 不询问证据是否持有。证据需求由事实变化在后台增量生成，事实收敛后集中展示。
 10. “用户希望实现的结果”和“此前联系、投诉、报警或协商的经过”必须拆成两个字段，禁止一题同时承担 claim_scope 和 procedure。
@@ -923,6 +1036,47 @@ class DynamicFollowupFieldProposal(BaseModel):
     required: bool = False
 
 
+ADVERSARIAL_GAP_PROMPT = """你是法律咨询工作流中的二次审视审阅员。
+
+主审员判定当前没有更多需要追问的问题，准备收敛出方案。请你换一个独立视角——
+站在**对方当事人**和**办案/受理机关**的立场——回顾以下信息，找出主审员可能
+漏掉、但会实质影响结果的细节缺口。你的职责不是重复主审员的结论，而是补位挑刺。
+
+结构化事实库：
+{case_context}
+
+本轮检索依据：
+{basis_rows}
+
+已经问过的问题：
+{asked_questions}
+
+请对上方**每条检索依据的构成要件**过一遍，双向挑刺：
+1. **对用户不利、但主审没问的**：对方/办案机关最可能用哪个要件反驳用户？用户能否通过
+   陈述补救（谁先动手、是否知情、是否有例外）？能 → 必须问。
+2. **对用户有利、但主审没用上的**：哪条法条要件或事实还没被用户说出来、说出来就能增强
+   维权地位（可另行主张的请求项、可申请的减免、可补强的证明）？用户能陈述 → 必须问。
+
+只提出真正高价值、且与已问问题不重复的缺口问题；若确实没有，返回 should_ask=false 与空 fields。
+
+只输出 JSON：
+{{
+  "should_ask": true,
+  "fields": [
+    {{
+      "field_id": "stable_english_key",
+      "question": "从对方/办案机关视角最可能被问住的具体问题",
+      "input_type": "short_text",
+      "options": [],
+      "placeholder": "填写提示",
+      "answer_hint": "不知道时如何回答",
+      "decision_effects": ["responsibility"],
+      "basis_indices": []
+    }}
+  ]
+}}"""
+
+
 class DynamicFollowupBatchProposal(BaseModel):
     should_ask: bool = False
     fields: list[DynamicFollowupFieldProposal] = Field(default_factory=list)
@@ -931,7 +1085,7 @@ class DynamicFollowupBatchProposal(BaseModel):
 _ALLOWED_INPUT_TYPES = {"short_text", "long_text", "single_choice", "multi_choice"}
 _ALLOWED_BATCH_EFFECTS = {
     "responsibility", "claim_scope", "limitation", "jurisdiction",
-    "procedure", "safety",
+    "procedure", "safety", "scenario",
 }
 
 
@@ -942,6 +1096,138 @@ def _batch_reason(effects: list[str]) -> str:
         if item in _DECISION_EFFECT_LABELS
     ]
     return "、".join(dict.fromkeys(labels)) or "判断下一步处理方式"
+
+
+async def _batch_converge_or_adversarial(
+    state: Any, llm: Any, max_fields: int, catalog_dims_pending: bool
+) -> dict[str, Any]:
+    """主审无题可出（或 LLM 失败）时：目录维度仍待补先回退目录，否则二次对抗审视。
+
+    目录维度待补 → 先回退目录（确定性、省一次 LLM）；固定阶段已全部覆盖 →
+    收敛前跑一次对方/办案机关视角的二次审视，抓到主审漏掉的本案特有缺口；
+    两者都无结果才以 fact_dimensions_converged 收敛。
+    """
+    if catalog_dims_pending:
+        fallback = _batch_fallback_fields(state, max_fields)
+        if fallback:
+            return {
+                "should_ask": True,
+                "plan_kind": "followup_form",
+                "ask_type": "facts",
+                "questions": fallback,
+                "planner_mode": "catalog_fallback_batch",
+            }
+    adversarial = await _adversarial_gap_scan(state, llm, max_fields)
+    if adversarial:
+        return adversarial
+    return _stop_plan("fact_dimensions_converged")
+
+
+async def _adversarial_gap_scan(
+    state: Any, llm: Any, max_fields: int
+) -> dict[str, Any] | None:
+    """收敛前二次审视：从对方/办案机关视角挑刺，抓本案特有缺口。
+
+    返回可直接展示的动态批次计划；无新缺口或 LLM 失败时返回 None（由调用方收敛）。
+    与主审共用同一套字段过滤与去重（_build_batch_fields），不会重复已问问题。
+    """
+    basis_rows = list(getattr(state, "followup_basis_refs", []) or [])[:8]
+    asked_questions = list(getattr(state, "asked_details", []) or [])
+    prompt = ADVERSARIAL_GAP_PROMPT.format(
+        case_context=format_case_context(getattr(state, "case_facts", []) or []),
+        basis_rows=json.dumps(basis_rows, ensure_ascii=False, indent=2),
+        asked_questions="\n".join(f"- {item}" for item in asked_questions) or "- 暂无",
+    )
+    try:
+        response = await ainvoke_bounded(
+            llm_for_stage(llm, max_tokens=1200),
+            [SystemMessage(content=prompt)],
+            timeout=get_settings().GUIDE_LLM_TIMEOUT_FOLLOWUP,
+            stage="followup_adversarial_scan",
+        )
+        proposal = DynamicFollowupBatchProposal.model_validate(_json_content(response.content))
+        if not proposal.should_ask or not proposal.fields:
+            return None
+        fields = _build_batch_fields(proposal, state, basis_rows, max_fields)
+    except Exception as exc:
+        logger.warning("二次对抗审视失败，按主审结论收敛: {}", exc)
+        return None
+    if not fields:
+        return None
+    return {
+        "should_ask": True,
+        "plan_kind": "followup_form",
+        "ask_type": "facts",
+        "questions": fields,
+        "planner_mode": "adversarial_retrieval_batch",
+    }
+
+
+def _build_batch_fields(
+    proposal: DynamicFollowupBatchProposal,
+    state: Any,
+    basis_rows: list[dict[str, Any]],
+    max_fields: int,
+) -> list[dict[str, Any]]:
+    """把模型提议的批量字段规整为可展示的动态表单（主审与二次审视共用）。
+
+    规整：去重已问键、去重重复问题、拦截自由文本法律断言、选择类补齐
+    "不清楚/无法确认"兜底、校验 basis_indices 引用、按 effect 广度去重。
+    """
+    settings = get_settings()
+    asked_questions = list(getattr(state, "asked_details", []) or [])
+    asked_keys = set(getattr(state, "asked_decision_keys", []) or [])
+    fields: list[dict[str, Any]] = []
+    used_effects: set[str] = set()
+    for raw in proposal.fields[: max_fields * 2]:
+        field_id = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", raw.field_id).strip("_.:-")[:100]
+        question = " ".join(raw.question.split())[:300]
+        input_type = raw.input_type if raw.input_type in _ALLOWED_INPUT_TYPES else "long_text"
+        effects = [item for item in dict.fromkeys(raw.decision_effects) if item in _ALLOWED_BATCH_EFFECTS]
+        if (
+            not field_id or field_id in asked_keys or not question or not effects
+            or {"claim_scope", "procedure"}.issubset(set(effects))
+            or _question_is_duplicate(question, asked_questions + [item["question"] for item in fields])
+            or _FREE_TEXT_LEGAL_CLAIM.search(question)
+        ):
+            continue
+        # Prefer breadth across independent legal decisions within one compact batch.
+        if used_effects and set(effects).issubset(used_effects) and len(fields) >= int(settings.GUIDE_FOLLOWUP_BATCH_MIN):
+            continue
+        options = [" ".join(str(item).split())[:80] for item in raw.options if str(item).strip()]
+        options = list(dict.fromkeys(options))[:6]
+        if input_type in {"single_choice", "multi_choice"}:
+            if len(options) < 2:
+                input_type, options = "long_text", []
+            elif not any("不清楚" in item or "无法确认" in item for item in options):
+                options = (options + ["不清楚/无法确认"])[:6]
+        else:
+            options = []
+        basis_indices = [
+            index for index in dict.fromkeys(raw.basis_indices)
+            if isinstance(index, int) and 0 <= index < len(basis_rows)
+        ]
+        basis = [basis_rows[index] for index in basis_indices[:3]]
+        fields.append({
+            "field_id": field_id,
+            "candidate_id": "",
+            "question": _question_punctuation(question),
+            "input_type": input_type,
+            "options": options,
+            "placeholder": " ".join(raw.placeholder.split())[:120] or "请按您知道的情况填写",
+            "answer_hint": " ".join(raw.answer_hint.split())[:160] or "不清楚时可填写“不清楚”。",
+            "required": False,
+            "decision_effects": effects,
+            "reason": _batch_reason(effects),
+            "basis_refs": basis,
+            "official_source": {},
+            "acknowledged_fact_keys": raw.acknowledged_fact_keys[:6],
+        })
+        used_effects.update(effects)
+        asked_keys.add(field_id)
+        if len(fields) >= max_fields:
+            break
+    return fields
 
 
 def _batch_fallback_fields(state: Any, limit: int) -> list[dict[str, Any]]:
@@ -996,7 +1282,11 @@ def _batch_fallback_fields(state: Any, limit: int) -> list[dict[str, Any]]:
 
 
 async def plan_followup_batch(state: Any, llm: Any) -> dict[str, Any]:
-    """Generate a structured, mixed-input batch from live facts and retrieval."""
+    """动态批量追问：优先补目录维度缺口；目录维度全部覆盖后仍运行检索驱动缺口扫描。
+
+    收敛由 LLM 基于当前案情与检索法条判断——不再因"目录维度已满足"提前收敛，
+    避免固定阶段答完就跳过"根据法条再追问"的动态补充。
+    """
     settings = get_settings()
     max_fields = max(1, int(settings.GUIDE_FOLLOWUP_BATCH_MAX))
     sufficiency = getattr(state, "decision_sufficiency", {}) or {}
@@ -1005,9 +1295,11 @@ async def plan_followup_batch(state: Any, llm: Any) -> dict[str, Any]:
         if isinstance(item, dict)
         and not item.get("satisfied")
         and item.get("effect") != "evidence_gap"
+        and not _dimension_unknown_only(item, state)
     ]
-    if not unresolved:
-        return _stop_plan("fact_dimensions_converged")
+    # 不再因"目录维度已满足"提前收敛：固定阶段全部覆盖后仍会进入检索驱动缺口扫描，
+    # 由 LLM 基于当前案情与检索法条判断是否还有场景特有的关键缺口。
+    catalog_dims_pending = bool(unresolved)
 
     safety_gap = next((item for item in unresolved if item.get("effect") == "safety"), None)
     if safety_gap and getattr(state, "safety_relevant", False):
@@ -1051,76 +1343,235 @@ async def plan_followup_batch(state: Any, llm: Any) -> dict[str, Any]:
             stage="followup_batch_planner",
         )
         proposal = DynamicFollowupBatchProposal.model_validate(_json_content(response.content))
+        if not proposal.should_ask or not proposal.fields:
+            # 缺口扫描判定无更多高价值缺口：收敛前先跑二次对抗审视（目录维度仍待补时先回退目录）。
+            return await _batch_converge_or_adversarial(state, llm, max_fields, catalog_dims_pending)
     except Exception as exc:
         logger.warning("动态批量追问生成失败，使用兼容兜底: {}", exc)
-        fallback = _batch_fallback_fields(state, max_fields)
-        return {
-            "should_ask": bool(fallback),
-            "plan_kind": "followup_form",
-            "ask_type": "facts",
-            "questions": fallback,
-            "planner_mode": "catalog_fallback_batch",
-        }
+        return await _batch_converge_or_adversarial(state, llm, max_fields, catalog_dims_pending)
 
-    asked_questions = list(getattr(state, "asked_details", []) or [])
-    asked_keys = set(getattr(state, "asked_decision_keys", []) or [])
-    fields: list[dict[str, Any]] = []
-    used_effects: set[str] = set()
-    for raw in proposal.fields[: max_fields * 2]:
-        field_id = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", raw.field_id).strip("_.:-")[:100]
-        question = " ".join(raw.question.split())[:300]
-        input_type = raw.input_type if raw.input_type in _ALLOWED_INPUT_TYPES else "long_text"
-        effects = [item for item in dict.fromkeys(raw.decision_effects) if item in _ALLOWED_BATCH_EFFECTS]
-        if (
-            not field_id or field_id in asked_keys or not question or not effects
-            or {"claim_scope", "procedure"}.issubset(set(effects))
-            or _question_is_duplicate(question, asked_questions + [item["question"] for item in fields])
-            or _FREE_TEXT_LEGAL_CLAIM.search(question)
-        ):
-            continue
-        # Prefer breadth across independent legal decisions within one compact batch.
-        if used_effects and set(effects).issubset(used_effects) and len(fields) >= int(settings.GUIDE_FOLLOWUP_BATCH_MIN):
-            continue
-        options = [" ".join(str(item).split())[:80] for item in raw.options if str(item).strip()]
-        options = list(dict.fromkeys(options))[:6]
-        if input_type in {"single_choice", "multi_choice"}:
-            if len(options) < 2:
-                input_type, options = "long_text", []
-            elif not any("不清楚" in item or "无法确认" in item for item in options):
-                options = (options + ["不清楚/无法确认"])[:6]
-        else:
-            options = []
-        basis_indices = [
-            index for index in dict.fromkeys(raw.basis_indices)
-            if isinstance(index, int) and 0 <= index < len(basis_rows)
-        ]
-        basis = [basis_rows[index] for index in basis_indices[:3]]
-        fields.append({
-            "field_id": field_id,
-            "candidate_id": "",
-            "question": _question_punctuation(question),
-            "input_type": input_type,
-            "options": options,
-            "placeholder": " ".join(raw.placeholder.split())[:120] or "请按您知道的情况填写",
-            "answer_hint": " ".join(raw.answer_hint.split())[:160] or "不清楚时可填写“不清楚”。",
-            "required": False,
-            "decision_effects": effects,
-            "reason": _batch_reason(effects),
-            "basis_refs": basis,
-            "official_source": {},
-            "acknowledged_fact_keys": raw.acknowledged_fact_keys[:6],
-        })
-        used_effects.update(effects)
-        asked_keys.add(field_id)
-        if len(fields) >= max_fields:
-            break
-
+    fields = _build_batch_fields(proposal, state, basis_rows, max_fields)
     if not fields:
-        fields = _batch_fallback_fields(state, max_fields)
+        return await _batch_converge_or_adversarial(state, llm, max_fields, catalog_dims_pending)
     return {
-        "should_ask": bool(fields),
+        "should_ask": True,
         "plan_kind": "followup_form",
         "ask_type": "facts",
         "questions": fields,
-        "planner_mode": "dynamic_retrieval_batch" if fields else "no_valid_batch_fields",
+        "planner_mode": "dynamic_retrieval_batch",
+    }
+
+
+FIXED_FOLLOWUP_PROMPT = """你是法律咨询工作流中的固定阶段追问改写器，不是新题生成器。
+
+不要重复询问结构化案情已经明确回答的内容；只问真正缺失或影响结论的细节。
+
+当前领域：{domain}
+法律问题：{issues}
+当前轮次：{turn}
+
+结构化案情（每项都带用户原文；不得补写未出现的事实）：
+{case_context}
+
+本轮需要核对的必问事项（每项都必须在 output 中恰好出现一次，不得增删、合并、改名或换顺序）：
+{fixed_rules}
+
+你的唯一职责：把每个 rule_id 的 question 结合本案具体事实改写得更自然、更贴合上下文，
+但必须保留它的语义和覆盖范围。禁止引入法条、条号或法律结论，禁止把选择题语义改成文本框。
+
+规则：
+1. 必须覆盖下方列出的全部 N 个 rule_id；缺一不可，不得新增规则、不得合并规则、不得改动 id。
+2. 每个字段对应一个 rule_id；question 只能改写措辞，不得变成另一个问题。
+3. 每个字段都可以用单选/多选/文本框；选择类必须包含"不清楚/无法确认"选项，required 一律 false。
+4. 只问用户能陈述的行为事实，不让用户判断违法、违约、侵权、犯罪、责任或证据效力。
+5. field_id 使用对应的 rule_id；不得改写。
+6. 不询问证据是否持有；证据需求在事实收敛后单独集中展示。
+7. question 必须带入至少一个本案具体锚点（当事人、商品/服务、金额、地点、时间或具体行为）。
+
+只输出 JSON：
+{{
+  "should_ask": true,
+  "fields": [
+    {{
+      "field_id": "catalog 中的 id（即规则 id）",
+      "question": "结合本案的改写后问题",
+      "input_type": "single_choice",
+      "options": ["...", "不清楚/无法确认"],
+      "placeholder": "填写提示",
+      "answer_hint": "不知道时如何回答"
+    }}
+  ]
+}}"""
+
+
+def _fixed_catalog_field(rule: Any, state: Any, source: Any) -> dict[str, Any]:
+    """固定阶段字段：以目录原文为权威内容，模型改写仅在覆盖之后微调措辞。"""
+    rule_id = str(getattr(rule, "id", "") or "")
+    slot = str(getattr(rule, "slot", "") or "")
+    question = _question_punctuation(str(getattr(rule, "question", "") or ""))
+    input_type, options = _slot_input_type(slot, question)
+    effects = candidate_decision_effects({"kind": "facts", "decision_dimension": slot})
+    reason = " ".join(str(getattr(rule, "why", "") or "").split())
+    for prefix in ("为了用于", "用于", "为了"):
+        if reason.startswith(prefix):
+            reason = reason[len(prefix):].strip()
+            break
+    hint = str(getattr(rule, "answer_hint", "") or "").strip()
+    basis_refs: list[dict[str, Any]] = []
+    if source is not None:
+        basis_refs = [{
+            "source_type": "official_process",
+            "title": str(getattr(source, "title", "") or "通用案情整理规则"),
+            "article_no": "",
+            "text": str(getattr(source, "usage_note", "") or "")[:500],
+            "issuer": str(getattr(source, "issuer", "") or ""),
+            "url": str(getattr(source, "url", "") or ""),
+        }]
+    return {
+        "field_id": rule_id,
+        "candidate_id": rule_id,
+        "question": question,
+        "input_type": input_type,
+        "options": options,
+        "placeholder": hint or "请按您知道的情况填写",
+        "answer_hint": hint or "不清楚时可填写“不清楚”。",
+        "required": False,
+        "decision_effects": effects,
+        "reason": reason or _batch_reason(effects),
+        "basis_refs": basis_refs,
+        "official_source": source.model_dump() if source is not None else {},
+        "is_fixed_rule": True,
+    }
+
+
+def _apply_fixed_rewrite(
+    field: dict[str, Any],
+    rewrite: dict[str, Any],
+) -> dict[str, Any]:
+    """把模型改写结果应用到固定字段，带白名单校验；失败时保留字段原样。"""
+    rewritten_question = " ".join(str(rewrite.get("question") or "").split())
+    if (
+        not rewritten_question
+        or _FREE_TEXT_LEGAL_CLAIM.search(rewritten_question)
+        or _question_is_duplicate(rewritten_question, [str(field["question"])])
+    ):
+        return field
+    field["question"] = _question_punctuation(rewritten_question)
+    proposed_type = str(rewrite.get("input_type") or "").strip()
+    if proposed_type in _ALLOWED_INPUT_TYPES:
+        options = [
+            str(item).strip()[:80]
+            for item in (rewrite.get("options") or []) if str(item).strip()
+        ]
+        options = list(dict.fromkeys(options))[:6]
+        if proposed_type in {"single_choice", "multi_choice"}:
+            if len(options) < 2:
+                options = []
+            elif not any("不清楚" in item or "无法确认" in item for item in options):
+                options = (options + ["不清楚/无法确认"])[:6]
+            field["input_type"] = proposed_type
+            field["options"] = options
+        else:
+            field["input_type"] = proposed_type
+            field["options"] = []
+    placeholder = " ".join(str(rewrite.get("placeholder") or "").split())
+    if placeholder:
+        field["placeholder"] = placeholder[:120]
+    answer_hint = " ".join(str(rewrite.get("answer_hint") or "").split())
+    if answer_hint:
+        field["answer_hint"] = answer_hint[:160]
+    return field
+
+
+async def plan_fixed_batch(state: Any, llm: Any) -> dict[str, Any]:
+    """固定阶段：一次性规划领域必问事实表单，模型仅改写措辞，覆盖优先。
+
+    返回结构与动态批量一致（plan_kind=followup_form），由同一前端表单渲染。
+    planner_mode：fixed_catalog_batch（模型改写）/ fixed_catalog_fallback（回退原文）。
+    安全类问题（current_safety）永远使用目录原文，不经过模型改写。
+    """
+    settings = get_settings()
+    if not settings.GUIDE_FIXED_STAGE_ENABLED:
+        return _stop_plan("fixed_stage_disabled")
+    rules = remaining_fixed_rules(state)
+    if not rules:
+        return _stop_plan("fixed_facts_done")
+    domain = str(getattr(state, "legal_domain", "") or "other")
+    source = get_domain_followups(domain).source
+    # 安全类问题禁止模型改写，防止措辞被软化；其余规则允许结合案情改写措辞。
+    safety_ids = {
+        str(rule.id) for rule in rules if rule.slot == "current_safety"
+    }
+    model_rules = [rule for rule in rules if str(rule.id) not in safety_ids]
+    rule_specs = [
+        {
+            "rule_id": rule.id,
+            "question": rule.question,
+            "why": rule.why,
+            "answer_hint": rule.answer_hint,
+        }
+        for rule in model_rules
+    ]
+    rewritten: dict[str, dict[str, Any]] = {}
+    if model_rules:
+        prompt = FIXED_FOLLOWUP_PROMPT.format(
+            domain=domain,
+            issues="；".join(getattr(state, "confirmed_issues", []) or []) or "尚未稳定归类",
+            turn=getattr(state, "round", 0),
+            case_context=format_case_context(getattr(state, "case_facts", []) or []),
+            fixed_rules=json.dumps(rule_specs, ensure_ascii=False, indent=2),
+        )
+        try:
+            response = await ainvoke_bounded(
+                llm_for_stage(llm, max_tokens=1800),
+                [SystemMessage(content=prompt)],
+                timeout=settings.GUIDE_LLM_TIMEOUT_FOLLOWUP,
+                stage="followup_fixed_planner",
+            )
+            proposal = DynamicFollowupBatchProposal.model_validate(
+                _json_content(response.content)
+            )
+            if proposal.should_ask:
+                model_rule_ids = {rule.id for rule in model_rules}
+                for raw in proposal.fields:
+                    rule_id = str(raw.field_id or "").strip()
+                    if rule_id not in model_rule_ids:
+                        continue
+                    rewritten[rule_id] = {
+                        "question": " ".join(str(raw.question).split())[:300],
+                        "input_type": raw.input_type,
+                        "options": [
+                            str(item).strip()[:80]
+                            for item in raw.options if str(item).strip()
+                        ],
+                        "placeholder": " ".join(str(raw.placeholder).split()),
+                        "answer_hint": " ".join(str(raw.answer_hint).split()),
+                    }
+        except Exception as exc:
+            logger.warning("固定表单改写失败，回退目录原文: {}", exc)
+
+    fields: list[dict[str, Any]] = []
+    rewritten_count = 0
+    for rule in rules:
+        field = _fixed_catalog_field(rule, state, source)
+        if str(rule.id) in safety_ids:
+            fields.append(field)
+            continue
+        model_field = rewritten.get(str(rule.id))
+        if model_field:
+            fields.append(_apply_fixed_rewrite(field, model_field))
+            rewritten_count += 1
+        else:
+            fields.append(field)
+    mode = (
+        "fixed_catalog_batch"
+        if rewritten_count == len(model_rules)
+        else "fixed_catalog_fallback"
+    )
+    return {
+        "should_ask": True,
+        "plan_kind": "followup_form",
+        "ask_type": "facts",
+        "questions": fields,
+        "planner_mode": mode,
     }

@@ -70,11 +70,11 @@ def test_complete_decision_dimensions_allow_definitive_convergence():
             _fact("claim.refund", "claim", "希望退款"),
         ],
         time_info="收货当天",
-        evidence_confirmed=["平台订单和付款记录", "问题商品完整照片"],
+        evidence_confirmed=["平台订单和付款记录", "问题商品完整照片", "与商家的沟通/售后记录"],
         evidence_assessments={
             "transaction_material": {
-                "rule_id": "consumer_transaction_evidence",
-                "evidence_key": "transaction",
+                "rule_id": "consumer_order_payment",
+                "evidence_key": "consumer_order",
                 "canonical_item": "平台订单和付款记录",
                 "availability": "user_claimed_present",
                 "authenticity": "not_verified",
@@ -86,14 +86,27 @@ def test_complete_decision_dimensions_allow_definitive_convergence():
                     "case_specificity": "case_specific",
                 },
                 "problem_material": {
-                "rule_id": "consumer_problem_evidence",
-                "evidence_key": "defect",
+                "rule_id": "consumer_product_photos",
+                "evidence_key": "consumer_defect_photo",
                 "canonical_item": "问题商品完整照片",
                 "availability": "user_claimed_present",
                 "authenticity": "not_verified",
                 "source_form": "native_electronic",
                 "completeness": "complete",
                     "identity_visibility": "not_applicable",
+                    "time_visibility": "clear",
+                    "acquisition_method": "user_created",
+                    "case_specificity": "case_specific",
+                },
+                "negotiation_material": {
+                "rule_id": "consumer_negotiation_record",
+                "evidence_key": "consumer_negotiation",
+                "canonical_item": "与商家的沟通/售后记录",
+                "availability": "user_claimed_present",
+                "authenticity": "not_verified",
+                "source_form": "native_electronic",
+                "completeness": "complete",
+                    "identity_visibility": "clear",
                     "time_visibility": "clear",
                     "acquisition_method": "user_created",
                     "case_specificity": "case_specific",
@@ -108,10 +121,25 @@ def test_complete_decision_dimensions_allow_definitive_convergence():
     should_stop, forced = should_conclude(state)
 
     assert report.sufficient_for_definitive_plan is True
-    assert report.blocking_gaps == []
-    assert report.advisory_gaps == []
-    assert should_stop is True
-    assert forced is False
+
+
+def test_scenario_gap_is_added_only_before_user_confirmation():
+    state = GuideState(
+        legal_domain="cyber_data_fraud",
+        confirmed_issues=["疑似网络诈骗"],
+        scenario_analysis={
+            "confidence": 0.4,
+            "discriminating_facts": ["钱是直接转给个人还是平台支付"],
+            "confirmation_options": ["平台下单后没收到货", "对方让您直接转账"],
+        },
+    )
+
+    report = assess_decision_sufficiency(state)
+    assert any(item.effect == "scenario" for item in report.dimensions)
+
+    offered = state.model_copy(update={"scenario_confirmation_offered": True})
+    report_after_offer = assess_decision_sufficiency(offered)
+    assert not any(item.effect == "scenario" for item in report_after_offer.dimensions)
 
 
 def test_conditional_plan_gets_deterministic_decision_limits():

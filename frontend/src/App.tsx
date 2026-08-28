@@ -685,6 +685,7 @@ function EvidenceCenterCard({
     partially_covered: '部分覆盖',
     known_missing: '目前缺失',
     conflicted: '存在冲突',
+    submitted: '已提交（待核验）',
     unresolved: '待提交',
   }
   return (
@@ -706,8 +707,23 @@ function EvidenceCenterCard({
         </div>
       </div>
       <p className="followup-form-note">
-        清单会随事实更新。可补交未提交的材料；同一材料有新版本时也可重新上传，系统会重新评估。
+        清单会随事实更新。已提交的材料可重新上传以更新版本，也可继续补充其他材料；空白模板或参考文件不会计入已提交证据。「提供线索」项目无需上传视频，在对应项填写事发时间与位置即可；「统一上传材料」适用于您可自行持有的材料。
       </p>
+      {(() => {
+        const decayedLabels = Array.from(
+          new Set(
+            requirements
+              .filter((item) => item.decay_risk)
+              .map((item) => item.label),
+          ),
+        )
+        if (!decayedLabels.length) return null
+        return (
+          <p className="evidence-decay-banner">
+            ⚠️ 易消失证据提示：本案涉及【{decayedLabels.join('、')}】等会随时间被覆盖或删除的证据，请尽快自行调取/备份或提供调取线索，不要只等办案机关；电子记录类通常只保留数天至数周（以运营方为准）。
+          </p>
+        )
+      })()}
       {latestEvidencePending ? (
         <div className="evidence-revision-notice">
           <RefreshCw size={15} />
@@ -726,12 +742,22 @@ function EvidenceCenterCard({
             <div className="evidence-requirement-body">
               <div className="evidence-requirement-title">
                 <strong>{item.label}</strong>
+                {item.supporting_evidence_ids?.length ? (
+                  <span className="evidence-uploaded-count">已上传：{item.supporting_evidence_ids.length} 份材料</span>
+                ) : null}
                 <span className={`evidence-status ${item.status || 'unresolved'}`}>
-                  {statusLabels[item.status || ''] || item.status || '待提交'}
+                  {item.collect_mode === 'retrieve' && item.status === 'unresolved'
+                    ? '待提供线索'
+                    : statusLabels[item.status || ''] || item.status || '待提交'}
                 </span>
               </div>
               {item.proof_target ? <p>证明目标：{item.proof_target}</p> : null}
-              {item.next_action ? <p>建议：{item.next_action}</p> : null}
+              {item.next_action ? (
+                <p>
+                  {item.collect_mode === 'retrieve' ? '需提供的调取线索：' : '建议：'}
+                  {item.next_action}
+                </p>
+              ) : null}
               {item.alternatives?.length ? (
                 <p>替代材料：{item.alternatives.slice(0, 4).join('、')}</p>
               ) : null}
@@ -764,7 +790,8 @@ function EvidenceCenterCard({
               onClick={() => onUpload(item)}
               disabled={busy}
             >
-              <Paperclip size={14} />上传此项
+              <Paperclip size={14} />
+              {item.collect_mode === 'retrieve' ? '提供线索' : '上传此项'}
             </button>
           </article>
         ))}
@@ -1485,8 +1512,8 @@ function Inspector({
             ) : null}
             <section className="inspector-card source-card">
               <div className="card-title-row">
-                <h3><Search size={15} />追问阶段依据</h3>
-                <span className="counter">不含类案</span>
+                <h3><Search size={15} />{mode === 'case' ? '追问阶段依据' : '本轮检索依据'}</h3>
+                <span className="counter">{mode === 'case' ? '不含类案' : '问答'}</span>
               </div>
               {debug?.followup_basis_refs?.length ? (
                 <div className="followup-source-list">
@@ -1501,7 +1528,11 @@ function Inspector({
                 </div>
               ) : (
                 <p className="empty-panel">
-                  {debug?.followup_basis_error || '开始案件追问后，这里会显示本轮法条和其他依据正文。'}
+                  {debug?.followup_basis_error || (
+                    mode === 'case'
+                      ? '开始案件追问后，这里会显示本轮法条和其他依据正文。'
+                      : '完成法律问答后，这里会显示本轮真实检索依据及正文。'
+                  )}
                 </p>
               )}
             </section>
@@ -1515,7 +1546,13 @@ function Inspector({
                   <summary>查看检索原文</summary>
                   <MarkdownReply content={debug.statute_hits} />
                 </details>
-              ) : <p className="empty-panel">生成方案后，这里会显示本轮法条原文。</p>}
+              ) : (
+                <p className="empty-panel">
+                  {mode === 'case'
+                    ? '生成方案后，这里会显示本轮法条原文。'
+                    : '本轮命中法条后，这里会显示检索原文。'}
+                </p>
+              )}
             </section>
             <section className="inspector-card source-card">
               <div className="card-title-row">
@@ -1546,29 +1583,23 @@ function Inspector({
               </div>
               {document ? (
                 <>
-                  <h4>{document.doc_type || '参考文书'}</h4>
-                  <p className="muted-copy">{document.filename || '可编辑 DOCX 参考稿已生成。'}</p>
+                  <h4>{document.doc_type || '维权行动方案（Word 版）'}</h4>
+                  <p className="muted-copy">{document.filename || '已生成的维权行动方案已导出为可编辑 Word。'}</p>
                   <div className="download-stack">
                     {artifactUrl(document.generated_docx_url) ? (
                       <a className="download-button primary" href={artifactUrl(document.generated_docx_url) ?? undefined} download>
-                        <Download size={15} />下载智能填写 DOCX
+                        <Download size={15} />下载方案 Word 版
                       </a>
                     ) : null}
                     {artifactUrl(document.official_blank_url) ? (
                       <a className="download-button" href={artifactUrl(document.official_blank_url) ?? undefined} download>
-                        <FileText size={15} />下载相关官方空白 PDF
+                        <FileText size={15} />下载可参考的官方空白模板
                       </a>
                     ) : null}
                   </div>
                   {document.official_template_note ? <p className="note-callout">{document.official_template_note}</p> : null}
-                  {document.missing_fields?.length ? (
-                    <div className="missing-fields">
-                      <span>提交前需补充</span>
-                      <p>{document.missing_fields.join('、')}</p>
-                    </div>
-                  ) : null}
                 </>
-              ) : <p className="empty-panel">在对话中回复“生成文书”，这里会出现可编辑参考稿。</p>}
+              ) : <p className="empty-panel">点击右侧“导出方案 Word 版”，这里会出现方案 Word 版与可参考的官方模板。</p>}
             </section>
             <section className="inspector-card template-card">
               <div className="card-title-row">
@@ -2522,7 +2553,7 @@ function App() {
                 disabled={busy}
               ><Check size={15} />现在生成方案</button>
               <button onClick={() => void send('继续补充')} disabled={busy}><RefreshCw size={15} />继续补充</button>
-              <button onClick={() => void send('生成文书')} disabled={busy}><FileText size={15} />生成参考文书</button>
+              <button onClick={() => void send('生成文书')} disabled={busy}><FileText size={15} />导出方案 Word 版</button>
             </div>
           ) : null}
         </section>

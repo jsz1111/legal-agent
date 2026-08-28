@@ -65,8 +65,8 @@ def test_existing_payment_record_is_partial_not_automatically_sufficient():
         assessments={
             "payment": _assessment(
                 name="付款记录",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
             )
         },
         confirmed_items=["付款记录"],
@@ -75,12 +75,12 @@ def test_existing_payment_record_is_partial_not_automatically_sufficient():
 
     transaction = next(
         row for row in report.coverage
-        if row.target_id == "proof_target:consumer_transaction_evidence"
+        if row.target_id == "proof_target:consumer_order_payment"
     )
 
     assert transaction.status == "partially_covered"
     assert "内容完整性" in transaction.quality_gaps
-    assert "初步证明与经营者之间的交易关系和金额" in transaction.purpose
+    assert "初步证明与经营者的交易关系和金额" in transaction.purpose
     assert report.preliminarily_covered_count == 0
 
 
@@ -90,8 +90,8 @@ def test_source_anchored_complete_material_can_preliminarily_cover_target():
         assessments={
             "order": _assessment(
                 name="平台导出的完整订单",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
                 source_form="exported_file",
                 completeness="complete",
                 identity_visibility="clear",
@@ -106,7 +106,7 @@ def test_source_anchored_complete_material_can_preliminarily_cover_target():
 
     transaction = next(
         row for row in report.coverage
-        if row.target_id == "proof_target:consumer_transaction_evidence"
+        if row.target_id == "proof_target:consumer_order_payment"
     )
 
     assert transaction.status == "preliminarily_covered"
@@ -120,8 +120,8 @@ def test_weaker_duplicate_does_not_downgrade_a_complete_supporting_material():
         assessments={
             "complete_order": _assessment(
                 name="平台导出的完整订单",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
                 source_form="exported_file",
                 completeness="complete",
                 identity_visibility="clear",
@@ -131,8 +131,8 @@ def test_weaker_duplicate_does_not_downgrade_a_complete_supporting_material():
             ),
             "payment_note": _assessment(
                 name="付款记录",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
             ),
         },
         confirmed_items=["平台导出的完整订单", "付款记录"],
@@ -141,7 +141,7 @@ def test_weaker_duplicate_does_not_downgrade_a_complete_supporting_material():
 
     transaction = next(
         row for row in report.coverage
-        if row.target_id == "proof_target:consumer_transaction_evidence"
+        if row.target_id == "proof_target:consumer_order_payment"
     )
 
     assert transaction.status == "preliminarily_covered"
@@ -158,7 +158,7 @@ def test_unavailable_material_is_known_gap_not_proof_coverage():
 
     transaction = next(
         row for row in report.coverage
-        if row.target_id == "proof_target:consumer_transaction_evidence"
+        if row.target_id == "proof_target:consumer_order_payment"
     )
 
     assert transaction.status == "known_missing"
@@ -186,11 +186,11 @@ def test_cross_domain_proof_role_links_material_without_case_keyword_patch():
 
     problem = next(
         row for row in report.coverage
-        if row.target_id == "proof_target:consumer_problem_evidence"
+        if row.target_id == "proof_target:consumer_product_photos"
     )
     matching_link = next(
         item for item in report.links
-        if item.target_id == "proof_target:consumer_problem_evidence"
+        if item.target_id == "proof_target:consumer_product_photos"
     )
 
     assert problem.status == "partially_covered"
@@ -350,8 +350,8 @@ def test_blank_reference_material_does_not_cover_case_proof_target():
         assessments={
             "blank_contract": _assessment(
                 name="劳动合同示范文本.docx",
-                rule_id="labor_relationship_evidence",
-                evidence_key="employment_relation",
+                rule_id="labor_contract_identity",
+                evidence_key="labor_contract",
                 availability="uploaded_copy",
                 case_specificity="blank_or_reference",
                 source_form="native_electronic",
@@ -363,7 +363,7 @@ def test_blank_reference_material_does_not_cover_case_proof_target():
     )
     relationship = next(
         item for item in report.coverage
-        if item.target_id == "proof_target:labor_relationship_evidence"
+        if item.target_id == "proof_target:labor_contract_identity"
     )
 
     assert relationship.status == "unresolved"
@@ -532,7 +532,7 @@ def test_comparable_uploaded_record_fields_expose_amount_conflict():
     )
     transaction = next(
         item for item in report.coverage
-        if item.target_id == "proof_target:consumer_transaction_evidence"
+        if item.target_id == "proof_target:consumer_order_payment"
     )
 
     assert transaction.status == "conflicted"
@@ -549,8 +549,8 @@ def test_partial_evidence_creates_quality_followup_instead_of_marking_done():
         assessments={
             "payment": _assessment(
                 name="付款记录",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
             )
         },
         confirmed_items=["付款记录"],
@@ -562,8 +562,8 @@ def test_partial_evidence_creates_quality_followup_instead_of_marking_done():
         evidence_assessments={
             "payment": _assessment(
                 name="付款记录",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
             )
         },
         evidence_items=[item.model_dump() for item in report.items],
@@ -578,7 +578,7 @@ def test_partial_evidence_creates_quality_followup_instead_of_marking_done():
     candidates, _ = build_followup_candidates(state)
     quality = next(
         item for item in candidates
-        if item["id"] == "consumer_transaction_evidence"
+        if item["id"] == "consumer_order_payment"
     )
 
     assert quality["evaluation_mode"] == "quality"
@@ -619,8 +619,8 @@ def test_user_facing_matrix_states_scope_and_non_admissibility_boundary():
         assessments={
             "payment": _assessment(
                 name="付款记录",
-                rule_id="consumer_transaction_evidence",
-                evidence_key="transaction",
+                rule_id="consumer_order_payment",
+                evidence_key="consumer_order",
             )
         },
         confirmed_items=["付款记录"],
@@ -630,7 +630,7 @@ def test_user_facing_matrix_states_scope_and_non_admissibility_boundary():
     text = format_evidence_coverage(report)
 
     assert "可能用途" in text
-    assert "初步证明与经营者之间的交易关系和金额" in text
+    assert "初步证明与经营者的交易关系和金额" in text
     assert "不认定真实性、合法性、可采性或最终证明力" in text
 
 
@@ -674,13 +674,14 @@ def test_parse_details_persists_only_source_anchored_quality_attributes():
     deps.llm.ainvoke = AsyncMock(
         return_value=AIMessage(content=json.dumps(payload, ensure_ascii=False))
     )
+    deps.fast_llm = deps.llm
     state = GuideState(
         messages=[HumanMessage(content=user_text)],
         legal_domain="consumer_market",
         round=2,
         pending_ask_details=["订单、发票或付款记录，您现在有吗？"],
         pending_ask_type="evidence",
-        pending_followup_ids=["consumer_transaction_evidence"],
+        pending_followup_ids=["consumer_order_payment"],
     )
 
     updates = asyncio.run(node_parse_details(state, deps))
@@ -703,6 +704,6 @@ def test_final_reply_gets_deterministic_evidence_scope_section():
     )
 
     assert "## 证据作用与缺口" in reply
-    assert "消费关系和付款材料" in reply
+    assert "订单/付款记录" in reply
     assert "可能用途" in reply
     assert "不认定真实性、合法性、可采性或最终证明力" in reply

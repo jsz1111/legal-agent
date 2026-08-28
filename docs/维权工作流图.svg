@@ -1,0 +1,441 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 2740" role="img" aria-labelledby="title desc" font-family="'Microsoft YaHei', 'PingFang SC', sans-serif">
+  <title id="title">法护通维权工作流节点分解图</title>
+  <desc id="desc">将用户事实描述到行动计划闭环拆成十个主节点，并在每个主节点内部展示小块处理逻辑和回流关系。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 z" fill="#475569" />
+    </marker>
+    <marker id="arrowLoop" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 z" fill="#D97706" />
+    </marker>
+  </defs>
+  <style>
+    .stage-title { font-size: 18px; font-weight: 700; }
+    .stage-desc { font-size: 13px; fill: #64748B; }
+    .block-title { font-size: 14px; font-weight: 700; }
+    .block-text { font-size: 12px; fill: #334155; }
+    .flow-arrow { stroke: #475569; stroke-width: 2; fill: none; stroke-linecap: round; }
+    .loop-arrow { stroke: #D97706; stroke-width: 2; fill: none; stroke-dasharray: 7 6; stroke-linecap: round; }
+    .loop-label { font-size: 12px; fill: #B45309; }
+  </style>
+
+  <rect width="1700" height="2740" fill="#F8FAFC" />
+  <text x="850" y="56" text-anchor="middle" font-size="34" font-weight="700" fill="#0F172A">法护通维权工作流节点分解图</text>
+  <text x="850" y="92" text-anchor="middle" font-size="17" fill="#475569">每个主节点拆成内部小块，展示从事实描述到行动计划的完整逻辑</text>
+
+  <g>
+    <rect x="1350" y="30" width="260" height="100" rx="12" fill="#FFFFFF" stroke="#CBD5E1" />
+    <text x="1370" y="58" font-size="14" font-weight="700" fill="#0F172A">图例</text>
+    <path d="M1370,76 L1390,76" stroke="#475569" stroke-width="2.5" marker-end="url(#arrow)" />
+    <text x="1400" y="80" font-size="12" fill="#334155">节点内部顺序</text>
+    <path d="M1370,100 L1390,100" stroke="#D97706" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#arrowLoop)" />
+    <text x="1400" y="104" font-size="12" fill="#334155">回流 / 分支</text>
+  </g>
+
+  <!-- 主流程箭头 -->
+  <g class="flow-arrow">
+    <path d="M620,350 L620,390" marker-end="url(#arrow)" />
+    <path d="M620,600 L620,640" marker-end="url(#arrow)" />
+    <path d="M620,850 L620,890" marker-end="url(#arrow)" />
+    <path d="M620,1100 L620,1140" marker-end="url(#arrow)" />
+    <path d="M620,1350 L620,1390" marker-end="url(#arrow)" />
+    <path d="M620,1600 L620,1640" marker-end="url(#arrow)" />
+    <path d="M620,1850 L620,1890" marker-end="url(#arrow)" />
+    <path d="M620,2100 L620,2140" marker-end="url(#arrow)" />
+    <path d="M620,2350 L620,2390" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 回流箭头 -->
+  <g class="loop-arrow">
+    <path d="M100,450 L70,450 L70,260 L100,260" marker-end="url(#arrowLoop)" />
+    <path d="M1085,1080 L1085,1100 L815,1100 L815,1080" marker-end="url(#arrowLoop)" />
+    <path d="M80,1720 L50,1720 L50,1260 L80,1260" marker-end="url(#arrowLoop)" />
+    <path d="M1620,2500 L1650,2500 L1650,1500 L1620,1500" marker-end="url(#arrowLoop)" />
+  </g>
+  <text x="68" y="360" class="loop-label" transform="rotate(-90 68 360)">澄清后重新输入</text>
+  <text x="950" y="1122" class="loop-label">用户确认后重新判断</text>
+  <text x="48" y="1500" class="loop-label" transform="rotate(-90 48 1500)">决策不足 → 继续追问</text>
+  <text x="1662" y="2020" class="loop-label" transform="rotate(-90 1662 2020)">补交证据 → 重新评估</text>
+
+  <!-- 1. 用户输入事实 -->
+  <g transform="translate(0,140)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#EFF6FF" stroke="#2563EB" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#1D4ED8">1. 用户输入事实</text>
+    <text x="150" y="56" class="stage-desc">接收消息、附件和控制意图</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="170" y="102" class="block-title" fill="#1D4ED8">接收消息</text>
+    <text x="170" y="128" class="block-text">自然语言 / 表单答案</text>
+    <text x="170" y="150" class="block-text">最近对话与来源</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="440" y="102" class="block-title" fill="#1D4ED8">附件接收</text>
+    <text x="440" y="128" class="block-text">PDF / DOCX / TXT</text>
+    <text x="440" y="150" class="block-text">图片证据</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="710" y="102" class="block-title" fill="#1D4ED8">控制意图</text>
+    <text x="710" y="128" class="block-text">继续补充 / 生成方案</text>
+    <text x="710" y="150" class="block-text">删除会话</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="980" y="102" class="block-title" fill="#1D4ED8">低信息判断</text>
+    <text x="980" y="128" class="block-text">“我”“好”“嗯”等</text>
+    <text x="980" y="150" class="block-text">不触发记忆和领域提取</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="1250" y="102" class="block-title" fill="#1D4ED8">保留上下文</text>
+    <text x="1250" y="128" class="block-text">多轮对话</text>
+    <text x="1250" y="150" class="block-text">用户原文锚点</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 2. 前置门控 -->
+  <g transform="translate(0,390)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#FFF7ED" stroke="#D97706" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#9A3412">2. 前置门控</text>
+    <text x="150" y="56" class="stage-desc">先过滤低信息、安全、止损和时效风险</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#D97706" />
+    <text x="170" y="102" class="block-title" fill="#9A3412">低信息门控</text>
+    <text x="170" y="128" class="block-text">不发长期记忆</text>
+    <text x="170" y="150" class="block-text">不发 LLM 领域提取</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#D97706" />
+    <text x="440" y="102" class="block-title" fill="#9A3412">人身安全</text>
+    <text x="440" y="128" class="block-text">110 / 12348</text>
+    <text x="440" y="150" class="block-text">安全中断 / 恢复同案</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#D97706" />
+    <text x="710" y="102" class="block-title" fill="#9A3412">诈骗止付</text>
+    <text x="710" y="128" class="block-text">停止继续转账</text>
+    <text x="710" y="150" class="block-text">冻结 / 保存记录 / 报警</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#D97706" />
+    <text x="980" y="102" class="block-title" fill="#9A3412">时效检查</text>
+    <text x="980" y="128" class="block-text">劳动仲裁 1 年</text>
+    <text x="980" y="150" class="block-text">一般民事 3 年</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#D97706" />
+    <text x="1250" y="102" class="block-title" fill="#9A3412">放行</text>
+    <text x="1250" y="128" class="block-text">保留风险标记</text>
+    <text x="1250" y="150" class="block-text">进入事实提取</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 3. 事实与争点提取 -->
+  <g transform="translate(0,640)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#EFF6FF" stroke="#2563EB" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#1D4ED8">3. 事实与争点提取</text>
+    <text x="150" y="56" class="stage-desc">把用户描述转成结构化法律问题与案情</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="170" y="102" class="block-title" fill="#1D4ED8">提取输入</text>
+    <text x="170" y="128" class="block-text">当前消息 + 已有事实</text>
+    <text x="170" y="150" class="block-text">相关长期记忆</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="440" y="102" class="block-title" fill="#1D4ED8">LLM 标准化</text>
+    <text x="440" y="128" class="block-text">口语 → 法律问题</text>
+    <text x="440" y="150" class="block-text">domain / issues</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="710" y="102" class="block-title" fill="#1D4ED8">case_frame</text>
+    <text x="710" y="128" class="block-text">核心事件类型</text>
+    <text x="710" y="150" class="block-text">frame_confidence</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="980" y="102" class="block-title" fill="#1D4ED8">原子事实</text>
+    <text x="980" y="128" class="block-text">主体 / 事件 / 时间</text>
+    <text x="980" y="150" class="block-text">金额 / 程序 / 损害</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="1250" y="102" class="block-title" fill="#1D4ED8">证据与时空</text>
+    <text x="1250" y="128" class="block-text">证据属性 / 地区 / 时间</text>
+    <text x="1250" y="150" class="block-text">冲突与不利事实</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 4. 场景再判断 -->
+  <g transform="translate(0,890)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#F0FDF4" stroke="#059669" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#047857">4. 场景再判断</text>
+    <text x="150" y="56" class="stage-desc">在领域化追问和检索前确认最接近的实际场景</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="170" y="102" class="block-title" fill="#047857">完整案情快照</text>
+    <text x="170" y="128" class="block-text">事实 / 争点 / 证据</text>
+    <text x="170" y="150" class="block-text">对话积累细节</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="440" y="102" class="block-title" fill="#047857">AI 场景判断</text>
+    <text x="440" y="128" class="block-text">primary_domain</text>
+    <text x="440" y="150" class="block-text">primary_frame</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="710" y="102" class="block-title" fill="#047857">置信度检查</text>
+    <text x="710" y="128" class="block-text">confidence</text>
+    <text x="710" y="150" class="block-text">竞争场景</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFF7ED" stroke="#D97706" />
+    <text x="980" y="102" class="block-title" fill="#9A3412">低置信度</text>
+    <text x="980" y="128" class="block-text">用户日常情境确认</text>
+    <text x="980" y="150" class="block-text">确认后重新判断</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="1250" y="102" class="block-title" fill="#047857">高置信度</text>
+    <text x="1250" y="128" class="block-text">更新 legal_domain</text>
+    <text x="1250" y="150" class="block-text">进入领域化流程</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,112 L960,100" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,152 L960,165" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 5. 两阶段追问 -->
+  <g transform="translate(0,1140)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#EFF6FF" stroke="#2563EB" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#1D4ED8">5. 两阶段追问</text>
+    <text x="150" y="56" class="stage-desc">固定表单 + 动态追问，只问会影响判断的缺口</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="170" y="102" class="block-title" fill="#1D4ED8">固定事实表单</text>
+    <text x="170" y="128" class="block-text">领域必问事实</text>
+    <text x="170" y="150" class="block-text">安全问题保持原文</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="440" y="102" class="block-title" fill="#1D4ED8">动态追问</text>
+    <text x="440" y="128" class="block-text">决策充分度缺口</text>
+    <text x="440" y="150" class="block-text">检索依据驱动</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="710" y="102" class="block-title" fill="#1D4ED8">去重</text>
+    <text x="710" y="128" class="block-text">已问问题</text>
+    <text x="710" y="150" class="block-text">决策键</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="980" y="102" class="block-title" fill="#1D4ED8">对抗扫描</text>
+    <text x="980" y="128" class="block-text">对方视角</text>
+    <text x="980" y="150" class="block-text">办案 / 受理机关视角</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#2563EB" />
+    <text x="1250" y="102" class="block-title" fill="#1D4ED8">输出问题</text>
+    <text x="1250" y="128" class="block-text">2-5 个高价值问题</text>
+    <text x="1250" y="150" class="block-text">等待用户回答</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 6. 证据中心 -->
+  <g transform="translate(0,1390)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#F0FDF4" stroke="#059669" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#047857">6. 证据中心</text>
+    <text x="150" y="56" class="stage-desc">围绕证明目标维护证据需求、覆盖和版本</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="170" y="102" class="block-title" fill="#047857">证明目标</text>
+    <text x="170" y="128" class="block-text">proof_targets</text>
+    <text x="170" y="150" class="block-text">对应争点</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="440" y="102" class="block-title" fill="#047857">证据需求</text>
+    <text x="440" y="128" class="block-text">evidence_requirements</text>
+    <text x="440" y="150" class="block-text">替代材料</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="710" y="102" class="block-title" fill="#047857">持有状态</text>
+    <text x="710" y="128" class="block-text">已上传 / 用户称持有</text>
+    <text x="710" y="150" class="block-text">明确没有 / 未确认</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="980" y="102" class="block-title" fill="#047857">覆盖评估</text>
+    <text x="980" y="128" class="block-text">部分覆盖 / 初步覆盖</text>
+    <text x="980" y="150" class="block-text">质量缺口</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="1250" y="102" class="block-title" fill="#047857">版本绑定</text>
+    <text x="1250" y="128" class="block-text">evidence_version</text>
+    <text x="1250" y="150" class="block-text">更新方案依据</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 7. 检索与决策充分度 -->
+  <g transform="translate(0,1640)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#F8FAFC" stroke="#64748B" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#334155">7. 检索与决策充分度</text>
+    <text x="150" y="56" class="stage-desc">轻量检索、完整检索、融合精排和收敛判断</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#64748B" />
+    <text x="170" y="102" class="block-title" fill="#334155">轻量检索</text>
+    <text x="170" y="128" class="block-text">法条 / 知识图谱 / 官方</text>
+    <text x="170" y="150" class="block-text">不检索类案</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#64748B" />
+    <text x="440" y="102" class="block-title" fill="#334155">完整检索</text>
+    <text x="440" y="128" class="block-text">法条 / 类案 / 图谱</text>
+    <text x="440" y="150" class="block-text">渠道</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#64748B" />
+    <text x="710" y="102" class="block-title" fill="#334155">RRF / 精排</text>
+    <text x="710" y="128" class="block-text">Dense + Sparse</text>
+    <text x="710" y="150" class="block-text">PG 补充 / rerank</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#64748B" />
+    <text x="980" y="102" class="block-title" fill="#334155">决策充分度</text>
+    <text x="980" y="128" class="block-text">责任 / 请求 / 时效</text>
+    <text x="980" y="150" class="block-text">管辖 / 程序 / 证据 / 场景</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#64748B" />
+    <text x="1250" y="102" class="block-title" fill="#334155">收敛判断</text>
+    <text x="1250" y="128" class="block-text">不足 → 继续追问</text>
+    <text x="1250" y="150" class="block-text">足够 → 进入方案</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 8. 最终方案生成 -->
+  <g transform="translate(0,1890)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#FDF4FF" stroke="#9333EA" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#7E22CE">8. 最终方案生成</text>
+    <text x="150" y="56" class="stage-desc">争点识别、要件分析、策略中枢和对抗推演</text>
+
+    <rect x="150" y="75" width="200" height="115" rx="10" fill="#FFFFFF" stroke="#9333EA" />
+    <text x="170" y="102" class="block-title" fill="#7E22CE">争点识别</text>
+    <text x="170" y="128" class="block-text">核心争点</text>
+    <text x="170" y="150" class="block-text">条件 / 程序争点</text>
+
+    <rect x="365" y="75" width="200" height="115" rx="10" fill="#FFFFFF" stroke="#9333EA" />
+    <text x="385" y="102" class="block-title" fill="#7E22CE">补充检索</text>
+    <text x="385" y="128" class="block-text">按争点检索法条</text>
+    <text x="385" y="150" class="block-text">issue 到法条映射</text>
+
+    <rect x="580" y="75" width="200" height="115" rx="10" fill="#FFFFFF" stroke="#9333EA" />
+    <text x="600" y="102" class="block-title" fill="#7E22CE">要件分析</text>
+    <text x="600" y="128" class="block-text">法条 × 事实</text>
+    <text x="600" y="150" class="block-text">证据矩阵</text>
+
+    <rect x="795" y="75" width="200" height="115" rx="10" fill="#FFFFFF" stroke="#9333EA" />
+    <text x="815" y="102" class="block-title" fill="#7E22CE">策略中枢</text>
+    <text x="815" y="128" class="block-text">优先行动</text>
+    <text x="815" y="150" class="block-text">程序路径 / 风险边界</text>
+
+    <rect x="1010" y="75" width="200" height="115" rx="10" fill="#FFFFFF" stroke="#9333EA" />
+    <text x="1030" y="102" class="block-title" fill="#7E22CE">对抗推演</text>
+    <text x="1030" y="128" class="block-text">反方压力测试</text>
+    <text x="1030" y="150" class="block-text">用户处境审视</text>
+
+    <rect x="1225" y="75" width="200" height="115" rx="10" fill="#FFFFFF" stroke="#9333EA" />
+    <text x="1245" y="102" class="block-title" fill="#7E22CE">批判修订</text>
+    <text x="1245" y="128" class="block-text">补齐缺失章节</text>
+    <text x="1245" y="150" class="block-text">清除泛化模板句</text>
+
+    <path d="M350,132 L365,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M565,132 L580,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M780,132 L795,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M995,132 L1010,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1225,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 9. 校验与行动计划 -->
+  <g transform="translate(0,2140)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#F0FDF4" stroke="#059669" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#047857">9. 校验与行动计划</text>
+    <text x="150" y="56" class="stage-desc">来源、事实、证据、章节和可执行性检查</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="170" y="102" class="block-title" fill="#047857">法条白名单</text>
+    <text x="170" y="128" class="block-text">引用必须可回查</text>
+    <text x="170" y="150" class="block-text">不编造法条</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="440" y="102" class="block-title" fill="#047857">事实接地</text>
+    <text x="440" y="128" class="block-text">未确认事实分开</text>
+    <text x="440" y="150" class="block-text">冲突保留</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="710" y="102" class="block-title" fill="#047857">证据表述</text>
+    <text x="710" y="128" class="block-text">支持 / 部分支持</text>
+    <text x="710" y="150" class="block-text">缺口</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="980" y="102" class="block-title" fill="#047857">必需章节</text>
+    <text x="980" y="128" class="block-text">当前判断</text>
+    <text x="980" y="150" class="block-text">行动清单 / 决策边界</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#FFFFFF" stroke="#059669" />
+    <text x="1250" y="102" class="block-title" fill="#047857">行动计划</text>
+    <text x="1250" y="128" class="block-text">渠道 / 步骤 / 材料</text>
+    <text x="1250" y="150" class="block-text">时限 / 风险 / 条件</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <!-- 10. 输出与闭环反馈 -->
+  <g transform="translate(0,2390)">
+    <rect x="120" y="0" width="1460" height="210" rx="16" fill="#0F172A" stroke="#0F172A" stroke-width="2" />
+    <text x="150" y="34" class="stage-title" fill="#F8FAFC">10. 输出与闭环反馈</text>
+    <text x="150" y="56" class="stage-desc" fill="#94A3B8">展示方案、导出产物并支持继续补充</text>
+
+    <rect x="150" y="75" width="250" height="115" rx="10" fill="#1E293B" stroke="#475569" />
+    <text x="170" y="102" class="block-title" fill="#F8FAFC">展示方案</text>
+    <text x="170" y="128" class="block-text" fill="#CBD5E1">Markdown 最终方案</text>
+    <text x="170" y="150" class="block-text" fill="#CBD5E1">条件分支</text>
+
+    <rect x="420" y="75" width="250" height="115" rx="10" fill="#1E293B" stroke="#475569" />
+    <text x="440" y="102" class="block-title" fill="#F8FAFC">证据 / 依据面板</text>
+    <text x="440" y="128" class="block-text" fill="#CBD5E1">法条 / 类案 / 渠道</text>
+    <text x="440" y="150" class="block-text" fill="#CBD5E1">来源展示</text>
+
+    <rect x="690" y="75" width="250" height="115" rx="10" fill="#1E293B" stroke="#475569" />
+    <text x="710" y="102" class="block-title" fill="#F8FAFC">导出文书</text>
+    <text x="710" y="128" class="block-text" fill="#CBD5E1">方案 Word</text>
+    <text x="710" y="150" class="block-text" fill="#CBD5E1">官方空白模板</text>
+
+    <rect x="960" y="75" width="250" height="115" rx="10" fill="#1E293B" stroke="#475569" />
+    <text x="980" y="102" class="block-title" fill="#F8FAFC">继续补充</text>
+    <text x="980" y="128" class="block-text" fill="#CBD5E1">补交证据 / 更新事实</text>
+    <text x="980" y="150" class="block-text" fill="#CBD5E1">回流证据与检索</text>
+
+    <rect x="1230" y="75" width="250" height="115" rx="10" fill="#1E293B" stroke="#475569" />
+    <text x="1250" y="102" class="block-title" fill="#F8FAFC">保存记录</text>
+    <text x="1250" y="128" class="block-text" fill="#CBD5E1">结构化咨询记录</text>
+    <text x="1250" y="150" class="block-text" fill="#CBD5E1">长期记忆摘要</text>
+
+    <path d="M400,132 L420,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M670,132 L690,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M940,132 L960,132" class="flow-arrow" marker-end="url(#arrow)" />
+    <path d="M1210,132 L1230,132" class="flow-arrow" marker-end="url(#arrow)" />
+  </g>
+
+  <g>
+    <rect x="120" y="2620" width="1460" height="80" rx="16" fill="#0F172A" />
+    <text x="850" y="2652" text-anchor="middle" font-size="19" font-weight="700" fill="#F8FAFC">闭环成功判定</text>
+    <text x="850" y="2680" text-anchor="middle" font-size="15" fill="#CBD5E1">缺口被识别 + 行动可执行 + 依据可追溯；信息不足时输出条件式方案，不编造依据</text>
+  </g>
+</svg>

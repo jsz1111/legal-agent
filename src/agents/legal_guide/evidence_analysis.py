@@ -78,6 +78,7 @@ ALLOWED_PROOF_ROLES = {
 # catalog concepts; roles are the smaller cross-domain ontology used to link a
 # user's description of what a material contains to the relevant proof target.
 EVIDENCE_KEY_PROOF_ROLES: dict[str, set[str]] = {
+    # 旧键保留为别名，避免历史评估行（rule_id/evidence_key 已入库）完全失配。
     "employment_relation": {"relationship", "identity", "time"},
     "wage_payment": {"payment", "loss", "time"},
     "transaction": {"transaction", "payment", "identity", "time"},
@@ -103,6 +104,65 @@ EVIDENCE_KEY_PROOF_ROLES: dict[str, set[str]] = {
     "procedure_document": {"procedure", "agreement", "time"},
     "underlying": {"agreement", "transaction", "payment"},
     "harm_and_report": {"harm", "loss", "procedure"},
+    # 细粒度证据点（evidence rules 已拆细后新增的证据键）。
+    "labor_contract": {"relationship", "identity", "time"},
+    "labor_payment": {"payment", "loss", "time"},
+    "labor_attendance": {"relationship", "time", "identity"},
+    "labor_arrears": {"communication", "payment", "event"},
+    "consumer_order": {"transaction", "payment", "identity", "time"},
+    "consumer_defect_photo": {"event", "problem"},
+    "consumer_negotiation": {"communication", "event", "procedure"},
+    "consumer_detection": {"problem", "harm", "event"},
+    "contract_agreement_doc": {"agreement", "relationship"},
+    "contract_payment": {"transaction", "payment", "time"},
+    "contract_terms_chat": {"agreement", "communication"},
+    "contract_delivery": {"transaction", "event", "time"},
+    "contract_breach": {"event", "communication", "loss"},
+    "crime_surveillance": {"event", "identity", "time"},
+    "crime_chat": {"communication", "identity", "time"},
+    "crime_injury_photo": {"harm", "event", "time"},
+    "crime_medical": {"harm", "loss", "payment"},
+    "crime_call": {"communication", "identity", "time"},
+    "crime_transfer": {"transaction", "payment", "identity"},
+    "crime_report_receipt": {"procedure", "harm", "loss"},
+    "crime_witness": {"event", "identity", "time"},
+    "family_status_docs": {"relationship", "identity"},
+    "family_harm": {"harm", "event", "procedure"},
+    "family_custody": {"relationship", "identity", "time"},
+    "family_property": {"loss", "transaction", "ownership"},
+    "traffic_certificate": {"liability", "event", "identity"},
+    "traffic_scene": {"event", "liability", "time"},
+    "traffic_treatment": {"harm", "loss", "payment"},
+    "traffic_loss": {"loss", "payment", "time"},
+    "traffic_repair": {"loss", "payment", "transaction"},
+    "met_service_doc": {"relationship", "transaction", "procedure", "time"},
+    "met_payment": {"transaction", "payment", "loss"},
+    "met_harm": {"harm", "loss", "event"},
+    "met_process": {"procedure", "communication", "event"},
+    "admin_decision": {"procedure", "identity", "event"},
+    "admin_service": {"time", "procedure", "identity"},
+    "admin_application": {"procedure", "time", "event"},
+    "admin_counter": {"event", "procedure", "problem"},
+    "ip_ownership_cert": {"ownership", "identity", "time"},
+    "ip_infringement_capture": {"infringement", "event", "identity", "time"},
+    "ip_creation": {"ownership", "identity", "time"},
+    "ip_loss": {"loss", "payment", "event"},
+    "env_scene": {"event", "problem", "time"},
+    "env_noise": {"problem", "event", "time"},
+    "env_monitoring": {"problem", "harm", "event"},
+    "env_harm_complaint": {"harm", "loss", "procedure"},
+    "cyber_transfer": {"transaction", "payment", "identity", "time"},
+    "cyber_account": {"identity", "transaction", "time"},
+    "cyber_chat": {"communication", "identity", "time", "procedure"},
+    "cyber_report": {"procedure", "event", "time"},
+    "cyber_freeze": {"procedure", "event", "time"},
+    "procedure_clause": {"agreement", "procedure", "relationship"},
+    "procedure_document_original": {"procedure", "agreement", "time"},
+    "procedure_underlying_contract": {"agreement", "transaction", "payment"},
+    "procedure_service": {"procedure", "time", "event"},
+    "other_relationship_docs": {"relationship", "agreement", "communication"},
+    "other_payment_loss": {"payment", "loss", "transaction"},
+    "other_process": {"procedure", "communication", "event"},
 }
 
 
@@ -152,6 +212,10 @@ class EvidenceCoverage(BaseModel):
     quality_gaps: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     next_action: str = ""
+    # 统一的“状态→缺失文案/追问问句”提供方：所有消费方（决策收敛、追问规划、
+    # 清单渲染）共享同一份措辞，避免多处硬编码状态文案漂移。
+    missing_text: str = ""
+    seed_question: str = ""
 
 
 class EvidenceEvaluationReport(BaseModel):
@@ -885,14 +949,90 @@ def _target_for_rule(rule: EvidenceFollowup) -> ProofTarget:
     )
 
 
+def case_context_text(state: Any) -> str:
+    """紧凑拼接细节库/上下文，供证据点相关性审核使用。
+
+    只采纳用户明确陈述、暂不确定或前后不一致的事实；排除被否认的事实，
+    避免“没有联系过”这类否定陈述点亮聊天记录等证据点。
+    """
+    issues = list(getattr(state, "confirmed_issues", []) or [])
+    collected = list(getattr(state, "collected_facts", []) or [])
+    active = [
+        str(item.get("statement") or "")
+        for item in active_case_facts(getattr(state, "case_facts", []) or [])
+        if item.get("status") in {"asserted", "uncertain", "conflicted"}
+    ]
+    return " ".join(str(item) for item in (*issues, *collected, *active))
+
+
+def _keyword_occurrence_is_negated(context: str, index: int) -> bool:
+    """判断关键词出现位置是否被“不/没/没有”直接否定。
+
+    只处理直接前缀否定（“不认识”“没联系过”“没有转账”），不处理跨词否定，
+    属于通用机制而非逐案补丁。
+    """
+    before1 = context[index - 1:index]
+    before2 = context[index - 2:index]
+    return before1 in {"不", "没"} or before2 == "没有"
+
+
+def evidence_rule_relevant(rule: EvidenceFollowup, context_text: str) -> bool:
+    """判定证据点是否为本案合理需要。
+
+    只有显式打了 `relevance.when_facts` 门控的规则才会被隐藏/点亮；未打标
+    的规则（默认）恒相关，保证各领域兼容。这是“证据清单合情理”的唯一判定点，
+    评估、追问、收敛、渲染四类消费方共用。
+
+    命中规则：任一关键词至少一次“正向”出现即相关。被“不/没/没有”直接否定
+    的出现（“对方我不认识”“没有联系过”）不计为相关，避免否定陈述点亮证据点。
+    """
+    relevance = getattr(rule, "relevance", None)
+    if not relevance or not relevance.when_facts:
+        return True
+    if not context_text:
+        return False
+    for keyword in relevance.when_facts:
+        start = 0
+        while True:
+            index = context_text.find(keyword, start)
+            if index < 0:
+                break
+            if not _keyword_occurrence_is_negated(context_text, index):
+                return True
+            start = index + len(keyword)
+    return False
+
+
+def evidence_decay_banner(requirements: list[dict[str, Any]]) -> str:
+    """任一清单行存在易消失证据时返回一条通用时效提示，否则返回空串。"""
+    decayed = list(dict.fromkeys(
+        str(item.get("label") or "")
+        for item in requirements
+        if item.get("decay_risk") and item.get("active", True)
+    ))
+    if not decayed:
+        return ""
+    return (
+        "⚠️ 易消失证据提示：本案涉及【" + "、".join(decayed)
+        + "】等会随时间被覆盖或删除的证据，请尽快自行调取/备份或提供调取线索，"
+        "不要只等办案机关；电子记录类通常只保留数天至数周（以运营方为准）。"
+    )
+
+
 def evaluate_evidence(
     *,
     domain: str,
     assessments: dict[str, dict] | None,
     confirmed_items: list[str] | None,
     unavailable_items: list[str] | None,
+    context_facts: list[str] | None = None,
 ) -> EvidenceEvaluationReport:
-    """Build a deterministic proof-coverage report from current case state."""
+    """Build a deterministic proof-coverage report from current case state.
+
+    When ``context_facts`` is provided, proof targets are filtered by case
+    relevance before assessment, so evaluation itself is grounded in the
+    collected-facts library and irrelevant rules do not inflate coverage counts.
+    """
 
     rows = {key: dict(value) for key, value in (assessments or {}).items()}
     known_names = {
@@ -916,14 +1056,18 @@ def evaluate_evidence(
     records_by_id = {
         key: record for key, record in rows.items()
     }
-    targets = [
-        _target_for_rule(rule)
-        for rule in get_domain_followups(domain).evidence
-    ]
+    evidence_rules = get_domain_followups(domain).evidence
+    if context_facts:
+        context_text = " ".join(context_facts)
+        evidence_rules = [
+            rule for rule in evidence_rules
+            if evidence_rule_relevant(rule, context_text)
+        ]
+    targets = [_target_for_rule(rule) for rule in evidence_rules]
     links: list[EvidenceLink] = []
     coverage_rows: list[EvidenceCoverage] = []
 
-    for rule, target in zip(get_domain_followups(domain).evidence, targets):
+    for rule, target in zip(evidence_rules, targets):
         linked_items: list[EvidenceItem] = []
         basis_by_item: dict[str, str] = {}
         for item in items:
@@ -1033,6 +1177,24 @@ def evaluate_evidence(
             next_action = (
                 "先确认是否持有该类材料；没有时再寻找替代材料。"
             )
+        if status == "partially_covered":
+            missing_text = (
+                f"{target.label}仍需核验{'、'.join(quality_gaps[:3])}"
+            )
+        elif status == "known_missing":
+            missing_text = f"缺少{target.label}"
+        elif status == "conflicted":
+            missing_text = f"{target.label}的持有情况前后不一致"
+        elif status == "unresolved":
+            missing_text = target.label
+        else:
+            missing_text = ""
+        seed_question = rule.question
+        if status == "partially_covered" and quality_gaps:
+            seed_question = (
+                f"您提到已有{target.label}，请确认原始载体是否还在、内容是否完整，"
+                "以及能否看清相关主体和形成时间？"
+            )
         coverage_rows.append(EvidenceCoverage(
             target_id=target.id,
             label=target.label,
@@ -1042,6 +1204,8 @@ def evaluate_evidence(
             quality_gaps=quality_gaps,
             limitations=limitations,
             next_action=next_action,
+            missing_text=missing_text,
+            seed_question=seed_question,
         ))
 
     counts = {
@@ -1067,6 +1231,7 @@ def evaluate_state_evidence(state: Any) -> EvidenceEvaluationReport:
         assessments=getattr(state, "evidence_assessments", {}) or {},
         confirmed_items=getattr(state, "evidence_confirmed", []) or [],
         unavailable_items=getattr(state, "evidence_unavailable", []) or [],
+        context_facts=[case_context_text(state)],
     )
 
 
@@ -1141,8 +1306,57 @@ def merge_evidence_requirements(
             "status": coverage.status if coverage else "unresolved",
             "supporting_evidence_ids": list(coverage.supporting_evidence_ids) if coverage else [],
             "quality_gaps": list(coverage.quality_gaps) if coverage else [],
-            "next_action": coverage.next_action if coverage else "先确认是否持有该类材料。",
+            "next_action": (
+                "提供调取线索：请填写事发时间、具体位置（路段/店铺/门口）与大致经过，供办案机关调取。"
+                if (rule and rule.collect_mode == "retrieve")
+                else (coverage.next_action if coverage else "先确认是否持有该类材料。")
+            ),
             "alternatives": list(rule.alternatives[:4]) if rule else [],
+            "collect_mode": rule.collect_mode if rule else "",
+            "decay_risk": rule.decay_risk if rule else False,
+            "trigger_fact_keys": fact_keys[-12:],
+            "basis_refs": normalized_basis,
+            "active": True,
+            "created_round": int(old.get("created_round") or current_round),
+            "updated_round": current_round,
+        }
+        comparable = {key: value for key, value in row.items() if key not in {"updated_round"}}
+        old_comparable = {key: value for key, value in old.items() if key not in {"updated_round", "version"}}
+        if comparable != old_comparable:
+            changed = True
+        rows.append(row)
+
+    # 孤儿材料浮现：用户已提交/明确声称持有、且不是空白模板的材料，若没有被
+    # 任何证明目标行收编，就作为独立行浮出，状态直接置为 submitted，确保
+    # "交了的东西绝不显示待提交、必有提交口"。参考模板不计入。
+    covered_evidence_ids = {
+        str(evidence_id)
+        for coverage in report.coverage
+        for evidence_id in coverage.supporting_evidence_ids
+    }
+    for item in report.items:
+        if item.id in active_ids or item.id in covered_evidence_ids:
+            continue
+        if item.availability not in {"uploaded_copy", "user_claimed_present"}:
+            continue
+        if item.case_specificity == "blank_or_reference":
+            continue
+        requirement_id = item.id
+        active_ids.add(requirement_id)
+        old = previous.get(requirement_id, {})
+        row = {
+            "id": requirement_id,
+            "rule_id": "",
+            "label": item.name,
+            "proof_target": "用户已提交材料，待核对证明力",
+            "priority": "required",
+            "status": "submitted",
+            "supporting_evidence_ids": [item.id],
+            "quality_gaps": _material_quality_gaps(item),
+            "next_action": "已接收提交。可重新上传以更新版本，或继续补充其他材料。",
+            "alternatives": [],
+            "collect_mode": "",
+            "decay_risk": False,
             "trigger_fact_keys": fact_keys[-12:],
             "basis_refs": normalized_basis,
             "active": True,
@@ -1157,6 +1371,15 @@ def merge_evidence_requirements(
 
     for requirement_id, old in previous.items():
         if requirement_id in active_ids or not old.get("active", True):
+            continue
+        # 永不隐藏用户已提交过或已覆盖的行：即使细节库不再命中相关性门控，
+        # 已经交了/已经覆盖过的证据也保留，避免已提交材料从清单消失。
+        if (
+            old.get("supporting_evidence_ids")
+            or old.get("status") in {"submitted", "preliminarily_covered", "partially_covered"}
+        ):
+            active_ids.add(requirement_id)
+            rows.append({**old, "active": True, "updated_round": current_round})
             continue
         changed = True
         rows.append({**old, "active": False, "updated_round": current_round})

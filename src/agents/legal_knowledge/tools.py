@@ -38,6 +38,7 @@ class LegalKnowledgeDeps:
         db_session: AsyncSession | None = None,
         user_id: str = "anonymous",
         statistics_previous_sql: str = "",
+        retrieval_artifacts: list[dict] | None = None,
     ):
         self.llm = llm
         self.embedding_model = embedding_model
@@ -46,6 +47,14 @@ class LegalKnowledgeDeps:
         self.db_session = db_session
         self.user_id = user_id
         self.statistics_previous_sql = statistics_previous_sql
+        self.retrieval_artifacts = retrieval_artifacts
+
+    def record_retrieval(self, source_type: str, **payload) -> None:
+        """Collect one turn-local retrieval artifact for the shared UI view."""
+
+        if self.retrieval_artifacts is None:
+            return
+        self.retrieval_artifacts.append({"source_type": source_type, **payload})
 
 
 async def _rewrite(question: str, llm: BaseChatModel) -> str:
@@ -74,6 +83,7 @@ def build_legal_knowledge_tools(deps: LegalKnowledgeDeps) -> list:
         from src.agents.legal_knowledge.statute_rag import search_statutes
 
         rewritten = await _rewrite(question, deps.llm)
+        retrieval_trace: dict = {}
         with Timer() as t:
             async with _db_session_or_new(deps.db_session) as db_session:
                 result = await search_statutes(
@@ -83,7 +93,14 @@ def build_legal_knowledge_tools(deps: LegalKnowledgeDeps) -> list:
                     llm=deps.llm,
                     db_session=db_session,
                     domain=domain,
+                    retrieval_trace=retrieval_trace,
                 )
+        deps.record_retrieval(
+            "statute",
+            question=question,
+            rewritten_question=rewritten,
+            **retrieval_trace,
+        )
         QueryAuditLog.log(
             deps.user_id, "citizen", question, "statute_rag",
             ["statute_index"], result[:80], t.elapsed_ms,
@@ -108,6 +125,12 @@ def build_legal_knowledge_tools(deps: LegalKnowledgeDeps) -> list:
                     db_session=db_session,
                     domain=domain,
                 )
+        deps.record_retrieval(
+            "case",
+            question=question,
+            domain=domain,
+            content=result,
+        )
         QueryAuditLog.log(
             deps.user_id, "citizen", question, "case_rag",
             ["case_index"], result[:80], t.elapsed_ms,
@@ -128,6 +151,12 @@ def build_legal_knowledge_tools(deps: LegalKnowledgeDeps) -> list:
                 neo4j_driver=deps.neo4j_driver,
                 llm=deps.llm,
             )
+        deps.record_retrieval(
+            "graph",
+            question=question,
+            rewritten_question=rewritten,
+            content=result,
+        )
         QueryAuditLog.log(
             deps.user_id, "citizen", question, "graph_rag",
             ["graph_rag"], result[:80], t.elapsed_ms,
@@ -152,6 +181,13 @@ def build_legal_knowledge_tools(deps: LegalKnowledgeDeps) -> list:
                     db=db_session,
                 )
                 result = fmt_channels(channels)
+        deps.record_retrieval(
+            "channel",
+            question=question,
+            domain=domain,
+            region=region_code,
+            content=result,
+        )
         QueryAuditLog.log(
             deps.user_id, "citizen", question, "channel_repository",
             ["channels"], result[:80], t.elapsed_ms,
@@ -173,6 +209,12 @@ def build_legal_knowledge_tools(deps: LegalKnowledgeDeps) -> list:
                 milvus_client=deps.milvus_client,
                 llm=deps.llm,
             )
+        deps.record_retrieval(
+            "document",
+            question=question,
+            rewritten_question=rewritten,
+            content=result,
+        )
         QueryAuditLog.log(
             deps.user_id, "citizen", question, "doc_rag",
             ["knowledge_docs"], result[:80], t.elapsed_ms,

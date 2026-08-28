@@ -235,6 +235,8 @@ def test_natural_conclude_request_stops_questioning_without_becoming_a_fact():
     assert route_after_urgency(state) == "parse_details"
 
     deps = MagicMock(spec=GuideDeps)
+
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock()
     parsed = asyncio.run(node_parse_details(state, deps))

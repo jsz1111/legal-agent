@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agents.legal_guide import graph as guide_graph
@@ -13,6 +15,81 @@ from src.agents.legal_guide.evidence_rules import (
 )
 from src.agents.legal_guide.graph import GuideDeps
 from src.agents.legal_guide.state import GuideState
+
+
+def _conclude_llm(final_reply: str) -> MagicMock:
+    issue_payload = {
+        "fact_tensions": [],
+        "issues": [{
+            "issue_id": "issue_1",
+            "title": "核心争点",
+            "importance": "core",
+            "reason": "需要判断",
+            "supporting_fact_keys": [],
+            "retrieval_questions": [],
+            "facts_that_change_result": [],
+        }],
+    }
+    analysis_payload = {"analyses": [{
+        "issue_id": "issue_1",
+        "title": "核心争点",
+        "current_view": "阶段性判断",
+        "supporting_facts": [],
+        "adverse_facts": [],
+        "legal_basis_refs": [],
+        "application_analysis": "适用分析",
+        "conditional_branch": "条件分支",
+        "facts_to_verify": [],
+        "evidence_actions": [],
+        "recommended_actions": [],
+        "procedure_steps": [],
+    }]}
+    strategy_payload = {"strategy_plan": {
+        "headline_assessment": {
+            "position": "当前判断",
+            "supporting_reason": "依据",
+            "uncertainty": "未确认",
+        },
+        "priority_actions": [{
+            "action": "保存材料",
+            "object": "用户",
+            "purpose": "固定证据",
+            "why_now": "防止灭失",
+            "risk": "影响举证",
+        }],
+        "procedure_path": [],
+        "evidence_plan": [],
+        "opponent_arguments": [],
+        "institution_focus": [],
+        "risk_boundaries": [],
+        "conditions_that_change_result": [],
+        "source_issue_ids": ["issue_1"],
+        "source_law_refs": [],
+    }}
+    review_payload = {
+        "adverse_points": [],
+        "evidence_weaknesses": [],
+        "unmet_legal_elements": [],
+        "procedure_risks": [],
+        "opponent_arguments": [],
+        "premise_risks": [],
+        "must_disclose": [],
+        "current_procedure_stage": "待确认",
+        "next_procedure_stage": "先补充材料",
+        "next_stage_trigger": "材料齐全",
+        "conditional_paths": [],
+        "actionability_checks": [],
+        "duplicate_actions": [],
+    }
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=[
+        AIMessage(content=json.dumps(issue_payload, ensure_ascii=False)),
+        AIMessage(content=json.dumps(analysis_payload, ensure_ascii=False)),
+        AIMessage(content=json.dumps({**strategy_payload, "adversarial_execution_review": review_payload}, ensure_ascii=False)),
+        AIMessage(content=final_reply),
+        AIMessage(content=json.dumps({"verdict": "acceptable", "issues": []}, ensure_ascii=False)),
+    ])
+    return llm
 
 
 def test_labor_evidence_is_grounded_before_litigation_stage():
@@ -71,12 +148,11 @@ def test_state_resolution_uses_accumulated_conversation():
 
 
 def test_conclusion_prompt_and_reply_keep_official_evidence_source():
-    llm = MagicMock()
-    llm.ainvoke = AsyncMock(
-        return_value=AIMessage(content="最终维权方案，依据法〔2025〕82号。")
-    )
+    llm = _conclude_llm("最终维权方案，依据法〔2025〕82号。")
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = llm
+    deps.fast_llm = llm
     state = GuideState(
         legal_domain="traffic_personal_injury",
         confirmed_issues=["机动车交通事故责任纠纷"],
@@ -85,23 +161,47 @@ def test_conclusion_prompt_and_reply_keep_official_evidence_source():
         confidence_tier="MEDIUM",
     )
 
-    updates = asyncio.run(guide_graph.node_conclude(state, deps))
-    prompt = llm.ainvoke.await_args_list[0].args[0][0].content
+    with patch.object(
+        guide_graph,
+        "assess_user_situation",
+        new=AsyncMock(return_value=type(
+            "Verdict", (), {
+                "own_risk_level": "none",
+                "own_risk_kinds": [],
+                "reasons": [],
+                "counter_claim": False,
+                "time_sensitive": False,
+                "premise_risks": [],
+            }
+        )()),
+    ), patch.object(
+        guide_graph,
+        "_supplement_strategy_law_retrieval",
+        new=AsyncMock(return_value=([], "")),
+    ):
+        updates = asyncio.run(guide_graph.node_conclude(state, deps))
+    prompt = next(
+        call.args[0][0].content
+        for call in llm.ainvoke.await_args_list
+        if "请为用户生成一份实用的法律维权行动方案" in str(call.args[0][0].content)
+    )
     reply = updates["messages"][0].content
 
     assert "医疗费凭证、费用清单和病历资料" in prompt
     assert "证据清单性质与来源" in prompt
     assert "法〔2025〕82号" in prompt
     assert "法〔2025〕82号" in reply
-    assert "官方发布页" in reply
-    assert "https://www.court.gov.cn/zixun/xiangqing/468671.html" in reply
+    assert reply == "最终维权方案，依据法〔2025〕82号。"
+    assert "官方发布页" not in reply
 
 
-def test_conclusion_timeout_returns_a_complete_deterministic_plan():
+def test_conclusion_llm_failure_propagates_without_fallback():
     llm = MagicMock()
     llm.ainvoke = AsyncMock(side_effect=TimeoutError("slow model"))
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = llm
+    deps.fast_llm = llm
     state = GuideState(
         legal_domain="consumer_market",
         confirmed_issues=["消费纠纷"],
@@ -113,16 +213,5 @@ def test_conclusion_timeout_returns_a_complete_deterministic_plan():
         confidence_tier="LOW",
     )
 
-    updates = asyncio.run(guide_graph.node_conclude(state, deps))
-    reply = updates["messages"][0].content
-
-    for section in (
-        "理解您的情况",
-        "法律依据",
-        "维权路径比较",
-        "维权胜算评估",
-        "行动清单",
-    ):
-        assert section in reply
-    assert "中华人民共和国消费者权益保护法" in reply
-    assert "第五十五条" in reply
+    with pytest.raises(TimeoutError):
+        asyncio.run(guide_graph.node_conclude(state, deps))

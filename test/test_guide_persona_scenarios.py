@@ -136,7 +136,7 @@ async def _fake_conclude(state: GuideState, deps: GuideDeps) -> dict:
     reply = (
         "**【法律依据】** RETRIEVED_LAW\n"
         "**【维权路径比较】** 可先投诉，再申请劳动仲裁。\n"
-        "**【维权胜算评估】** 综合胜算：中等。现有证据越完整越有利。\n"
+        "**【优势与劣势】** 有利因素：有劳动合同与流水；不利因素：需核对对方抗辩。\n"
         "**【行动清单】** 保存现有材料，拨打12333咨询。"
     )
     return {"phase": GuidePhase.CONCLUDE, "messages": [AIMessage(content=reply)]}
@@ -170,6 +170,7 @@ def _scripted_graph():
 
 def _run_messages(messages: list[str]) -> tuple[list[dict], GuideState]:
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     state = None
     trace: list[dict] = []
     for message in messages:
@@ -200,7 +201,7 @@ def test_elderly_unclear_and_evidence_poor_user_converges_by_ninth_turn():
     assert state.round <= 9
     assert 0 < state.ask_rounds <= settings.GUIDE_MAX_ASK_ROUNDS
     assert state.evidence_unavailable
-    assert "维权胜算评估" in trace[-1]["reply"]
+    assert "优势与劣势" in trace[-1]["reply"]
     assert all(item["reply"] for item in trace)
 
 
@@ -213,7 +214,7 @@ def test_knowledgeable_adult_gets_grounded_plan_without_an_extra_menu():
     assert state.round == 1
     assert state.confidence_tier == "HIGH"
     assert "RETRIEVED_LAW" in trace[-1]["reply"]
-    assert "维权胜算评估" in trace[-1]["reply"]
+    assert "优势与劣势" in trace[-1]["reply"]
     assert "继续补充" not in trace[0]["reply"]
 
 
@@ -232,7 +233,7 @@ def test_long_dialogue_can_continue_beyond_soft_limit_and_stop_at_will():
     assert state.phase == GuidePhase.END
     assert state.ask_rounds > settings.GUIDE_SOFT_ASK_ROUNDS
     assert state.ask_rounds <= settings.GUIDE_MAX_ASK_ROUNDS
-    assert "维权胜算评估" in trace[-1]["reply"]
+    assert "优势与劣势" in trace[-1]["reply"]
     assert all("继续补充" not in item["reply"] for item in trace)
     assert all(item["reply"] for item in trace)
 

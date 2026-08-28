@@ -142,10 +142,10 @@ def test_decision_trace_records_scores_and_rejection_reasons():
 
 def test_explicit_continue_restores_normal_value_threshold_after_soft_limit():
     candidate = {
-        "id": "criminal_original_clues",
+        "id": "criminal_cctv_recording",
         "kind": "evidence",
-        "decision_dimension": "original_clues",
-        "coverage": {"missing": ["原始电子记录", "实物线索"]},
+        "decision_dimension": "crime_surveillance",
+        "coverage": {"missing": ["现场监控", "行车记录仪录像"]},
         "priority": 1,
     }
     passive_state = GuideState(

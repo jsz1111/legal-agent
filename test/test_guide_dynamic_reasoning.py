@@ -220,7 +220,7 @@ def test_all_scenes_use_the_same_grounded_acknowledgement_contract(
     plan = asyncio.run(plan_next_followup(state, _llm(_planner_payload())))
     planned = state.model_copy(update={"followup_plan": plan})
     deps = MagicMock(spec=GuideDeps)
-
+    deps.fast_llm = None
     updates = asyncio.run(node_ask_followup(planned, deps))
     reply = updates["messages"][0].content
 
@@ -303,7 +303,7 @@ def test_food_followup_renders_case_specific_question_and_reason():
         },
     )
     deps = MagicMock(spec=GuideDeps)
-
+    deps.fast_llm = None
     updates = asyncio.run(node_ask_followup(state, deps))
     reply = updates["messages"][0].content
 
@@ -329,7 +329,7 @@ def test_evidence_plan_cannot_turn_material_question_into_payment_method_questio
     )
     proposal = _planner_payload(
         ask_type="evidence",
-        candidate_id="consumer_transaction_evidence",
+        candidate_id="consumer_order_payment",
         decision_key="proof_of_payment",
         question="您是用现金还是手机支付这39元的？",
         contextual_reason="如果没有付款记录，对方一定会否认这次消费",
@@ -337,7 +337,7 @@ def test_evidence_plan_cannot_turn_material_question_into_payment_method_questio
 
     plan = asyncio.run(plan_next_followup(state, _llm(proposal)))
 
-    assert "订单、发票、收据或付款记录" in plan["question"]
+    assert "订单详情、付款记录或发票" in plan["question"]
     assert plan["contextual_reason"] == ""
 
 
@@ -370,7 +370,7 @@ def test_declarative_detail_is_not_misclassified_as_a_counter_question():
         messages=[HumanMessage(content=user_text)],
         pending_ask_details=["您有付款记录吗？"],
         pending_ask_type="evidence",
-        pending_followup_ids=["consumer_transaction_evidence"],
+        pending_followup_ids=["consumer_order_payment"],
     )
     payload = {
         "is_answer": False,
@@ -392,6 +392,7 @@ def test_declarative_detail_is_not_misclassified_as_a_counter_question():
         "adverse_facts": [],
     }
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = _llm(payload)
 
     updates = asyncio.run(node_parse_details(state, deps))
@@ -423,7 +424,7 @@ def test_generic_planner_question_uses_scannable_markdown_without_repeating_cont
         },
     )
     deps = MagicMock(spec=GuideDeps)
-
+    deps.fast_llm = None
     updates = asyncio.run(node_ask_followup(state, deps))
     reply = updates["messages"][0].content
 
@@ -585,7 +586,7 @@ def test_contextual_reason_cannot_invent_procedural_outcomes(contextual_reason: 
         time_info="昨天",
     )
     payload = _planner_payload(
-        candidate_id="criminal_original_clues",
+        candidate_id="criminal_cctv_recording",
         ask_type="evidence",
         question="现场监控或证人线索，您现在能找到哪一种？",
         contextual_reason=contextual_reason,
@@ -595,7 +596,7 @@ def test_contextual_reason_cannot_invent_procedural_outcomes(contextual_reason: 
 
     assert plan["should_ask"] is True
     assert plan["contextual_reason"] == ""
-    assert "相关人员身份" in plan["reason"]
+    assert "影像线索" in plan["reason"]
 
 
 def test_planner_repairs_multiple_questions_to_one_center_question():
@@ -769,6 +770,7 @@ def test_parse_details_records_blacklist_through_generic_case_updates_only():
         "adverse_facts": [],
     }
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = _llm(payload)
 
     updates = asyncio.run(node_parse_details(state, deps))

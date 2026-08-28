@@ -34,6 +34,7 @@ settings = get_settings()
 
 def _deps_with_parse(payload: dict) -> GuideDeps:
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(
         return_value=AIMessage(content=json.dumps(payload, ensure_ascii=False))
@@ -313,6 +314,7 @@ def test_counter_question_is_answered_before_pending_question_is_restored():
         "user_question": "劳动仲裁收费吗？",
     }
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(side_effect=[
         AIMessage(content=json.dumps(parser_payload, ensure_ascii=False)),
@@ -438,6 +440,7 @@ def test_pure_conclusion_command_is_not_parsed_or_saved_as_a_case_fact():
         draftable_facts=["用户昨天在百货大楼受伤"],
     )
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock()
 

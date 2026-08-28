@@ -86,7 +86,26 @@ def test_grounded_law_rendering_preserves_retrieval_order_without_scene_prioriti
     assert "《丁法》第四条" not in restored
 
 
-def test_long_term_case_memory_requires_explicit_user_recall():
+def test_grounded_legal_basis_includes_cited_laws_beyond_first_two():
+    context = "\n\n---\n\n".join([
+        "法条1【甲法 第一条】\n第一条检索原文。",
+        "法条2【乙法 第二条】\n第二条检索原文。",
+        "法条3【丙法 第三条】\n第三条检索原文。",
+        "法条4【丁法 第四条】\n第四条检索原文。",
+    ])
+    reply = (
+        "**【法律依据】**\n模型先写的一段。\n\n"
+        "**【核心争点分析】**\n根据《丙法》第三条，需要继续分析。"
+    )
+
+    restored = _ensure_grounded_legal_basis(reply, context)
+
+    assert "《丙法》第三条" in restored
+    assert "《甲法》第一条" in restored
+    assert "模型先写的一段" not in restored
+
+
+def test_long_term_case_memory_is_available_without_explicit_recall():
     memory = "法律咨询摘要：案情事实：支付700元；经营者没有回应"
     new_case = GuideState(
         messages=[HumanMessage(content="我今天遇到另一件事")],
@@ -96,5 +115,5 @@ def test_long_term_case_memory_requires_explicit_user_recall():
         "messages": [HumanMessage(content="我之前说的纠纷是什么情况？")],
     })
 
-    assert _active_long_term_memories(new_case) == []
+    assert _active_long_term_memories(new_case) == [memory]
     assert _active_long_term_memories(recall) == [memory]

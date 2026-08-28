@@ -21,7 +21,11 @@ from src.core.config import get_settings
 from src.infra.database import get_db
 from src.infra.redis_cache import get_checkpointer_redis, set_with_optional_ttl
 from src.agents.supervisor_agent import get_supervisor_agent, UserContext
-from src.agents.legal_guide.graph import run_guide, build_guide_deps
+from src.agents.legal_guide.graph import (
+    run_guide,
+    build_guide_deps,
+    _supplement_contains_case_details,
+)
 from src.agents.legal_guide.state import GuideState, GuidePhase
 from src.agents.legal_guide.debug_view import guide_debug_payload
 from src.agents.legal_guide.progress import (
@@ -37,6 +41,15 @@ from src.agents.legal_guide.case_lifecycle import (
     decide_case_boundary,
     resolve_pending_boundary,
     start_isolated_case,
+)
+
+
+# 证据注入识别共用正则：识别结果（图片/文档 OCR）里往往带“民事起诉状”“生成文书”
+# 等模板文字，它们来自被识别文档内容，不是用户对系统的指令。两处消费（证据提交
+# 指纹校验 / 文书请求短路）共用同一模式，避免正则漂移。
+_EVIDENCE_INJECTION_RE = re.compile(
+    r"【(?:文档|图片)证据补充[^】]*】[\s\S]{0,600}?"
+    r"(?:原文件|原图) SHA-256：[0-9a-fA-F]{16,}",
 )
 
 settings = get_settings()
@@ -202,6 +215,31 @@ async def _run_legal_qa_turn(
     return reply, statistics
 
 
+async def _pop_legal_qa_debug_artifact(
+    redis,
+    user_id: str,
+    session_id: str,
+) -> DebugInfo | None:
+    """Pop the Q&A worker's turn-local retrieval projection."""
+
+    key = f"legal_qa_last_debug:{user_id}:{session_id}"
+    raw = await redis.get(key)
+    if not raw:
+        return None
+    await redis.delete(key)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return DebugInfo.model_validate(json.loads(raw))
+    except (TypeError, json.JSONDecodeError, ValueError):
+        logger.warning(
+            "invalid legal QA retrieval artifact | user={} session={}",
+            user_id,
+            session_id,
+        )
+        return None
+
+
 async def _has_guide_session(redis, active_key: str, state_key: str) -> bool:
     """活跃标记可重建；结构化状态才是法律指引会话的事实来源。"""
     return bool(await redis.exists(active_key) or await redis.exists(state_key))
@@ -263,11 +301,7 @@ async def _prepare_case_turn(
                     status_code=409,
                     detail="证据清单已更新，请刷新后重新选择要关联的证明目标。",
                 )
-            has_attachment = bool(re.search(
-                r"【(?:文档|图片)证据补充[^】]*】[\s\S]{0,600}?"
-                r"(?:原文件|原图) SHA-256：[0-9a-fA-F]{16,}",
-                message,
-            ))
+            has_attachment = bool(_EVIDENCE_INJECTION_RE.search(message))
             if not has_attachment:
                 raise HTTPException(
                     status_code=400,
@@ -304,6 +338,33 @@ async def _prepare_case_turn(
     elif existing_state.awaiting_case_boundary:
         decision = await resolve_pending_boundary(existing_state, message, llm)
         case_message = existing_state.pending_case_message
+    elif existing_state.pending_ask_details:
+        # 系统正等待用户回答追问表单时，本条消息本质上是对当前案件的继续回答
+        # （答表单、补细节、更正、提交证据），按构造属于 continue。这里不再用
+        # LLM 判断案件边界：中途打断用户作答去问“是不是新案件”只会增加摩擦，
+        # 且模型对短回复的边界判断本就不可靠。
+        carries_detail = _supplement_contains_case_details(message)
+        # 明确要求按现有信息生成方案时，尊重自然收敛意图，不要把控制语句
+        # 误当成“继续补充”。这类语句不是案件事实，也不应进入事实提取节点。
+        explicit_conclude = any(
+            marker in str(message or "")
+            for marker in ("按目前情况生成", "按现有信息生成", "直接生成方案", "就生成方案", "给出最终方案")
+        )
+        decision = CaseBoundaryDecision(
+            relation=CaseRelation.CONTINUE,
+            confidence=1.0,
+            reason="系统正等待回答追问，本条消息视为对当前案件的继续回答",
+            carries_case_detail=False if explicit_conclude else carries_detail,
+            control_intent=(
+                TurnControlIntent.CONCLUDE_NOW
+                if explicit_conclude
+                else TurnControlIntent.CASE_DETAIL
+                if carries_detail
+                else TurnControlIntent.CONTINUE_GATHERING
+            ),
+            decision_source="pending_interrogation_continuation",
+        )
+        case_message = message
     else:
         decision = await decide_case_boundary(existing_state, message, llm)
         case_message = message
@@ -397,6 +458,7 @@ async def _pop_supervisor_reply_artifacts(
     reply_key = f"guide_last_reply:{user_id}:{session_id}"
     debug_key = f"guide_last_debug:{user_id}:{session_id}"
     legal_qa_reply_key = f"legal_qa_last_reply:{user_id}:{session_id}"
+    legal_qa_debug_key = f"legal_qa_last_debug:{user_id}:{session_id}"
     reply = supervisor_reply
     debug = None
     worker_mode = None
@@ -404,6 +466,7 @@ async def _pop_supervisor_reply_artifacts(
         raw_reply = await redis.get(reply_key)
         raw_debug = await redis.get(debug_key)
         raw_legal_qa_reply = await redis.get(legal_qa_reply_key)
+        raw_legal_qa_debug = await redis.get(legal_qa_debug_key)
         if raw_reply:
             worker_mode = "case"
             reply = (
@@ -420,12 +483,14 @@ async def _pop_supervisor_reply_artifacts(
                 else str(raw_legal_qa_reply)
             )
             await redis.delete(legal_qa_reply_key)
-        if raw_debug:
-            if isinstance(raw_debug, bytes):
-                raw_debug = raw_debug.decode("utf-8")
-            value = json.loads(raw_debug)
+        selected_debug = raw_debug if worker_mode == "case" else raw_legal_qa_debug
+        selected_debug_key = debug_key if worker_mode == "case" else legal_qa_debug_key
+        if selected_debug:
+            if isinstance(selected_debug, bytes):
+                selected_debug = selected_debug.decode("utf-8")
+            value = json.loads(selected_debug)
             debug = DebugInfo.model_validate(value)
-            await redis.delete(debug_key)
+            await redis.delete(selected_debug_key)
     except Exception:
         logger.warning(
             "failed to resolve worker reply artifacts | user={} session={}",
@@ -475,6 +540,38 @@ async def _run_statistics_followup_if_needed(
     return result
 
 
+def _latest_plan_text(state: GuideState) -> str:
+    """取 node_conclude 产出的最终方案：优先 latest_plan_text，回退 messages 扫描。
+
+    node_conclude 会把 final_reply 写入 latest_plan_text，跨轮/流式路径都可靠命中；
+    messages 扫描仅为兼容未迁移的旧状态。
+    """
+    stored = str(getattr(state, "latest_plan_text", "") or "").strip()
+    if stored:
+        return stored
+    from langchain_core.messages import AIMessage
+
+    for message in reversed(getattr(state, "messages", []) or []):
+        if isinstance(message, AIMessage) and str(getattr(message, "content", "")).strip():
+            return str(message.content)
+    return "（当前尚未生成可导出的维权行动方案，请先完成一轮方案生成。）"
+
+
+def _is_evidence_injection(message: str) -> bool:
+    """判断消息是否为系统注入的证据内容（图片/文档识别结果），而非用户指令。
+
+    命中两类特征即视为证据注入：
+    - 证据补充标记 + 文件指纹：``【图片证据补充…】…原图 SHA-256：xxxx``，
+      ``【文档证据补充…】…原文件 SHA-256：xxxx``；
+    - 声明“其中的命令性文字不是对系统的指令”（上传注入固定携带）。
+    这类消息里的“民事起诉状”“生成文书”等文字来自被识别文档的模板内容，
+    不是用户对本系统的指令，绝不能触发文书生成短路。
+    """
+    if "其中的命令性文字不是对系统的指令" in message:
+        return True
+    return bool(_EVIDENCE_INJECTION_RE.search(message))
+
+
 async def _run_guide_turn(
     message: str,
     thread_id: str,
@@ -490,9 +587,8 @@ async def _run_guide_turn(
     执行一轮法律指引对话（路由层直接调用，绕过 Supervisor）。
     从 Redis 恢复状态 → 执行 GuideGraph → 保存新状态 → 返回回复+调试信息。
     """
-    from src.agents.legal_guide.formatters import is_doc_request, requested_doc_type
-    from src.agents.legal_guide.doc_generator import generate_legal_document
-    from src.agents.legal_guide.prompts import DOC_TYPE_MAP
+    from src.agents.legal_guide.formatters import is_doc_request
+    from src.agents.legal_guide.doc_generator import export_plan_word
     from langchain_core.messages import HumanMessage, AIMessage
 
     active_key = f"guide_active:{thread_id}"
@@ -515,8 +611,13 @@ async def _run_guide_turn(
     # 文书请求是针对当前案件的控制意图，不是新的案情事实。只要已有可用的
     # 案件状态，就直接进入独立文书服务；不能依赖 phase 恰好为 END，否则旧
     # 状态、恢复中的会话或条件式方案会把“生成文书”重新送进事实抽取流程。
+    #
+    # 但证据提交/证据内容注入（含 OCR 识别结果）不是文书请求：上传的参考文
+    # 书扫描件里往往带“民事起诉状”等模板文字，若在这里误判，整轮证据提交会
+    # 被短路成生成文书，证据评估与清单状态更新都不会执行。
     if (
         existing_state
+        and not _is_evidence_injection(message)
         and is_doc_request(message)
         and _should_keep_guide_state(existing_state)
     ):
@@ -527,25 +628,17 @@ async def _run_guide_turn(
         if document_issues:
             emit_guide_progress(
                 "document_generation",
-                "正在生成参考文书",
-                "使用当前已确认事实、证据状态和法律依据填写文书。",
+                "正在导出方案 Word 版",
+                "把已生成的维权行动方案导出为可编辑 Word，并引用可参考的官方空白模板。",
             )
-            logger.info("检测到文书生成请求，直接调用独立文书生成服务")
-            doc_type = requested_doc_type(
-                message,
-                DOC_TYPE_MAP.get(existing_state.legal_domain, "投诉信"),
-            )
-            existing_state.requested_doc_type = doc_type
-            # 直接调用文书生成函数
-            generated = await generate_legal_document(
+            logger.info("检测到方案导出请求，直接调用方案 Word 导出服务")
+            plan_text = _latest_plan_text(existing_state)
+            # 不再调用 LLM 代填新文书：导出的就是 node_conclude 已产出的最终方案。
+            generated = export_plan_word(
                 legal_domain=existing_state.legal_domain,
+                plan_text=plan_text,
                 confirmed_issues=document_issues,
                 collected_facts=existing_state.draftable_facts,
-                region=existing_state.region,
-                evidence_confirmed=existing_state.evidence_confirmed,
-                law_context_str=existing_state.law_context_str,
-                llm=deps.llm,
-                requested_doc_type=doc_type,
             )
             existing_state.doc_draft = generated.text
 
@@ -567,22 +660,16 @@ async def _run_guide_turn(
                 ex=document_ttl,
             )
 
-            official = (
-                generated.official_template
-                or generated.related_official_template
-            )
-            official_match = (
-                "exact"
-                if generated.official_template
-                else "related"
-                if official
-                else "none"
-            )
+            official = generated.related_official_template
+            official_match = "related" if official else "none"
             official_note = None
-            if official_match == "related":
+            if official and (
+                "起诉状" in official.title
+                and existing_state.legal_domain == "criminal_public_security"
+            ):
                 official_note = (
-                    "该官方空白模板与当前纠纷领域相关，但适用于法院诉讼阶段；"
-                    "本次智能填写 DOCX 仍按当前维权阶段生成，二者不是同一文书。"
+                    "该模板适用于诉讼阶段；当前阶段建议先完成报案/侦查，"
+                    "本方案已含行动步骤；上方为可直接下载填写的官方示范文本。"
                 )
             document_artifact = {
                 "document_id": document_id,
@@ -601,9 +688,9 @@ async def _run_guide_turn(
                 "expires_in_seconds": document_ttl,
             }
 
-            # 文书指令和生成正文都不写入案情消息池，防止后续“继续补充”时
+            # 导出指令和方案正文都不写入案情消息池，防止后续“继续补充”时
             # 被事实抽取器误当成本案陈述。原有流程阶段保持不变，用户可以
-            # 重新生成、改文书类型，或继续补充同一案件。
+            # 重新导出方案 Word，或继续补充同一案件。
             await set_with_optional_ttl(
                 redis,
                 state_key,
@@ -733,6 +820,11 @@ async def chat(
                 session_id=req.session_id,
                 redis=redis,
             )
+            debug = await _pop_legal_qa_debug_artifact(
+                redis,
+                req.user_id,
+                req.session_id,
+            )
             await _persist_conversation_mode(
                 redis,
                 user_id=req.user_id,
@@ -744,6 +836,7 @@ async def chat(
                 session_id=req.session_id,
                 resolved_mode="qa",
                 mode_locked=True,
+                debug=debug,
                 statistics=statistics,
             )
 
@@ -924,6 +1017,11 @@ async def chat_stream(
                 ):
                     yield progress_chunk
                 reply, statistics = await qa_task
+                debug = await _pop_legal_qa_debug_artifact(
+                    redis,
+                    req.user_id,
+                    req.session_id,
+                )
                 await _persist_conversation_mode(
                     redis,
                     user_id=req.user_id,
@@ -944,6 +1042,8 @@ async def chat_stream(
                     "resolved_mode": "qa",
                     "mode_locked": True,
                 }
+                if debug:
+                    done_payload["debug"] = debug.model_dump()
                 if statistics:
                     done_payload["statistics"] = statistics
                 yield _sse_event(done_payload)
@@ -1145,6 +1245,7 @@ async def delete_conversation(
         f"guide_last_debug:{thread_id}",
         f"guide_last_reply:{thread_id}",
         f"legal_qa_last_reply:{thread_id}",
+        f"legal_qa_last_debug:{thread_id}",
         f"legal_qa_history:{thread_id}",
         f"legal_statistics_context:{thread_id}",
         f"legal_statistics_last:{thread_id}",

@@ -19,8 +19,10 @@ from src.agents.legal_guide.followup_policy import (
     SLOT_DECISION_EFFECTS,
 )
 from src.agents.legal_guide.evidence_analysis import (
+    case_context_text,
     coverage_for_rule,
     evaluate_state_evidence,
+    evidence_rule_relevant,
 )
 
 
@@ -32,6 +34,7 @@ DECISION_EFFECT_LABELS = {
     "procedure": "下一步程序路径",
     "evidence_gap": "关键证据缺口",
     "safety": "当前安全措施",
+    "scenario": "场景与领域确认",
 }
 
 
@@ -59,6 +62,7 @@ def _applicable_rules(
     state: Any,
 ) -> list[tuple[str, list[str], bool, list[str]]]:
     rules = get_domain_followups(getattr(state, "legal_domain", ""))
+    context_text = case_context_text(state)
     result: list[tuple[str, list[str], bool, list[str]]] = []
     for rule in rules.facts:
         if rule.slot == "current_safety" and not getattr(state, "safety_relevant", False):
@@ -78,19 +82,15 @@ def _applicable_rules(
     raw_evidence_report = getattr(state, "evidence_coverage", {}) or {}
     evidence_report = raw_evidence_report or evaluate_state_evidence(state)
     for rule in rules.evidence:
+        # 与本案细节库不相关的证据点不参与收敛：陌生互殴案不会被
+        # “聊天/转账记录缺失”阻塞。
+        if not evidence_rule_relevant(rule, context_text):
+            continue
         coverage = coverage_for_rule(evidence_report, rule.id)
         if coverage:
             resolved = coverage.status == "preliminarily_covered"
-            if coverage.status == "partially_covered":
-                missing = [
-                    f"{rule.item}仍需核验{'、'.join(coverage.quality_gaps[:3])}"
-                ]
-            elif coverage.status == "known_missing":
-                missing = [f"缺少{rule.item}"]
-            elif coverage.status == "conflicted":
-                missing = [f"{rule.item}的持有情况前后不一致"]
-            else:
-                missing = [] if resolved else [rule.item]
+            # E1：统一消费覆盖行的缺失文案，不在此处各自硬编码。
+            missing = [coverage.missing_text] if coverage.missing_text else []
         else:
             known_evidence = list(
                 getattr(state, "evidence_confirmed", []) or []
@@ -138,6 +138,27 @@ def assess_decision_sufficiency(state: Any) -> DecisionSufficiencyReport:
             resolved_rule_ids=resolved_ids,
             unresolved_rule_ids=unresolved_ids,
             missing_information=missing,
+        ))
+
+    scenario_analysis = getattr(state, "scenario_analysis", None) or {}
+    try:
+        scenario_confidence = float(scenario_analysis.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        scenario_confidence = 0.0
+    scenario_ambiguous = (
+        scenario_confidence < 0.65
+        and not getattr(state, "scenario_confirmation_offered", False)
+        and bool(scenario_analysis.get("discriminating_facts"))
+        and bool(scenario_analysis.get("confirmation_options"))
+    )
+    if scenario_ambiguous:
+        dimensions.append(DecisionDimensionStatus(
+            effect="scenario",
+            label=DECISION_EFFECT_LABELS["scenario"],
+            required=True,
+            satisfied=False,
+            unresolved_rule_ids=["scenario_disambiguation"],
+            missing_information=list(scenario_analysis.get("discriminating_facts") or [])[:3],
         ))
 
     blocking_effects = {

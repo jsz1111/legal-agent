@@ -1,12 +1,9 @@
 """法律知识问答 Agent — 对标 knowledge_agent.py，使用法律 RAG 工具箱。"""
 from langchain.agents import create_agent
-from langchain_deepseek import ChatDeepSeek
 
-from src.core.config import get_settings
+from src.agents.legal_guide.llm_runtime import build_chat_llm
 from src.agents.legal_knowledge.runtime import build_legal_knowledge_deps
 from src.agents.legal_knowledge.tools import build_legal_knowledge_tools
-
-settings = get_settings()
 
 LEGAL_QA_SYSTEM_PROMPT = """你是专业的法律知识问答助手，面向普通市民和企业用户提供法律知识服务。
 
@@ -55,7 +52,7 @@ LEGAL_QA_SYSTEM_PROMPT = """你是专业的法律知识问答助手，面向普�
 ## 工作原则
 
 1. 回答必须基于工具返回的检索结果，不要编造法律条文或案例
-2. 引用法条时注明法律名称和条号（如"《劳动合同法》第三十条"）
+2. 引用法条时注明法律名称和条号（如"《劳动合同法》第三十条"）；在“依据来源”中必须同时摘录检索返回的对应条文正文，禁止只列法律名称和条号
 3. 如果所有工具都未找到相关信息，明确告知用户并建议拨打12348法律援助热线
 4. 涉及刑事、重大民事纠纷，必须建议用户寻求专业律师帮助
 5. 法律年鉴统计资料只用于数据分析，不能作为法律依据或个案裁判结论
@@ -80,18 +77,18 @@ def create_legal_qa_agent(
     db_session=None,
     user_id: str = "anonymous",
     statistics_previous_sql: str = "",
+    retrieval_artifacts: list[dict] | None = None,
+    milvus_client=None,
 ):
     deps = build_legal_knowledge_deps(
         db_session,
         user_id,
         statistics_previous_sql=statistics_previous_sql,
+        retrieval_artifacts=retrieval_artifacts,
+        milvus_client=milvus_client,
     )
     tools = build_legal_knowledge_tools(deps)
-    llm = ChatDeepSeek(
-        model=settings.DEEPSEEK_MODEL,
-        api_key=settings.DEEPSEEK_API_KEY,
-        temperature=0.3,
-    )
+    llm = build_chat_llm(temperature=0.3)
     return create_agent(
         model=llm,
         tools=tools,

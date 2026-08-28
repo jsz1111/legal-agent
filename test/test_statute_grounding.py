@@ -79,6 +79,36 @@ def test_verify_grounding_off_skips_check():
     check_mock.assert_not_awaited()
 
 
+def test_retrieval_trace_contains_exact_statute_text():
+    """Q&A inspector receives the same law text used for generation."""
+    hits = [{
+        "law_id": "28",
+        "article_no": "第七十六条",
+        "domain": "traffic_personal_injury",
+        "text": "机动车发生交通事故造成人身伤亡、财产损失的，由保险公司依法赔偿。",
+        "score": 0.91,
+    }]
+    trace = {}
+    with patch(
+        "src.agents.legal_knowledge.statute_rag.search_statutes_raw",
+        new=AsyncMock(return_value=hits),
+    ):
+        out = asyncio.run(search_statutes(
+            "红灯能否通行",
+            MagicMock(),
+            MagicMock(),
+            _llm_returning("不能通行"),
+            db_session=None,
+            verify_grounding=False,
+            retrieval_trace=trace,
+        ))
+
+    assert out == "不能通行"
+    assert trace["hits"][0]["article_no"] == "第七十六条"
+    assert "由保险公司依法赔偿" in trace["hits"][0]["text"]
+    assert "机动车发生交通事故" in trace["context"]
+
+
 if __name__ == "__main__":
     test_grounded_answer_unchanged()
     test_ungrounded_answer_gets_disclaimer()

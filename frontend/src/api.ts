@@ -31,6 +31,8 @@ export type EvidenceRequirement = {
   alternatives?: string[]
   quality_gaps?: string[]
   next_action?: string
+  collect_mode?: string
+  decay_risk?: boolean
   trigger_fact_keys?: string[]
   basis_refs?: Array<{
     title?: string

@@ -32,6 +32,12 @@ class FactFollowup(BaseModel):
     priority: int = 100
 
 
+class EvidenceRelevance(BaseModel):
+    """证据点与案情的相关性门控：命中 when_facts 关键词才算本案合理需要。"""
+    when_facts: list[str] = Field(default_factory=list)
+    hide_default: bool = False
+
+
 class EvidenceFollowup(BaseModel):
     id: str
     evidence_key: str
@@ -41,6 +47,9 @@ class EvidenceFollowup(BaseModel):
     alternatives: list[str] = Field(default_factory=list)
     match_keywords: list[str] = Field(default_factory=list)
     priority: int = 100
+    relevance: EvidenceRelevance | None = None
+    collect_mode: str = ""
+    decay_risk: bool = False
 
 
 class DomainFollowups(BaseModel):

@@ -23,6 +23,7 @@ from langgraph.graph import END
 def _make_deps(urgency_json: dict) -> GuideDeps:
     """构造一个 LLM 只返回指定 urgency JSON 的 deps。"""
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     resp = AIMessage(content=json.dumps(urgency_json, ensure_ascii=False))
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(return_value=resp)
@@ -129,9 +130,62 @@ def test_past_violence_without_current_status_is_marked_unknown_not_critical():
     assert result["current_safety_status"] == "unknown"
 
 
+def test_physical_harm_is_never_marked_not_applicable_by_model():
+    deps = _make_deps({
+        "urgency": "NORMAL",
+        "safety_relevant": False,
+        "safety_status": "not_applicable",
+        "time_clue": "",
+    })
+    state = GuideState(messages=[HumanMessage(content="我被打了")])
+
+    result = asyncio.run(node_check_urgency(state, deps))
+
+    assert result["urgency_level"] == "normal"
+    assert result["safety_relevant"] is True
+    assert result["current_safety_status"] == "unknown"
+
+
+def test_extract_issues_safety_frame_overrides_early_cyber_domain():
+    state = GuideState(
+        round=2,
+        legal_domain="cyber_data_fraud",
+        confidence_tier="LOW",
+        confirmed_issues=["疑似网络诈骗"],
+        messages=[HumanMessage(content="我被打了")],
+    )
+    normalizer = AsyncMock(return_value={
+        "standard": ["人身安全纠纷"],
+        "colloquial": [],
+        "term_map": {},
+        "domain": "criminal_public_security",
+        "case_frame": "personal_safety",
+        "frame_confidence": 0.95,
+        "collected_facts": ["我被打了"],
+        "case_updates": [],
+        "evidence_details": [],
+        "region": "",
+        "time_info": "",
+    })
+    deps = MagicMock()
+    deps.fast_llm = deps.llm
+
+    with patch(
+        "src.agents.legal_guide.graph.normalize_legal_issues",
+        new=normalizer,
+    ):
+        updates = asyncio.run(node_extract_issues(state, deps))
+
+    assert updates["legal_domain"] == "criminal_public_security"
+    assert updates["case_frame"] == "personal_safety"
+    assert updates["frame_confidence"] == 0.95
+    assert updates["safety_relevant"] is True
+
+
 def test_prepare_turn_increments_user_round_once():
     """每条用户消息只由 prepare_turn 推进一次轮次。"""
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     state = GuideState(round=2, total_rounds=2)
     result = asyncio.run(node_prepare_turn(state, deps))
     assert result["round"] == 3
@@ -213,6 +267,7 @@ def test_resumed_safety_case_extracts_the_original_event_and_clears_pause_messag
         "time_info": "",
     })
     deps = MagicMock()
+    deps.fast_llm = deps.llm
 
     with patch(
         "src.agents.legal_guide.graph.normalize_legal_issues",

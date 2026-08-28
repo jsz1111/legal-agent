@@ -9,6 +9,7 @@ from langgraph.graph import END
 from src.agents.legal_guide.graph import (
     GuideDeps,
     _needs_clarify,
+    _recall_relevant_memories,
     build_guide_graph,
     node_assess_retrieve,
     node_clarify,
@@ -20,6 +21,7 @@ from src.agents.legal_guide.graph import (
     run_guide,
 )
 from src.agents.legal_guide.decision_sufficiency import DecisionSufficiencyReport
+from src.agents.legal_guide.scenario_assessment import ScenarioAssessment
 from src.agents.legal_guide.state import GuidePhase, GuideState
 from src.core.config import get_settings
 from src.api.routers.chat import _has_guide_session, _should_keep_guide_state
@@ -88,6 +90,45 @@ def test_route_after_extract_branches():
     assert route_after_extract(
         GuideState(confirmed_issues=["拖欠工资"])
     ) == "assess_retrieve"
+
+
+def test_low_information_message_clarifies_even_with_prior_domain_and_facts():
+    state = GuideState(
+        legal_domain="cyber_data_fraud",
+        confirmed_issues=["疑似网络诈骗"],
+        collected_facts=["用户此前被网络诈骗"],
+        messages=[HumanMessage(content="我")],
+    )
+
+    assert route_after_extract(state) == "clarify"
+
+
+def test_extract_low_information_message_skips_memory_and_llm():
+    state = GuideState(
+        user_context={"long_term_memories": ["用户此前被网络诈骗"]},
+        messages=[HumanMessage(content="我")],
+    )
+    deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
+    deps.llm = MagicMock()
+    normalizer = AsyncMock()
+    with patch(
+        "src.agents.legal_guide.graph.normalize_legal_issues",
+        new=normalizer,
+    ):
+        result = asyncio.run(node_extract_issues(state, deps))
+
+    normalizer.assert_not_awaited()
+    assert result["phase"] == GuidePhase.CLARIFY
+    assert result["issue_refresh_needed"] is False
+
+
+def test_recall_relevant_memories_skips_low_information_query():
+    with patch("src.infra.milvus_store.get_milvus_store") as store:
+        result = asyncio.run(_recall_relevant_memories("user_1", "我"))
+
+    assert result == []
+    store.assert_not_called()
 
 
 def test_route_after_parse_branches():
@@ -167,6 +208,7 @@ def test_unresolved_safety_plan_routes_to_one_followup_not_conclusion():
 
 def test_parse_details_clears_explicit_ask_type_and_saves_time():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps({
         "is_answer": True,
@@ -193,6 +235,7 @@ def test_parse_details_clears_explicit_ask_type_and_saves_time():
 
 def test_clarify_uses_recent_context_and_registers_a_pending_question():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(
         return_value=AIMessage(content="对方是什么身份，例如个人还是公司？")
@@ -243,6 +286,7 @@ def test_more_specific_grounded_facts_can_revise_an_early_low_confidence_domain(
         "time_info": "",
     }
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.neo4j_driver = MagicMock()
     deps.embedding_model = MagicMock()
@@ -259,6 +303,7 @@ def test_more_specific_grounded_facts_can_revise_an_early_low_confidence_domain(
 
 def test_parse_details_timeout_preserves_declarative_user_answer():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(side_effect=TimeoutError("slow model"))
     state = GuideState(
@@ -277,6 +322,7 @@ def test_parse_details_timeout_preserves_declarative_user_answer():
 
 def test_off_target_but_substantive_answer_requests_issue_and_domain_refresh():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps({
         "is_answer": True,
@@ -350,6 +396,39 @@ def test_assess_retrieve_reuses_snapshot_when_user_requests_conclusion():
     assert result["force_conclude"] is False
 
 
+def test_assess_retrieve_asks_scenario_confirmation_before_domain_retrieval():
+    state = GuideState(
+        legal_domain="cyber_data_fraud",
+        confirmed_issues=["疑似网络诈骗"],
+    )
+    deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
+    deps.llm = MagicMock()
+    report = ScenarioAssessment(
+        primary_scenario="平台下单付款后没收到货",
+        primary_domain="consumer_market",
+        primary_frame="contract_service",
+        confidence=0.4,
+        competing_scenarios=["对方诱导直接转账后被拉黑"],
+        discriminating_facts=["钱是直接转给个人还是平台支付"],
+        confirmation_question="您的情况更接近哪一种？",
+        confirmation_options=[
+            "平台下单付款后没收到货",
+            "对方诱导直接转账后被拉黑",
+        ],
+    )
+    with patch(
+        "src.agents.legal_guide.graph.assess_scenario",
+        new=AsyncMock(return_value=report),
+    ):
+        result = asyncio.run(node_assess_retrieve(state, deps))
+
+    assert result["followup_plan"]["planner_mode"] == "scenario_confirmation"
+    assert result["followup_plan"]["should_ask"] is True
+    assert result["scenario_confirmation_offered"] is True
+    assert result["scenario_analysis"]["primary_domain"] == "consumer_market"
+
+
 def test_assess_retrieve_explicit_continue_overrides_soft_sufficiency_stop():
     state = GuideState(
         legal_domain="criminal_public_security",
@@ -363,11 +442,12 @@ def test_assess_retrieve_explicit_continue_overrides_soft_sufficiency_stop():
     )
     followup = {
         "should_ask": True,
-        "candidate_id": "criminal_original_clues",
+        "candidate_id": "criminal_cctv_recording",
         "planner_mode": "deterministic_policy",
     }
     planner = AsyncMock(return_value=followup)
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     with patch(
         "src.agents.legal_guide.graph.node_score",
@@ -379,6 +459,9 @@ def test_assess_retrieve_explicit_continue_overrides_soft_sufficiency_stop():
             recommended_action="conclude_definitive",
             reason="自动判断已经充分",
         ),
+    ), patch(
+        "src.agents.legal_guide.graph.plan_fixed_batch",
+        new=AsyncMock(return_value={"should_ask": False}),
     ), patch(
         "src.agents.legal_guide.graph.plan_next_followup",
         new=planner,
@@ -411,10 +494,14 @@ def test_assess_retrieve_skips_all_knowledge_retrieval_while_following_up():
         "planner_mode": "deterministic_policy",
     })
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     with patch(
         "src.agents.legal_guide.graph.node_score",
         new=AsyncMock(return_value={"confidence_score": 0.3, "confidence_tier": "LOW"}),
+    ), patch(
+        "src.agents.legal_guide.graph.plan_fixed_batch",
+        new=AsyncMock(return_value={"should_ask": False}),
     ), patch(
         "src.agents.legal_guide.graph.plan_next_followup",
         new=planner,
@@ -444,10 +531,14 @@ def test_assess_retrieve_runs_knowledge_retrieval_when_planner_converges():
         "planner_mode": "no_candidates",
     })
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     with patch(
         "src.agents.legal_guide.graph.node_score",
         new=AsyncMock(return_value={"confidence_score": 0.3, "confidence_tier": "LOW"}),
+    ), patch(
+        "src.agents.legal_guide.graph.plan_fixed_batch",
+        new=AsyncMock(return_value={"should_ask": False}),
     ), patch(
         "src.agents.legal_guide.graph.plan_next_followup",
         new=planner,
@@ -464,6 +555,7 @@ def test_assess_retrieve_runs_knowledge_retrieval_when_planner_converges():
 
 def test_explicit_continue_can_use_bounded_extra_rounds_but_not_exceed_absolute_limit():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     followup = {
         "should_ask": True,
@@ -483,6 +575,10 @@ def test_explicit_continue_can_use_bounded_extra_rounds_but_not_exceed_absolute_
         patch(
             "src.agents.legal_guide.graph.node_score",
             new=AsyncMock(return_value={"confidence_score": 0.4, "confidence_tier": "LOW"}),
+        ),
+        patch(
+            "src.agents.legal_guide.graph.plan_fixed_batch",
+            new=AsyncMock(return_value={"should_ask": False}),
         ),
         patch(
             "src.agents.legal_guide.graph.plan_next_followup",
@@ -521,6 +617,7 @@ def test_compiled_graph_has_exactly_nine_business_nodes():
 
 def test_end_to_end_route_returns_question_then_final_plan():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     common = [
         patch("src.agents.legal_guide.graph.node_load_context", new=AsyncMock(return_value={})),
         patch("src.agents.legal_guide.graph.node_check_urgency", new=AsyncMock(return_value={"urgency_level": "normal"})),

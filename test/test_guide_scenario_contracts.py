@@ -9,21 +9,104 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage
 
 import src.agents.legal_guide.graph as guide_graph
+import src.agents.legal_guide.issue_normalizer as issue_normalizer
 import src.agents.workers.guide_agent as guide_worker
 from src.agents.legal_guide.graph import GuideDeps
 from src.agents.legal_guide.db_queries import load_user_context
-from src.agents.legal_guide.issue_normalizer import extract_legal_issues
+from src.agents.legal_guide.issue_normalizer import (
+    IssuesOutput,
+    extract_legal_issues,
+    normalize_legal_issues,
+)
+from src.agents.legal_guide.scenario_assessment import assess_scenario
+from src.agents.legal_guide.situation_review import UserSituationVerdict
 from src.agents.legal_guide.state import GuidePhase, GuideState
 from src.agents.legal_knowledge.statute_rag import _expand_pg_keywords, format_statute_context
 
 
 def _deps_with_json(payload: dict) -> GuideDeps:
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(
         return_value=AIMessage(content=json.dumps(payload, ensure_ascii=False))
     )
     return deps
+
+
+def _conclude_llm(final_reply: str) -> MagicMock:
+    issue_payload = {
+        "fact_tensions": [],
+        "issues": [{
+            "issue_id": "issue_1",
+            "title": "核心争点",
+            "importance": "core",
+            "reason": "需要判断",
+            "supporting_fact_keys": [],
+            "retrieval_questions": [],
+            "facts_that_change_result": [],
+        }],
+    }
+    analysis_payload = {"analyses": [{
+        "issue_id": "issue_1",
+        "title": "核心争点",
+        "current_view": "阶段性判断",
+        "supporting_facts": [],
+        "adverse_facts": [],
+        "legal_basis_refs": [],
+        "application_analysis": "适用分析",
+        "conditional_branch": "条件分支",
+        "facts_to_verify": [],
+        "evidence_actions": [],
+        "recommended_actions": [],
+        "procedure_steps": [],
+    }]}
+    strategy_payload = {"strategy_plan": {
+        "headline_assessment": {
+            "position": "当前判断",
+            "supporting_reason": "依据",
+            "uncertainty": "未确认",
+        },
+        "priority_actions": [{
+            "action": "保存材料",
+            "object": "用户",
+            "purpose": "固定证据",
+            "why_now": "防止灭失",
+            "risk": "影响举证",
+        }],
+        "procedure_path": [],
+        "evidence_plan": [],
+        "opponent_arguments": [],
+        "institution_focus": [],
+        "risk_boundaries": [],
+        "conditions_that_change_result": [],
+        "source_issue_ids": ["issue_1"],
+        "source_law_refs": [],
+    }}
+    review_payload = {
+        "adverse_points": [],
+        "evidence_weaknesses": [],
+        "unmet_legal_elements": [],
+        "procedure_risks": [],
+        "opponent_arguments": [],
+        "premise_risks": [],
+        "must_disclose": [],
+        "current_procedure_stage": "待确认",
+        "next_procedure_stage": "先补充材料",
+        "next_stage_trigger": "材料齐全",
+        "conditional_paths": [],
+        "actionability_checks": [],
+        "duplicate_actions": [],
+    }
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=[
+        AIMessage(content=json.dumps(issue_payload, ensure_ascii=False)),
+        AIMessage(content=json.dumps(analysis_payload, ensure_ascii=False)),
+        AIMessage(content=json.dumps({**strategy_payload, "adversarial_execution_review": review_payload}, ensure_ascii=False)),
+        AIMessage(content=final_reply),
+        AIMessage(content=json.dumps({"verdict": "acceptable", "issues": []}, ensure_ascii=False)),
+    ])
+    return llm
 
 
 def test_prepare_turn_merges_context_without_losing_identity_or_memory():
@@ -35,6 +118,7 @@ def test_prepare_turn_merges_context_without_losing_identity_or_memory():
         },
     )
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.db_session = MagicMock()
 
     with patch.object(
@@ -70,6 +154,7 @@ def test_non_numeric_user_id_does_not_open_postgres_query():
 
 def test_prepare_turn_detects_user_requested_and_hard_limit_convergence():
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     requested = GuideState(
         round=3,
         total_rounds=3,
@@ -123,7 +208,7 @@ def test_followup_reply_has_at_most_two_questions_without_llm_expansion():
         },
     )
     deps = MagicMock(spec=GuideDeps)
-
+    deps.fast_llm = None
     updates = asyncio.run(guide_graph.node_ask_facts(state, deps))
     reply = updates["messages"][0].content
 
@@ -604,7 +689,7 @@ def test_required_sections_fill_empty_recommendation_block():
         "【法律依据】\n《劳动合同法》第三十条。\n"
         "【维权路径比较】\n- 劳动监察\n- 劳动仲裁\n"
         "【推荐方案】\n"
-        "【维权胜算评估】\n- 综合判断：中等\n"
+        "【优势与劣势】\n- 有利因素：有劳动合同\n"
         "【行动清单】\n1. 保存证据"
     )
 
@@ -620,7 +705,7 @@ def test_compact_accessible_reply_removes_optional_sections_not_required_section
         + "\n**【理解您的情况】**\n工资被拖欠。"
         + "\n**【法律依据】**\n法条。"
         + "\n**【维权路径比较】**\n投诉或仲裁。"
-        + "\n**【维权胜算评估】**\n较低。"
+        + "\n**【优势与劣势】**\n- 有劳动合同。"
         + "\n**【行动清单】**\n1. 保存材料。2. 打12333。3. 请家人协助。"
         + "\n**【常见误区】**\n" + "重复说明。" * 200
     )
@@ -629,7 +714,7 @@ def test_compact_accessible_reply_removes_optional_sections_not_required_section
 
     assert "重复开场" not in compacted
     assert "常见误区" not in compacted
-    for section in ("理解您的情况", "法律依据", "维权路径比较", "维权胜算评估", "行动清单"):
+    for section in ("理解您的情况", "法律依据", "维权路径比较", "优势与劣势", "行动清单"):
         assert section in compacted
 
 
@@ -641,7 +726,7 @@ def test_compact_reply_enforces_budget_and_preserves_document_offer():
         + "\n**【维权路径比较】**\n" + "路径说明。" * 300
         + "\n**【维权情况分析】**\n" + "重复分析。" * 300
         + "\n**【行动清单】**\n" + "行动步骤。" * 300
-        + "\n**【维权胜算评估】**\n一般。"
+        + "\n**【优势与劣势】**\n一般。"
         + "\n\n---\n📄 **需要参考文书？** 请回复「生成文书」。"
     )
 
@@ -652,7 +737,7 @@ def test_compact_reply_enforces_budget_and_preserves_document_offer():
     assert len(concluded) <= 2600
     assert "维权情况分析" not in compacted
     assert "需要参考文书" in compacted
-    for section in ("理解您的情况", "法律依据", "维权路径比较", "维权胜算评估", "行动清单"):
+    for section in ("理解您的情况", "法律依据", "维权路径比较", "优势与劣势", "行动清单"):
         assert section in compacted
 
 
@@ -666,7 +751,7 @@ def test_forced_conclusion_restores_action_checklist_if_cleanup_removed_it():
     reply = (
         "**【法律依据】**\n法条。\n"
         "**【维权路径比较】**\n投诉或仲裁。\n"
-        "**【维权胜算评估】**\n较低。"
+        "**【优势与劣势】**\n- 有劳动合同。"
     )
 
     restored = guide_graph._ensure_action_checklist(reply, state)
@@ -750,14 +835,14 @@ def test_requested_conclusion_removes_single_numbered_followup_without_losing_ac
 def test_forced_cleanup_does_not_delete_required_sections_after_supplement_sentence():
     reply = (
         "**【维权路径比较】**\n先投诉。\n"
-        "**【维权胜算评估】**\n需补充证据后才能准确评估。\n"
+        "**【优势与劣势】**\n需补充证据后才能准确评估。\n"
         "**【行动清单】**\n1. 保存材料。\n2. 拨打12348。"
     )
 
     sanitized = guide_graph._sanitize_forced_followups(reply)
 
     assert "【维权路径比较】" in sanitized
-    assert "【维权胜算评估】" in sanitized
+    assert "【优势与劣势】" in sanitized
     assert "【行动清单】" in sanitized
 
 
@@ -771,7 +856,7 @@ def test_required_plan_sections_are_restored_before_document_offer():
     restored = guide_graph._ensure_required_plan_sections(reply, state)
 
     assert "【维权路径比较】" in restored
-    assert "【维权胜算评估】" in restored
+    assert "【优势与劣势】" in restored
     assert "【行动清单】" in restored
     assert restored.index("【行动清单】") < restored.index("需要参考文书")
 
@@ -919,28 +1004,29 @@ def test_issue_extraction_reuses_same_llm_call_for_initial_fact_blackboard():
     assert result.time_info == "2025年4月开始"
 
 
-def test_issue_extraction_uses_high_precision_wage_fallback_on_invalid_json():
+def test_issue_extraction_invalid_json_keeps_seed_without_deterministic_routing():
     llm = MagicMock()
     llm.ainvoke = AsyncMock(return_value=AIMessage(content="not-json"))
 
     result = asyncio.run(extract_legal_issues("公司欠我工资。", llm))
 
-    assert result.issues == ["拖欠劳动报酬"]
-    assert result.domain == "labor_social_security"
-    assert result.facts == ["公司欠我工资。"]
+    assert result.issues == ["公司欠我工资。"]
+    assert result.domain == "other"
+    assert result.degraded is True
 
 
-def test_issue_extraction_uses_contract_nonperformance_fallback_on_invalid_json():
+def test_issue_extraction_invalid_json_keeps_contract_seed_without_deterministic_routing():
     llm = MagicMock()
     llm.ainvoke = AsyncMock(return_value=AIMessage(content="not-json"))
 
+    source = "我委托对方代购门票并支付4000元，双方约定未交付就退款，但对方没有退款。"
     result = asyncio.run(extract_legal_issues(
-        "我委托对方代购门票并支付4000元，双方约定未交付就退款，但对方没有退款。",
+        source,
         llm,
     ))
 
-    assert result.issues == ["合同履行与退款争议"]
-    assert result.domain == "contracts_property_housing"
+    assert result.issues == [source]
+    assert result.domain == "other"
     assert result.degraded is True
 
 
@@ -994,6 +1080,145 @@ def test_issue_extraction_timeout_preserves_recent_dialogue_as_semantic_seed():
     assert result.issues == [recent_dialogue]
     assert result.domain == "other"
     assert result.degraded is True
+
+
+def test_issue_extraction_physical_harm_overrides_cyber_fraud_label():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps({
+        "issues": ["网络购物付款后未收到货物"],
+        "domain": "cyber_data_fraud",
+        "case_frame": "financial_loss",
+        "frame_confidence": 0.8,
+        "facts": ["我被打了"],
+    }, ensure_ascii=False)))
+
+    result = asyncio.run(extract_legal_issues("我被打了", llm))
+
+    assert result.case_frame == "personal_safety"
+    assert result.domain == "criminal_public_security"
+    assert result.issues[0] == "人身安全纠纷，可能涉及故意伤害"
+    assert result.frame_confidence == 0.95
+
+
+def test_issue_extraction_physical_harm_fallback_uses_public_security_domain():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content="not-json"))
+
+    result = asyncio.run(extract_legal_issues("我被人打了，对方还威胁我", llm))
+
+    assert result.case_frame == "personal_safety"
+    assert result.domain == "criminal_public_security"
+    assert result.issues == ["人身安全纠纷，可能涉及故意伤害"]
+    assert result.frame_confidence == 0.95
+
+
+def test_deterministic_safety_gate_does_not_match_phone_call_phrasing():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content="not-json"))
+
+    result = asyncio.run(extract_legal_issues(
+        "对方一直打人电话催款",
+        llm,
+    ))
+
+    assert result.case_frame == "other"
+    assert result.domain == "other"
+    assert result.degraded is True
+
+
+def test_valid_llm_output_is_not_overwritten_by_deterministic_scenario_rules():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps({
+        "issues": ["网络购物付款后未收到货物"],
+        "domain": "consumer_market",
+        "case_frame": "contract_service",
+        "frame_confidence": 0.8,
+        "facts": ["我在闲鱼付款后对方不发货"],
+    }, ensure_ascii=False)))
+
+    result = asyncio.run(extract_legal_issues(
+        "我在闲鱼付款后对方不发货",
+        llm,
+    ))
+
+    assert result.domain == "consumer_market"
+    assert result.case_frame == "contract_service"
+    assert result.issues == ["网络购物付款后未收到货物"]
+
+
+def test_scenario_assessment_parses_model_report():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps({
+        "primary_scenario": "平台下单付款后没收到货",
+        "primary_domain": "consumer_market",
+        "primary_frame": "contract_service",
+        "confidence": 0.9,
+        "competing_scenarios": [],
+        "discriminating_facts": [],
+        "confirmation_question": "无需确认",
+        "confirmation_options": [],
+        "reason": "用户明确说明通过平台下单付款",
+    }, ensure_ascii=False)))
+    state = GuideState(
+        legal_domain="cyber_data_fraud",
+        confirmed_issues=["疑似网络诈骗"],
+        case_facts=[{
+            "key": "event.platform_order",
+            "category": "event",
+            "statement": "用户通过平台下单付款后没有收到货",
+            "source_text": "我在平台下单付款后没有收到货",
+            "status": "asserted",
+            "turn": 1,
+        }],
+    )
+
+    report = asyncio.run(assess_scenario(state, llm))
+
+    assert report.primary_domain == "consumer_market"
+    assert report.primary_frame == "contract_service"
+    assert report.confidence == 0.9
+
+
+def test_normalize_legal_issues_preserves_case_frame():
+    llm = MagicMock()
+    with (
+        patch.object(
+            issue_normalizer,
+            "extract_legal_issues",
+            new=AsyncMock(return_value=IssuesOutput(
+                issues=["人身安全纠纷，可能涉及故意伤害"],
+                domain="criminal_public_security",
+                case_frame="personal_safety",
+                frame_confidence=0.95,
+                facts=["我被打了"],
+            )),
+        ),
+        patch.object(
+            issue_normalizer,
+            "confirm_domain_in_neo4j",
+            new=AsyncMock(return_value="criminal_public_security"),
+        ),
+        patch.object(
+            issue_normalizer,
+            "match_issues_in_neo4j",
+            new=AsyncMock(return_value=([], [])),
+        ),
+        patch.object(
+            issue_normalizer,
+            "semantic_fallback",
+            new=AsyncMock(return_value=({}, [], [])),
+        ),
+    ):
+        result = asyncio.run(normalize_legal_issues(
+            "我被打了",
+            llm,
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+        ))
+
+    assert result["case_frame"] == "personal_safety"
+    assert result["frame_confidence"] == 0.95
 
 
 def test_parse_details_accumulates_fact_blackboard_across_turns():
@@ -1170,6 +1395,7 @@ def test_retrieval_query_uses_accumulated_facts_and_long_term_memory():
         user_context={"long_term_memories": ["用户此前保存了劳动合同"]},
     )
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.embedding_model = MagicMock()
     deps.milvus_client = MagicMock()
     deps.llm = MagicMock()
@@ -1197,10 +1423,11 @@ def test_retrieval_query_uses_accumulated_facts_and_long_term_memory():
 
 
 def test_conclusion_prompt_uses_retrieval_and_complete_state_blackboard():
-    llm = MagicMock()
-    llm.ainvoke = AsyncMock(return_value=AIMessage(content="最终方案含《测试法》第一条"))
+    llm = _conclude_llm("最终方案含《测试法》第一条")
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = llm
+    deps.fast_llm = llm
     state = GuideState(
         legal_domain="labor_social_security",
         confirmed_issues=["拖欠工资"],
@@ -1216,8 +1443,21 @@ def test_conclusion_prompt_uses_retrieval_and_complete_state_blackboard():
         confidence_tier="HIGH",
     )
 
-    updates = asyncio.run(guide_graph.node_conclude(state, deps))
-    prompt = llm.ainvoke.await_args_list[0].args[0][0].content
+    with patch.object(
+        guide_graph,
+        "assess_user_situation",
+        new=AsyncMock(return_value=UserSituationVerdict()),
+    ), patch.object(
+        guide_graph,
+        "_supplement_strategy_law_retrieval",
+        new=AsyncMock(return_value=([], "GROUNDING_LAW\n法条1【测试法 第一条】\n测试法条原文")),
+    ):
+        updates = asyncio.run(guide_graph.node_conclude(state, deps))
+    prompt = next(
+        call.args[0][0].content
+        for call in llm.ainvoke.await_args_list
+        if "请为用户生成一份实用的法律维权行动方案" in str(call.args[0][0].content)
+    )
 
     assert "GROUNDING_LAW" in prompt
     assert "GROUNDING_CASE" in prompt
@@ -1350,10 +1590,11 @@ def test_worker_tool_retrieves_long_term_memory_deterministically():
 
 
 def test_conclusion_writes_region_and_case_summary_to_long_term_memory():
-    llm = MagicMock()
-    llm.ainvoke = AsyncMock(return_value=AIMessage(content="最终维权方案"))
+    llm = _conclude_llm("最终维权方案")
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = llm
+    deps.fast_llm = llm
     store = MagicMock()
     store.aput = AsyncMock()
     state = GuideState(
@@ -1368,7 +1609,15 @@ def test_conclusion_writes_region_and_case_summary_to_long_term_memory():
         user_context={"user_id": "12"},
     )
 
-    with patch("src.infra.milvus_store.get_milvus_store", return_value=store):
+    with patch("src.infra.milvus_store.get_milvus_store", return_value=store), patch.object(
+        guide_graph,
+        "assess_user_situation",
+        new=AsyncMock(return_value=UserSituationVerdict()),
+    ), patch.object(
+        guide_graph,
+        "_supplement_strategy_law_retrieval",
+        new=AsyncMock(return_value=([], "")),
+    ):
         asyncio.run(guide_graph.node_conclude(state, deps))
 
     assert store.aput.await_count == 2

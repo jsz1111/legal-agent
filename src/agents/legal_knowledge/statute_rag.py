@@ -90,7 +90,7 @@ async def search_statutes_raw(
             )
 
         except Exception as e:
-            logger.warning(f"RRF 混合检索失败，降级为纯向量检索: {e}")
+            logger.warning("RRF 混合检索失败，降级为纯向量检索: {}", e, exc_info=True)
             use_rrf = False
 
     # 降级：纯 Dense 向量检索
@@ -112,7 +112,7 @@ async def search_statutes_raw(
                 filter=filter_expr,
             )
         except Exception as e:
-            logger.warning(f"法条检索失败: {e}")
+            logger.warning("法条检索失败: {}", e, exc_info=True)
             return []
 
     if not results or not results[0]:
@@ -202,6 +202,7 @@ async def search_statutes(
     domain: str = "",
     use_hyde: bool = True,
     verify_grounding: bool = True,
+    retrieval_trace: dict | None = None,
 ) -> str:
     """法条 RAG 完整流程：检索 → 精排 → 补充标题 → 生成回答 → 自省校验。
 
@@ -212,7 +213,24 @@ async def search_statutes(
         question, embedding_model, milvus_client,
         domain=domain, llm=llm, use_hyde=use_hyde,
     )
+    if not hits and db_session is not None:
+        try:
+            hits = await search_statutes_pg_fallback(
+                domain=domain,
+                issues=[question],
+                db_session=db_session,
+                limit=8,
+            )
+            if hits:
+                logger.info(
+                    "法条向量检索无结果，已使用 PostgreSQL 原文字面检索恢复 | hits={}",
+                    len(hits),
+                )
+        except Exception as fallback_error:
+            logger.warning("法条 PostgreSQL 降级检索失败: {}", fallback_error)
     if not hits:
+        if retrieval_trace is not None:
+            retrieval_trace.update({"hits": [], "context": ""})
         return "当前法条库中未找到与您问题相关的法律条文。"
 
     law_titles: dict[str, str] = {}
@@ -220,6 +238,23 @@ async def search_statutes(
         law_titles = await _fetch_law_titles(hits, db_session)
 
     context = format_statute_context(hits, law_titles)
+    if retrieval_trace is not None:
+        retrieval_trace.update({
+            "hits": [
+                {
+                    "law_id": str(hit.get("law_id") or ""),
+                    "title": law_titles.get(
+                        str(hit.get("law_id") or ""),
+                        f"法律ID:{hit.get('law_id') or ''}",
+                    ),
+                    "article_no": str(hit.get("article_no") or ""),
+                    "text": str(hit.get("text") or ""),
+                    "score": hit.get("rerank_score", hit.get("score", 0.0)),
+                }
+                for hit in hits
+            ],
+            "context": context,
+        })
     prompt = STATUTE_QA_PROMPT.format(question=question, context=context)
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     answer = response.content
@@ -252,8 +287,9 @@ async def search_statutes_pg_fallback(
             Law.id.label("law_id"),
         )
         .join(Law, Article.law_id == Law.id)
-        .where(Law.domain == domain)
     )
+    if domain:
+        query = query.where(Law.domain == domain)
     if keywords:
         conditions = [Article.content.ilike(f"%{kw}%") for kw in keywords]
         query = query.where(or_(*conditions))

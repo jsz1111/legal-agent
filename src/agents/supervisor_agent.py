@@ -8,6 +8,7 @@ from langchain.agents import create_agent
 
 from src.agents.tools.store_tools import save_memory, search_memory
 from src.agents.tools.worker_tools import WORKER_TOOLS, UserContext
+from src.agents.legal_guide.llm_runtime import build_chat_llm
 from src.infra.milvus_client import get_milvus_client_alias
 from src.infra.milvus_store import MilvusStore
 from src.infra.redis_cache import get_checkpointer_redis
@@ -92,13 +93,13 @@ async def create_supervisor_agent():
 
     # 4. 创建 Agent
     agent = create_agent(
-        model="deepseek-v4-flash",
+        model=build_chat_llm(),
         tools=tools,
         system_prompt=SUPERVISOR_SYSTEM_PROMPT,
         context_schema=UserContext,
         middleware=[
             SummarizationMiddleware( # 会话总结压缩
-                model="deepseek-v4-flash",
+                model=build_chat_llm(),
                 trigger=[
                     ("tokens", 4000),  # token数达到4k时触发
                     ("messages", 6),  # 或消息数达到 4条时触发

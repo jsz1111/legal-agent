@@ -24,6 +24,7 @@ from src.agents.legal_guide.state import GuideState
 
 def _deps(parsed: dict) -> GuideDeps:
     deps = MagicMock(spec=GuideDeps)
+    deps.fast_llm = None
     deps.llm = MagicMock()
     deps.llm.ainvoke = AsyncMock(return_value=AIMessage(content=json.dumps(parsed, ensure_ascii=False)))
     return deps
@@ -59,7 +60,7 @@ def test_every_domain_has_sources_and_every_rule_has_a_citation():
     assert set(DOMAIN_SOURCE_KEYS) == set(catalog.domains)
     assert expected_rule_ids == citation_rule_ids
     assert len(sources) == 18
-    assert len(citations) == 116
+    assert len(citations) == 170
 
 
 def test_official_local_files_pass_integrity_check_without_claiming_legal_review():
@@ -86,8 +87,8 @@ def test_mapping_status_distinguishes_file_level_and_system_guidance():
 
 def test_authority_index_rows_keep_traceability_fields():
     rows = build_authority_index_rows()
-    assert len(rows) == 116
-    assert len({row["id"] for row in rows}) == 116
+    assert len(rows) == 170
+    assert len({row["id"] for row in rows}) == 170
     assert all(row["rule_id"] and row["source_key"] and row["source_url"] for row in rows if row["domain"] != "other")
     assert all("依据来源：" in row["text"] for row in rows)
 
@@ -117,13 +118,13 @@ def test_user_claimed_evidence_is_not_marked_authentic_or_admissible():
         messages=[HumanMessage(content="有劳动合同，在我手里")],
         pending_ask_details=["劳动合同、工牌、考勤、工作群记录中，您现在有任何一种吗？"],
         pending_ask_type="evidence",
-        pending_followup_ids=["labor_relationship_evidence"],
+        pending_followup_ids=["labor_contract_identity"],
     )
     result = asyncio.run(guide_graph.node_parse_details(
         state,
         _deps(_parsed(evidence=["劳动合同"])),
     ))
-    assessment = result["evidence_assessments"]["labor_relationship_evidence"]
+    assessment = result["evidence_assessments"]["labor_contract_identity"]
 
     assert assessment["availability"] == "user_claimed_present"
     assert assessment["authenticity"] == "not_verified"
@@ -136,7 +137,7 @@ def test_explicit_evidence_absence_is_progress_not_low_information():
         messages=[HumanMessage(content="没有，找不到了")],
         pending_ask_details=["工资流水、工资条或单位确认欠薪的聊天记录，您有其中一种吗？"],
         pending_ask_type="evidence",
-        pending_followup_ids=["labor_payment_evidence"],
+        pending_followup_ids=["labor_payment_record"],
         consecutive_low_info_answers=1,
     )
     result = asyncio.run(guide_graph.node_parse_details(

@@ -35,6 +35,8 @@ class IssuesOutput(BaseModel):
     """LLM 结构化输出 Schema。"""
     issues: list[str] = Field(description="标准化的法律问题列表，无则空列表")
     domain: str = Field(description="推断的法律领域代码，如 labor_social_security")
+    case_frame: str = Field(default="other", description="核心事件类型：personal_safety/financial_loss/contract_service/family_dispute/labor_dispute/administrative_remedy/other")
+    frame_confidence: float = Field(default=0.0, description="核心事件类型判断置信度")
     facts: list[str] = Field(default_factory=list, description="用户明确说出的客观案情事实")
     case_updates: list[CaseFactUpdate] = Field(default_factory=list, description="带用户原文锚点的原子案情更新")
     evidence_details: list[dict] = Field(default_factory=list, description="带用户原文锚点的证据基础属性")
@@ -116,13 +118,37 @@ async def _extract_structured_intake(
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         data = json.loads(content)
+        deterministic_frame = _deterministic_case_frame(case_summary)
+        llm_frame = str(data.get("case_frame") or deterministic_frame or "other")
+        case_frame = (
+            "personal_safety"
+            if deterministic_frame == "personal_safety"
+            else llm_frame
+        )
+        domain = str(data.get("domain") or "other")
+        issues = [
+            str(item).strip()
+            for item in data.get("issues", [])
+            if str(item).strip()
+        ]
+        if case_frame == "personal_safety" and domain not in {
+            "criminal_public_security",
+            "traffic_personal_injury",
+            "family_vulnerable_groups",
+        }:
+            domain = "criminal_public_security"
+            issues = list(dict.fromkeys([
+                "人身安全纠纷，可能涉及故意伤害",
+                *issues,
+            ]))
         return IssuesOutput(
-            issues=[
-                str(item).strip()
-                for item in data.get("issues", [])
-                if str(item).strip()
-            ],
-            domain=str(data.get("domain") or "other"),
+            issues=issues,
+            domain=domain,
+            case_frame=case_frame,
+            frame_confidence=max(
+                float(data.get("frame_confidence") or 0.0),
+                0.95 if deterministic_frame == "personal_safety" else 0.0,
+            ),
             facts=facts,
             case_updates=updates,
             evidence_details=[],
@@ -139,6 +165,7 @@ async def _extract_structured_intake(
         )
         narrative = sections.get("事情经过", "")
         fallback = _deterministic_issue_fallback(narrative)
+        deterministic_frame = _deterministic_case_frame(narrative)
         return IssuesOutput(
             issues=(
                 list(fallback.issues)
@@ -146,6 +173,8 @@ async def _extract_structured_intake(
                 else ([narrative] if narrative else [])
             ),
             domain=fallback.domain if fallback else "other",
+            case_frame=fallback.case_frame if fallback else (deterministic_frame or "other"),
+            frame_confidence=fallback.frame_confidence if fallback else (0.9 if deterministic_frame else 0.0),
             facts=facts,
             case_updates=updates,
             evidence_details=[],
@@ -155,45 +184,19 @@ async def _extract_structured_intake(
 
 
 def _deterministic_issue_fallback(user_input: str) -> IssuesOutput | None:
-    """Recover only high-precision intents when structured LLM output is unavailable."""
-    normalized = "".join((user_input or "").split())
-    if is_high_precision_fraud_report(normalized):
+    """Safety-only fallback when structured LLM output is unavailable.
+
+    This is deliberately not a general scenario router. Other domains are
+    decided by the model; hardcoding every fraud/wage/rent/contract pattern
+    would not scale and would override valid AI reasoning.
+    """
+    physical_frame = _deterministic_case_frame(user_input)
+    if physical_frame == "personal_safety":
         return IssuesOutput(
-            issues=["疑似网络诈骗线索"],
-            domain="cyber_data_fraud",
-            facts=[user_input.strip()] if user_input.strip() else [],
-        )
-    wage_pattern = re.compile(
-        r"(?:欠|拖欠|没发|不发|不给).{0,8}(?:工资|工钱|薪水|劳动报酬)|"
-        r"(?:工资|工钱|薪水|劳动报酬).{0,8}(?:欠|拖欠|没发|不发|不给)"
-    )
-    if wage_pattern.search(normalized):
-        return IssuesOutput(
-            issues=["拖欠劳动报酬"],
-            domain="labor_social_security",
-            facts=[user_input.strip()] if user_input.strip() else [],
-        )
-    if re.search(r"(?:交通事故|道路事故|相撞|碰撞).{0,30}(?:受伤|医疗费|误工费|护理费|伤残)", normalized):
-        return IssuesOutput(
-            issues=["交通事故人身损害赔偿争议"],
-            domain="traffic_personal_injury",
-            facts=[user_input.strip()] if user_input.strip() else [],
-        )
-    if re.search(r"(?:租赁|租房|房东|承租).{0,40}(?:押金|租金|退租|解除合同)", normalized):
-        return IssuesOutput(
-            issues=["房屋租赁合同履行与返还争议"],
-            domain="contracts_property_housing",
-            facts=[user_input.strip()] if user_input.strip() else [],
-        )
-    contract_nonperformance = bool(re.search(
-        r"(?:合同|协议|约定|委托|代购).{0,80}(?:未交付|不交付|未退款|不退款|拒绝退款|没有退款)|"
-        r"(?:支付|付款|转账).{0,80}(?:未交付|不交付|未退款|不退款|拒绝退款|没有退款)",
-        normalized,
-    ))
-    if contract_nonperformance:
-        return IssuesOutput(
-            issues=["合同履行与退款争议"],
-            domain="contracts_property_housing",
+            issues=["人身安全纠纷，可能涉及故意伤害"],
+            domain="criminal_public_security",
+            case_frame="personal_safety",
+            frame_confidence=0.95,
             facts=[user_input.strip()] if user_input.strip() else [],
         )
     return None
@@ -216,6 +219,22 @@ def is_high_precision_fraud_report(user_input: str) -> bool:
         r"(?:转账|付款).{0,20}(?:后|以后).{0,12}(?:拉黑|失联|不发货)",
         normalized,
     ))
+
+
+_PHYSICAL_HARM_MARKERS = (
+    "被打了", "被打伤", "被殴打", "被人打", "挨打", "打了我",
+    "被人打了", "殴打", "打伤", "受伤", "人身安全",
+)
+
+
+def _deterministic_case_frame(user_input: str) -> str:
+    """Return a safety fail-safe only for unambiguous physical-harm phrases."""
+    normalized = "".join(str(user_input or "").split())
+    if not normalized:
+        return ""
+    if any(marker in normalized for marker in _PHYSICAL_HARM_MARKERS):
+        return "personal_safety"
+    return ""
 
 
 # ── 第一层：LLM 提取 + 粗标准化 ──────────────────────────────────────────────
@@ -242,9 +261,21 @@ async def extract_legal_issues(
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         data = json.loads(content)
+        deterministic_frame = _deterministic_case_frame(user_input)
+        llm_frame = str(data.get("case_frame") or "other")
+        case_frame = (
+            "personal_safety"
+            if deterministic_frame == "personal_safety"
+            else llm_frame
+        )
         result = IssuesOutput(
             issues=[i for i in data.get("issues", []) if i],
             domain=data.get("domain", "other") or "other",
+            case_frame=case_frame,
+            frame_confidence=max(
+                float(data.get("frame_confidence") or 0.0),
+                0.95 if deterministic_frame == "personal_safety" else 0.0,
+            ),
             facts=[item for item in data.get("facts", []) if item],
             case_updates=[CaseFactUpdate.model_validate(item) for item in data.get("case_updates", []) if isinstance(item, dict)],
             evidence_details=[
@@ -254,14 +285,19 @@ async def extract_legal_issues(
             region=(data.get("region") or "").strip(),
             time_info=(data.get("time_info") or "").strip(),
         )
-        deterministic = _deterministic_issue_fallback(user_input)
-        if deterministic and deterministic.domain == "cyber_data_fraud":
-            result.domain = deterministic.domain
-            result.issues = list(dict.fromkeys([*deterministic.issues, *result.issues]))
-            if not result.facts:
-                result.facts = deterministic.facts
-        elif not result.issues:
-            result = deterministic or result
+        if result.case_frame == "personal_safety" and result.domain not in {
+            "criminal_public_security",
+            "traffic_personal_injury",
+            "family_vulnerable_groups",
+        }:
+            result.domain = "criminal_public_security"
+            result.issues = list(dict.fromkeys([
+                "人身安全纠纷，可能涉及故意伤害",
+                *result.issues,
+            ]))
+        # Valid model output is authoritative. Only the physical-safety
+        # fail-safe above may correct it; other domains are not overwritten by
+        # regex-based scenario rules.
         logger.debug("提取法律问题: {} domain: {}", result.issues, result.domain)
         return result
     except Exception as e:
@@ -470,6 +506,8 @@ async def normalize_legal_issues(
         logger.info("标准化结果 | L1 未提取到法律问题 domain={}", domain)
         return {
             "standard": [], "colloquial": [], "term_map": {}, "domain": domain,
+            "case_frame": extracted.case_frame,
+            "frame_confidence": extracted.frame_confidence,
             "collected_facts": extracted.facts,
             "case_updates": [item.model_dump() for item in extracted.case_updates],
             "evidence_details": extracted.evidence_details,
@@ -498,6 +536,8 @@ async def normalize_legal_issues(
         "colloquial": still_unmatched,
         "term_map":   term_map,
         "domain":     domain,
+        "case_frame": extracted.case_frame,
+        "frame_confidence": extracted.frame_confidence,
         "collected_facts": extracted.facts,
         "case_updates": [item.model_dump() for item in extracted.case_updates],
         "evidence_details": extracted.evidence_details,

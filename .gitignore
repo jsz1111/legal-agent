@@ -173,6 +173,7 @@ uploads/
 
 # Local runtime, validation, and ad-hoc debugging artifacts
 tmp/
+/.tmp/
 /.tmp_*/
 /output/
 test_output_*.txt
@@ -188,3 +189,6 @@ gradio.log
 uvicorn.log
 乱文件,智能体暂时不能读取/测试结果_*.json
 resources/legal_document_templates/sources/spc_2025/parsed_*/
+
+# Local AI assistant settings
+.claude/settings.local.json

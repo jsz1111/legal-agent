@@ -2,11 +2,8 @@
 # 运营数据占位 Agent — 功能开发中
 
 from langchain.agents import create_agent
-from langchain_deepseek import ChatDeepSeek
 
-from src.core.config import get_settings
-
-settings = get_settings()
+from src.agents.legal_guide.llm_runtime import build_chat_llm
 
 OPERATION_SYSTEM_PROMPT = """你是法律平台的运营数据助手。
 
@@ -20,11 +17,7 @@ OPERATION_SYSTEM_PROMPT = """你是法律平台的运营数据助手。
 
 
 def create_operation_agent(db_session=None):
-    llm = ChatDeepSeek(
-        model=settings.DEEPSEEK_MODEL,
-        api_key=settings.DEEPSEEK_API_KEY,
-        temperature=0.2,
-    )
+    llm = build_chat_llm(temperature=0.2)
     return create_agent(
         model=llm,
         tools=[],
